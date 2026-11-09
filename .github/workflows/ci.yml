@@ -51,6 +51,7 @@ jobs:
           lipo -archs "dist/Claude Handoff.app/Contents/MacOS/Claude Handoff" | grep -q arm64
           lipo -archs "dist/Claude Handoff.app/Contents/MacOS/claude-handoff" | grep -q x86_64
           "dist/Claude Handoff.app/Contents/MacOS/claude-handoff" --version
+          test -f "dist/Claude Handoff.app/Contents/Resources/AppIcon.icns"
           scripts/make-dmg.sh dist/test.dmg
   reference:
     # The Node reference engine that the parity job checks the Swift port against.
