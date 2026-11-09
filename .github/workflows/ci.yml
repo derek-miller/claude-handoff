@@ -1,0 +1,63 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  swift:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+      - run: swift --version
+      - run: swift build --build-tests
+      - run: swift test --skip-build --parallel
+      - name: CLI smoke test
+        run: |
+          swift build -c release --product claude-handoff
+          "$(swift build -c release --show-bin-path)/claude-handoff" --version
+          "$(swift build -c release --show-bin-path)/claude-handoff" --help
+  parity:
+    # The Node suite with every engine call served by the Swift port.
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: swift build -c release -Xswiftc -enable-testing --product handoff-parity
+      - run: node Tests/Parity/run.mjs .build/release/handoff-parity ${{ matrix.shard }}/6
+  app:
+    # Packages the universal app ad-hoc signed, the same way the release does with a Developer ID.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+      - run: VERSION=0.0.0 scripts/build-app.sh
+      - run: |
+          lipo -archs "dist/Claude Handoff.app/Contents/MacOS/Claude Handoff" | grep -q arm64
+          lipo -archs "dist/Claude Handoff.app/Contents/MacOS/claude-handoff" | grep -q x86_64
+          "dist/Claude Handoff.app/Contents/MacOS/claude-handoff" --version
+          scripts/make-dmg.sh dist/test.dmg
+  reference:
+    # The Node reference engine that the parity job checks the Swift port against.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm test
+        working-directory: Tests/Reference

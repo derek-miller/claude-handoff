@@ -1,0 +1,309 @@
+import Darwin
+import Foundation
+
+// Node-style filesystem errors: `code` is the errno name and the message matches Node's wording.
+public func fsError(_ err: Int32, _ syscall: String, _ path: String? = nil, _ dest: String? = nil) -> JSError {
+    let (code, text) = errnoName(err)
+    var message = "\(code): \(text), \(syscall)"
+    if let path { message += " '\(path)'" }
+    if let dest { message += " -> '\(dest)'" }
+    var extra: [(String, Value)] = [("errno", Value(-Int(err))), ("syscall", Value(syscall))]
+    if let path { extra.append(("path", Value(path))) }
+    if let dest { extra.append(("dest", Value(dest))) }
+    return JSError(message, code: Value(code), extra: extra)
+}
+
+func errnoName(_ err: Int32) -> (String, String) {
+    switch err {
+    case ENOENT: return ("ENOENT", "no such file or directory")
+    case EEXIST: return ("EEXIST", "file already exists")
+    case ENOTDIR: return ("ENOTDIR", "not a directory")
+    case EISDIR: return ("EISDIR", "illegal operation on a directory")
+    case EACCES: return ("EACCES", "permission denied")
+    case EPERM: return ("EPERM", "operation not permitted")
+    case ENOTEMPTY: return ("ENOTEMPTY", "directory not empty")
+    case ELOOP: return ("ELOOP", "too many symbolic links encountered")
+    case EXDEV: return ("EXDEV", "cross-device link not permitted")
+    case EBADF: return ("EBADF", "bad file descriptor")
+    case EINVAL: return ("EINVAL", "invalid argument")
+    case EMLINK: return ("EMLINK", "too many links")
+    case EBUSY: return ("EBUSY", "resource busy or locked")
+    case EAGAIN: return ("EAGAIN", "resource temporarily unavailable")
+    case ENOSPC: return ("ENOSPC", "no space left on device")
+    case EROFS: return ("EROFS", "read-only file system")
+    case ENAMETOOLONG: return ("ENAMETOOLONG", "name too long")
+    case EIO: return ("EIO", "i/o error")
+    case EMFILE: return ("EMFILE", "too many open files")
+    default: return ("E\(err)", String(cString: strerror(err)))
+    }
+}
+
+// Mirrors the subset of Node's Stats object the engine reads. With `bigint`, numeric fields are BigInt and *Ns fields exist.
+public func statValue(_ s: stat, bigint: Bool) -> Value {
+    let o = JSObject()
+    func n(_ x: Int64) -> Value { bigint ? .bigint(x) : .number(Double(x)) }
+    o["dev"] = n(Int64(s.st_dev))
+    o["mode"] = n(Int64(s.st_mode))
+    o["nlink"] = n(Int64(s.st_nlink))
+    o["uid"] = n(Int64(s.st_uid))
+    o["gid"] = n(Int64(s.st_gid))
+    o["rdev"] = n(Int64(s.st_rdev))
+    o["blksize"] = n(Int64(s.st_blksize))
+    o["ino"] = n(Int64(bitPattern: UInt64(s.st_ino)))
+    o["size"] = n(Int64(s.st_size))
+    o["blocks"] = n(Int64(s.st_blocks))
+    func ns(_ t: timespec) -> Int64 { Int64(t.tv_sec) * 1_000_000_000 + Int64(t.tv_nsec) }
+    func ms(_ t: timespec) -> Value { bigint ? .bigint(ns(t) / 1_000_000) : .number(Double(t.tv_sec) * 1000 + Double(t.tv_nsec) / 1_000_000) }
+    o["atimeMs"] = ms(s.st_atimespec)
+    o["mtimeMs"] = ms(s.st_mtimespec)
+    o["ctimeMs"] = ms(s.st_ctimespec)
+    o["birthtimeMs"] = ms(s.st_birthtimespec)
+    if bigint {
+        o["atimeNs"] = .bigint(ns(s.st_atimespec))
+        o["mtimeNs"] = .bigint(ns(s.st_mtimespec))
+        o["ctimeNs"] = .bigint(ns(s.st_ctimespec))
+        o["birthtimeNs"] = .bigint(ns(s.st_birthtimespec))
+    }
+    let kind = s.st_mode & S_IFMT
+    o["isFile"] = Value { _ in .bool(kind == S_IFREG) }
+    o["isDirectory"] = Value { _ in .bool(kind == S_IFDIR) }
+    o["isSymbolicLink"] = Value { _ in .bool(kind == S_IFLNK) }
+    o["isFIFO"] = Value { _ in .bool(kind == S_IFIFO) }
+    o["isSocket"] = Value { _ in .bool(kind == S_IFSOCK) }
+    o.hidden = ["isFile", "isDirectory", "isSymbolicLink", "isFIFO", "isSocket"]
+    return .object(o)
+}
+
+public struct Dirent {
+    public let name: String
+    public let type: UInt8
+    public var isDirectory: Bool { type == DT_DIR }
+    public var isFile: Bool { type == DT_REG }
+    public var isSymbolicLink: Bool { type == DT_LNK }
+}
+
+// An open file descriptor, like Node's FileHandle.
+public final class FileHandle {
+    public let fd: Int32
+    public let path: String
+    private var closed = false
+    init(fd: Int32, path: String) { self.fd = fd; self.path = path }
+    deinit { if !closed { Darwin.close(fd) } }
+
+    public func stat(bigint: Bool = false) throws -> Value {
+        try fs.handleStat(self, bigint)
+    }
+    public func readFile() throws -> Data { try fs.handleReadFile(self) }
+    // handle.read(buffer, 0, length, position) → bytes actually read.
+    public func read(length: Int, position: Int64?) throws -> Data {
+        var buf = [UInt8](repeating: 0, count: length)
+        let n = buf.withUnsafeMutableBytes { raw -> Int in
+            if let position { return pread(fd, raw.baseAddress, length, off_t(position)) }
+            return Darwin.read(fd, raw.baseAddress, length)
+        }
+        if n < 0 { throw fsError(errno, "read") }
+        return Data(buf[0..<n])
+    }
+    public func writeFile(_ data: Data) throws { try fs.handleWrite(self, data) }
+    public func writeFile(_ text: String) throws { try writeFile(Data(text.utf8)) }
+    public func sync() throws { try fs.handleSync(self) }
+    public func chmod(_ mode: Int) throws { if fchmod(fd, mode_t(mode)) != 0 { throw fsError(errno, "fchmod") } }
+    public func truncate(_ length: Int64 = 0) throws { if ftruncate(fd, off_t(length)) != 0 { throw fsError(errno, "ftruncate") } }
+    public func close() throws {
+        if closed { return }
+        closed = true
+        if Darwin.close(fd) != 0 { throw fsError(errno, "close") }
+    }
+    // Sequential chunks from the current position, like handle.createReadStream({ autoClose: false }).
+    public func chunks(size: Int = 64 * 1024, _ body: (Data) throws -> Void) throws {
+        while true {
+            let d = try read(length: size, position: nil)
+            if d.isEmpty { return }
+            try body(d)
+        }
+    }
+}
+
+// Every filesystem call goes through this table so tests can interpose, the way the JS tests patch node:fs.
+public final class NodeFS {
+    public var readFile: (String) throws -> Data = NodeFS.nativeReadFile
+    public var writeFile: (String, Data, String, Int) throws -> Void = NodeFS.nativeWriteFile
+    public var stat: (String, Bool) throws -> Value = { p, big in try NodeFS.nativeStat(p, big, follow: true) }
+    public var lstat: (String, Bool) throws -> Value = { p, big in try NodeFS.nativeStat(p, big, follow: false) }
+    public var readdir: (String) throws -> [Dirent] = NodeFS.nativeReaddir
+    public var mkdir: (String, Bool, Int) throws -> Void = NodeFS.nativeMkdir
+    public var rename: (String, String) throws -> Void = { a, b in if Darwin.rename(a, b) != 0 { throw fsError(errno, "rename", a, b) } }
+    public var link: (String, String) throws -> Void = { a, b in if Darwin.link(a, b) != 0 { throw fsError(errno, "link", a, b) } }
+    public var symlink: (String, String) throws -> Void = { a, b in if Darwin.symlink(a, b) != 0 { throw fsError(errno, "symlink", a, b) } }
+    public var unlink: (String) throws -> Void = { a in if Darwin.unlink(a) != 0 { throw fsError(errno, "unlink", a) } }
+    public var rmdir: (String) throws -> Void = { a in if Darwin.rmdir(a) != 0 { throw fsError(errno, "rmdir", a) } }
+    public var rm: (String, Bool, Bool) throws -> Void = NodeFS.nativeRm
+    public var realpath: (String) throws -> String = NodeFS.nativeRealpath
+    public var readlink: (String) throws -> Data = NodeFS.nativeReadlink
+    public var copyFile: (String, String) throws -> Void = { a, b in if copyfile(a, b, nil, copyfile_flags_t(COPYFILE_ALL)) != 0 { throw fsError(errno, "copyfile", a, b) } }
+    public var open: (String, Int32, Int) throws -> FileHandle = NodeFS.nativeOpen
+    public var handleStat: (FileHandle, Bool) throws -> Value = { h, big in
+        var s = Darwin.stat()
+        if fstat(h.fd, &s) != 0 { throw fsError(errno, "fstat") }
+        return statValue(s, bigint: big)
+    }
+    public var handleReadFile: (FileHandle) throws -> Data = { h in
+        var out = Data()
+        try h.chunks { out.append($0) }
+        return out
+    }
+    public var handleWrite: (FileHandle, Data) throws -> Void = { h, data in
+        try data.withUnsafeBytes { raw in
+            var off = 0
+            while off < raw.count {
+                let n = Darwin.write(h.fd, raw.baseAddress! + off, raw.count - off)
+                if n < 0 { if errno == EINTR { continue }; throw fsError(errno, "write") }
+                off += n
+            }
+        }
+    }
+    public var handleSync: (FileHandle) throws -> Void = { h in if fsync(h.fd) != 0 { throw fsError(errno, "fsync") } }
+
+    public init() {}
+
+    public static func nativeReadFile(_ p: String) throws -> Data {
+        let h = try nativeOpen(p, O_RDONLY, 0)
+        defer { try? h.close() }
+        var s = Darwin.stat()
+        if fstat(h.fd, &s) != 0 { throw fsError(errno, "fstat") }
+        if s.st_mode & S_IFMT == S_IFDIR { throw fsError(EISDIR, "read") }
+        var out = Data(capacity: Int(s.st_size))
+        try h.chunks(size: 1 << 20) { out.append($0) }
+        return out
+    }
+
+    // flag follows Node: "w", "wx", "a", "ax".
+    public static func nativeWriteFile(_ p: String, _ data: Data, _ flag: String, _ mode: Int) throws {
+        var flags: Int32 = O_WRONLY | O_CREAT
+        if flag.hasPrefix("a") { flags |= O_APPEND } else { flags |= O_TRUNC }
+        if flag.contains("x") { flags |= O_EXCL }
+        let h = try nativeOpen(p, flags, mode)
+        defer { try? h.close() }
+        try h.writeFile(data)
+    }
+
+    public static func nativeStat(_ p: String, _ bigint: Bool, follow: Bool) throws -> Value {
+        var s = Darwin.stat()
+        let r: Int32 = follow ? statPath(p, &s) : Darwin.lstat(p, &s)
+        if r != 0 { throw fsError(errno, follow ? "stat" : "lstat", p) }
+        return statValue(s, bigint: bigint)
+    }
+
+    public static func nativeReaddir(_ p: String) throws -> [Dirent] {
+        guard let d = opendir(p) else { throw fsError(errno, "scandir", p) }
+        defer { closedir(d) }
+        var out: [Dirent] = []
+        while let e = Darwin.readdir(d) {
+            let name = withUnsafePointer(to: e.pointee.d_name) { ptr in
+                ptr.withMemoryRebound(to: CChar.self, capacity: Int(e.pointee.d_namlen) + 1) { String(cString: $0) }
+            }
+            if name == "." || name == ".." { continue }
+            var type = e.pointee.d_type
+            if type == DT_UNKNOWN {
+                var s = Darwin.stat()
+                if Darwin.lstat((p as NSString).appendingPathComponent(name), &s) == 0 {
+                    switch s.st_mode & S_IFMT {
+                    case S_IFDIR: type = UInt8(DT_DIR)
+                    case S_IFREG: type = UInt8(DT_REG)
+                    case S_IFLNK: type = UInt8(DT_LNK)
+                    default: break
+                    }
+                }
+            }
+            out.append(Dirent(name: name, type: type))
+        }
+        return out
+    }
+
+    public static func nativeMkdir(_ p: String, _ recursive: Bool, _ mode: Int) throws {
+        if !recursive {
+            if Darwin.mkdir(p, mode_t(mode)) != 0 { throw fsError(errno, "mkdir", p) }
+            return
+        }
+        var s = Darwin.stat()
+        if statPath(p, &s) == 0 {
+            if s.st_mode & S_IFMT == S_IFDIR { return }
+            throw fsError(EEXIST, "mkdir", p)
+        }
+        let parent = (p as NSString).deletingLastPathComponent
+        if !parent.isEmpty && parent != p { try nativeMkdir(parent, true, mode) }
+        if Darwin.mkdir(p, mode_t(mode)) != 0 && errno != EEXIST { throw fsError(errno, "mkdir", p) }
+    }
+
+    public static func nativeRm(_ p: String, _ recursive: Bool, _ force: Bool) throws {
+        var s = Darwin.stat()
+        if Darwin.lstat(p, &s) != 0 {
+            if force && errno == ENOENT { return }
+            throw fsError(errno, "lstat", p)
+        }
+        if s.st_mode & S_IFMT == S_IFDIR {
+            guard recursive else { throw JSError("Path is a directory: rm returned EISDIR (is a directory) \(p)", code: "ERR_FS_EISDIR") }
+            for e in try nativeReaddir(p) { try nativeRm((p as NSString).appendingPathComponent(e.name), true, force) }
+            if Darwin.rmdir(p) != 0 { throw fsError(errno, "rmdir", p) }
+        } else if Darwin.unlink(p) != 0 {
+            if force && errno == ENOENT { return }
+            throw fsError(errno, "unlink", p)
+        }
+    }
+
+    public static func nativeRealpath(_ p: String) throws -> String {
+        guard let r = Darwin.realpath(p, nil) else { throw fsError(errno, "realpath", p) }
+        defer { free(r) }
+        return String(cString: r)
+    }
+
+    public static func nativeReadlink(_ p: String) throws -> Data {
+        var buf = [Int8](repeating: 0, count: Int(PATH_MAX) + 1)
+        let n = Darwin.readlink(p, &buf, buf.count - 1)
+        if n < 0 { throw fsError(errno, "readlink", p) }
+        return Data(buf[0..<n].map { UInt8(bitPattern: $0) })
+    }
+
+    public static func nativeOpen(_ p: String, _ flags: Int32, _ mode: Int) throws -> FileHandle {
+        let fd = Darwin.open(p, flags | O_CLOEXEC, mode_t(mode))
+        if fd < 0 { throw fsError(errno, "open", p) }
+        return FileHandle(fd: fd, path: p)
+    }
+}
+
+// The process-wide filesystem table.
+public var fs = NodeFS()
+
+// Convenience wrappers with Node's default arguments.
+extension NodeFS {
+    public func readText(_ p: String) throws -> String { String(decoding: try readFile(p), as: UTF8.self) }
+    public func readJSON(_ p: String) throws -> Value { try JSON.parse(try readFile(p)) }
+    public func write(_ p: String, _ text: String, flag: String = "w", mode: Int = 0o666) throws { try writeFile(p, Data(text.utf8), flag, mode) }
+    public func stat(_ p: String, bigint: Bool = false) throws -> Value { try stat(p, bigint) }
+    public func lstat(_ p: String, bigint: Bool = false) throws -> Value { try lstat(p, bigint) }
+    public func names(_ p: String) throws -> [String] { try readdir(p).map(\.name) }
+    public func mkdirp(_ p: String, mode: Int = 0o777) throws { try mkdir(p, true, mode) }
+    public func rm(_ p: String, recursive: Bool = false, force: Bool = false) throws { try rm(p, recursive, force) }
+    // Node's string flags for open(): r, r+, w, wx, a, ax.
+    public func open(_ p: String, _ flag: String, mode: Int = 0o666) throws -> FileHandle {
+        let flags: Int32
+        switch flag {
+        case "r": flags = O_RDONLY
+        case "r+": flags = O_RDWR
+        case "w": flags = O_WRONLY | O_CREAT | O_TRUNC
+        case "wx": flags = O_WRONLY | O_CREAT | O_TRUNC | O_EXCL
+        case "a": flags = O_WRONLY | O_CREAT | O_APPEND
+        case "ax": flags = O_WRONLY | O_CREAT | O_APPEND | O_EXCL
+        default: flags = O_RDONLY
+        }
+        return try open(p, flags, mode)
+    }
+    public func exists(_ p: String) -> Bool { (try? stat(p, false)) != nil }
+    public func mkdtemp(_ prefix: String) throws -> String {
+        var template = Array((prefix + "XXXXXX").utf8CString)
+        guard Darwin.mkdtemp(&template) != nil else { throw fsError(errno, "mkdtemp", prefix + "XXXXXX") }
+        return String(cString: template)
+    }
+}
+
+func statPath(_ p: String, _ s: inout Darwin.stat) -> Int32 { fstatat(AT_FDCWD, p, &s, 0) }

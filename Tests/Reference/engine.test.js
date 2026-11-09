@@ -1,0 +1,12287 @@
+import assert from 'node:assert/strict'
+import childProcess, { execFile, spawn, spawnSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { once } from 'node:events'
+import fsSync, { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import fs, { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
+import os from 'node:os'
+import path from 'node:path'
+import test from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+import { accounts, cloudClient, leftovers, tidy, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './engine.js'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const fixtureCommand = run => (file, ...args) => {
+  if (file === '/usr/bin/security') return { status: 1, stdout: '', stderr: 'fixture login unavailable' }
+  if (['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl', 'launchctl', 'pkill'].includes(file)) throw new Error('fixture native command requires a mock')
+  return run(file, ...args)
+}
+childProcess.spawnSync = fixtureCommand(childProcess.spawnSync)
+childProcess.spawn = fixtureCommand(childProcess.spawn)
+syncBuiltinESMExports()
+const SOURCE = '00000000-0000-4000-8000-000000000001'
+const MESSAGES = new Set(['user', 'assistant', 'attachment', 'system'])
+const id = (k) => `00000000-0000-4000-8000-${String(k).padStart(12, '0')}`
+const rehomeRecord = (extra = {}) => ({ forkedFromSessionId: null, ...extra })
+const lines = (text) => text.split('\n').filter((l) => l.trim()).flatMap((l) => { try { return [JSON.parse(l)] } catch { return [] } })
+const mutatingOpen = flags => typeof flags === 'number'
+  ? Boolean(flags & (fsSync.constants.O_WRONLY | fsSync.constants.O_RDWR | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | fsSync.constants.O_APPEND))
+  : typeof flags === 'string' && /[wa+]/.test(flags)
+const fixture = async (name) => lines(await readFile(path.join(here, 'fixtures', name), 'utf8'))
+const entry = (type, k, parent, session, extra = {}) => ({
+  type,
+  uuid: id(k),
+  parentUuid: parent === null ? null : id(parent),
+  sessionId: session,
+  timestamp: `2026-09-01T00:00:${String(k % 60).padStart(2, '0')}.000Z`,
+  cwd: '/tmp/fixture',
+  isSidechain: false,
+  message: { role: type, content: `message ${k}` },
+  ...extra
+})
+const remoteState = (status, extra = {}) => ({
+  status,
+  connection_status: 'disconnected',
+  worker_status: 'WORKER_STATUS_UNSPECIFIED',
+  client_presence: [],
+  last_event_at: '2026-09-01T00:01:00.000Z',
+  ...extra
+})
+const remoteRows = (entries) => entries.map((payload, sequence_num) => ({ event_type: payload.type, payload, sequence_num, created_at: payload.timestamp }))
+const remoteSession = (extra = {}) => ({ created_at: '2026-09-01T00:00:00.000Z', environment_kind: 'bridge', tags: ['remote-control-sdk'], status: 'active', ...extra })
+const cloudFixture = (h, extra = {}) => ({
+  account: h.acct.P,
+  org: h.org.P,
+  list: async () => [],
+  eventRows: async () => [],
+  session: async () => remoteState('active'),
+  archive: async () => {},
+  unarchive: async () => {},
+  ...extra
+})
+async function moveWithPending(h, from, to, cloud = null) {
+  const pending = id(997)
+  await h.record('T', pending, rehomeRecord({ title: 'Pending local source' }))
+  const current = await accounts(h.paths)
+  const source = from.map((row) => current.find((account) => account.account === row.account && account.org === row.org))
+  const target = current.find((account) => account.account === to.account && account.org === to.org)
+  const result = await move(await inventory(source, target, h.paths, () => {}, { cloud, cloudRequested: true }), target, h.paths)
+  await unlink(path.join(h.dir('T'), `local_${pending}.json`))
+  return result
+}
+const branchEntries = (count, session, start) => Array.from({ length: count }, (_, index) => entry(index % 2 ? 'assistant' : 'user', start + index, index ? start + index - 1 : null, session))
+const processSetup = processes => `
+  const processes = ${JSON.stringify(processes)}, run = childProcess.spawnSync
+  childProcess.spawnSync = (file, args, ...rest) => file === '/bin/ps' ? { status: 0, stdout: processes[args[1].endsWith('command=') ? 'commands' : 'list'], stderr: '' } : run(file, args, ...rest)
+`
+const cli = (home, args, setup = '') => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+  import childProcess from 'node:child_process'
+  import { syncBuiltinESMExports } from 'node:module'
+  childProcess.spawnSync = (${fixtureCommand.toString()})(childProcess.spawnSync)
+  childProcess.spawn = (${fixtureCommand.toString()})(childProcess.spawn)
+  ${setup}
+  syncBuiltinESMExports()
+  process.argv.splice(1, 0, ${JSON.stringify(path.join(here, 'engine.js'))})
+  await import(${JSON.stringify(path.join(here, 'engine.js'))})
+`, '--', ...args], {
+  env: { ...process.env, HOME: home },
+  cwd: here
+}).then((r) => ({ ...r, code: 0 }), (e) => ({ stdout: e.stdout, stderr: e.stderr, code: e.code }))
+const touchPlaced = file => {
+  const native = fs.link
+  fs.link = async (...args) => {
+    const result = await native(...args)
+    if (args[1] === file) writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file)), lastFocusedAt: 1000 }))
+    return result
+  }
+  syncBuiltinESMExports()
+  return () => { fs.link = native; syncBuiltinESMExports() }
+}
+const withoutLockf = `
+  import lockFs from 'node:fs/promises'
+  const lockStat = lockFs.stat
+  lockFs.stat = (file, ...args) => file === '/usr/bin/lockf' ? Promise.reject(Object.assign(new Error('fixture missing lockf'), { code: 'ENOENT' })) : lockStat(file, ...args)
+`
+
+test('process identity separates Desktop descendants, external workers, and reused pids', () => {
+  const at = 'Fri Sep  4 18:00:00 2026'
+  const later = 'Fri Sep  4 18:01:00 2026'
+  const table = [
+    `10 1 ${at} /Applications/Claude.app/Contents/MacOS/Claude`,
+    `11 10 ${at} /Applications/Claude.app/Contents/Helpers/disclaimer`,
+    `12 11 ${at} /Library/Application Support/Claude/claude`,
+    `13 1 ${at} /tmp/claude`,
+    `14 1 ${at} /tmp/claude`,
+    `15 16 ${at} /tmp/claude`,
+    `16 15 ${at} /bin/sh`
+  ].join('\n')
+  const commands = [
+    `10 1 ${at} Claude`, `11 10 ${at} disclaimer local_${SOURCE}`,
+    `12 11 ${at} claude --resume ${id(2)}`, `13 1 ${at} claude --resume ${id(2)}`,
+    `14 1 ${later} claude --resume ${SOURCE}`, `15 16 ${at} claude`, `16 15 ${at} sh`
+  ].join('\n')
+  const rows = parseProcesses(table, commands)
+  assert.equal(rows.find((row) => row.pid === 12).desktopPid, 10)
+  assert.equal(rows.find((row) => row.pid === 13).desktopPid, null)
+  assert.deepEqual(rows.find((row) => row.pid === 14).ids, [])
+  assert.deepEqual(rows.find((row) => row.pid === 11).ids, [SOURCE])
+  assert.equal(rows.find((row) => row.pid === 15).desktopPid, null)
+  assert.throws(() => parseProcesses('unparseable', ''), /process identity/)
+  const alternate = parseProcesses(table.replaceAll('/Applications/Claude.app', '/Users/fixture/Applications/Claude.app'), commands)
+  assert.equal(alternate.find((row) => row.pid === 11).worker, true)
+  assert.equal(alternate.find((row) => row.pid === 12).desktopPid, 10)
+})
+
+test('process inventory handles more than one megabyte of unrelated argv', async () => {
+  const h = await home()
+  const children = Array.from({ length: 9 }, () => spawn('/usr/bin/python3', ['-c', 'import time; time.sleep(30)', 'x'.repeat(120 * 1024)], { stdio: 'ignore' }))
+  try {
+    await Promise.all(children.map((child) => once(child, 'spawn')))
+    const listing = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 2000 })
+    assert.equal(listing.status, 0)
+    assert.ok(Buffer.byteLength(listing.stdout) > 1024 * 1024)
+    const to = (await accounts(h.paths)).find((row) => row.account === h.acct.T)
+    assert.equal((await inventory([], to, h.paths)).move.length, 0)
+  } finally {
+    for (const child of children) child.kill('SIGTERM')
+    await Promise.all(children.filter((child) => child.pid && child.exitCode === null && child.signalCode === null).map((child) => once(child, 'exit')))
+  }
+})
+
+test('publication exposes complete bytes only after creation evidence is saved', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-publish-')), file = path.join(root, 'record.json'), payload = '{"title":"complete"}\n'
+  await writeNew(file, payload, async (created) => {
+    assert.equal(created.size, Buffer.byteLength(payload))
+    assert.equal(await readFile(file).catch(() => null), null)
+  })
+  assert.equal(await readFile(file, 'utf8'), payload)
+  assert.deepEqual(await readdir(root), ['record.json'])
+})
+
+test('inventory recognizes a live Desktop record id before its CLI uuid enters argv', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  const desktopId = id(800)
+  await h.record('P', SOURCE, { sessionId: `local_${desktopId}` })
+  await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('P'), `local_${desktopId}.json`))
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P)
+  const to = all.find((a) => a.account === h.acct.T)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [{ pid: 100, worker: true, ids: [desktopId], desktopPid: 50 }] })
+  assert.equal(inv.move.length, 0)
+  assert.equal(inv.blocked[0].id, SOURCE)
+  assert.match(inv.blocked[0].error, /running worker/)
+})
+
+const desktopFixture = (session = SOURCE) => [
+  { pid: 500, ppid: 1, started: 'first', executable: '/Applications/Claude.app/Contents/MacOS/Claude', ids: [], worker: true, desktopPid: 500 },
+  { pid: 501, ppid: 500, started: 'worker', executable: '/tmp/claude', ids: [session], worker: true, desktopPid: 500 }
+]
+
+test('restart plans include collateral and refuse to claim external worker ownership', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P)
+  const to = all.find((a) => a.account === h.acct.T)
+  const table = [...desktopFixture(), { pid: 502, ppid: 500, started: 'other', executable: '/tmp/claude', ids: [id(400)], worker: true, desktopPid: 500 }]
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: table })
+  const plan = await restartPlan(inv, h.paths, table)
+  assert.equal(plan.held.length, 1)
+  assert.equal(plan.held[0].id, SOURCE)
+  assert.deepEqual(plan.interrupts.map((row) => row.pid), [502])
+  const external = [...table, { pid: 600, ppid: 1, started: 'external', executable: '/tmp/claude', ids: [SOURCE], worker: true, desktopPid: null }]
+  assert.equal(await restartPlan(inv, h.paths, external), null)
+})
+
+test('a worker on a non-representative Desktop alias holds the whole compatible group', async () => {
+  const h = await home(), alias = id(810)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, { lastFocusedAt: 1000 })
+  await h.record('T', SOURCE, { sessionId: `local_${alias}` })
+  await rename(path.join(h.dir('T'), `local_${SOURCE}.json`), path.join(h.dir('T'), `local_${alias}.json`))
+  const all = await accounts(h.paths), from = all.filter((row) => [h.acct.P, h.acct.T].includes(row.account)), to = all.find((row) => row.account === h.acct.Z)
+  const rows = desktopFixture(alias)
+  const inv = await inventory(from, to, h.paths, () => {}, { processes: rows })
+  assert.equal(inv.move.length, 0)
+  assert.equal(inv.blocked[0].worker, false)
+  assert.equal(inv.blocked[0].members.some((row) => row.worker), true)
+  const plan = await restartPlan(inv, h.paths, rows)
+  assert.equal(plan.held[0].sources.length, 2)
+})
+
+test('a worker plus a permanent filename collision never offers a restart', async () => {
+  const h = await home(), other = id(400)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  await h.write(other, [entry('user', 400, null, other)])
+  await h.record('T', other, { sessionId: `local_${SOURCE}` })
+  await rename(path.join(h.dir('T'), `local_${other}.json`), path.join(h.dir('T'), `local_${SOURCE}.json`))
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: desktopFixture() })
+  assert.match(inv.blocked[0].error, /filename collision/)
+  assert.equal(await restartPlan(inv, h.paths, desktopFixture()), null)
+})
+
+test('a destination arriving after planning is never quarantined by a failed placement', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const target = path.join(h.dir('T'), `local_${SOURCE}.json`), foreign = '{"title":"independent arrival"}\n'
+  const result = await executeMove([from], to, h.paths, { processes: [], summary: () => writeFileSync(target, foreign) })
+  assert.equal(result.ok, false)
+  assert.equal(await readFile(target, 'utf8'), foreign)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+test('independent destination arrivals preserve Undo for successfully moved siblings', async () => {
+  for (const identical of [false, true]) {
+    const h = await home(), sibling = id(300)
+    for (const session of [SOURCE, sibling]) {
+      await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+      await h.record('P', session)
+    }
+    const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+    const target = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    const record = JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    const foreign = identical ? JSON.stringify(record, null, 2) + '\n' : '{"title":"foreign sibling"}\n'
+    const result = await executeMove([from], to, h.paths, { processes: [], summary: () => writeFileSync(target, foreign) })
+    assert.equal(result.ok, identical)
+    assert.equal(result.receipt.sessions.length, 1)
+    assert.equal(await readFile(target, 'utf8'), foreign)
+    assert.equal(result.receipt.retained, undefined)
+    assert.ok((await undo(h.paths)).dest)
+    assert.equal(await readFile(target, 'utf8'), foreign)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${sibling}.json`)))
+  }
+})
+
+test('restart waits for children, moves only after exit, and reopens on move failure', async () => {
+  const h = await home()
+  let rows = desktopFixture(), time = 0
+  const plan = await restartPlan(null, h.paths, rows)
+  const calls = []
+  const result = await withDesktopRestart(plan, h.paths, async () => {
+    assert.equal(rows.length, 0)
+    calls.push('move')
+    throw new Error('fixture move failed')
+  }, () => {}, {
+    now: () => time, shutdownWait: 400, reserve: 200, inspect: () => rows,
+    wait: async (ms) => { time += ms; rows = [] },
+    command: async (file) => {
+      if (file.endsWith('osascript')) { calls.push('quit'); rows = rows.slice(1); return { status: 0 } }
+      calls.push('open'); rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]; return { status: 0 }
+    }
+  })
+  assert.deepEqual(calls, ['quit', 'move', 'open'])
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.equal(result.ok, false)
+  assert.match(result.error, /fixture move failed/)
+  assert.ok(time <= 1000)
+})
+
+test('a native quit veto leaves held work untouched and does not reopen the running app', async () => {
+  const h = await home()
+  const rows = desktopFixture()
+  const plan = await restartPlan(null, h.paths, rows)
+  let time = 0, moved = false, opened = false
+  const result = await withDesktopRestart(plan, h.paths, async () => { moved = true }, () => {}, {
+    now: () => time, shutdownWait: 400, reserve: 200, inspect: () => rows, wait: async (ms) => { time += ms },
+    command: async (file) => { if (file.endsWith('/open')) opened = true; return { status: 1 } }
+  })
+  assert.equal(moved, false)
+  assert.equal(opened, false)
+  assert.equal(result.restart.outcome, 'quit-not-confirmed')
+  assert.equal(time, 0)
+})
+
+test('long closed work gets a fresh bounded reopen wait', async () => {
+  const h = await home()
+  let rows = desktopFixture(), time = 0
+  const plan = await restartPlan(null, h.paths, rows)
+  const calls = []
+  const result = await withDesktopRestart(plan, h.paths, async ({ progress, check }) => { for (let i = 0; i < 10; i++) { time += 30_000; progress(); check() } }, () => {}, {
+    inspect: () => rows, now: () => time, shutdownWait: 400, reserve: 200,
+    command: async (file, args, timeout) => {
+      calls.push({ file, timeout })
+      rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+      return { status: 0 }
+    }
+  })
+  assert.equal(calls.at(-1).file, '/usr/bin/open')
+  assert.ok(calls.at(-1).timeout > 0)
+  assert.equal(result.ok, true)
+  assert.equal(result.error, undefined)
+  assert.equal(calls.at(-1).timeout, 200)
+  assert.equal(lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8')).at(-1).stopCode, 'NO_WORK')
+})
+
+test('a journal failure after quit cannot prevent the reopen request', async () => {
+  const h = await home()
+  let rows = desktopFixture()
+  const plan = await restartPlan(null, h.paths, rows), calls = []
+  const result = await withDesktopRestart(plan, h.paths, async () => {
+    await rename(h.paths.state, h.paths.state + '.saved')
+    await writeFile(h.paths.state, 'state path is unavailable')
+  }, () => {}, { inspect: () => rows, command: async (file) => {
+    calls.push(file)
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } })
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.equal(result.ok, false)
+  assert.match(result.restart.error, /journal could not be saved/)
+})
+
+test('a failed progress callback cannot prevent the mandatory reopen', async () => {
+  const h = await home()
+  let rows = desktopFixture(), reportedAfterOpen = false
+  const plan = await restartPlan(null, h.paths, rows), calls = []
+  const result = await withDesktopRestart(plan, h.paths, async () => ({ ok: true }), stage => {
+    if (stage === 'reopen') {
+      reportedAfterOpen = calls.includes('/usr/bin/open')
+      throw new Error('progress output unavailable')
+    }
+  }, { inspect: () => rows, command: async file => {
+    calls.push(file)
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } })
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.equal(reportedAfterOpen, true)
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.equal(result.ok, true)
+})
+
+test('new workers invalidate the reviewed restart scope before any quit', async () => {
+  const h = await home()
+  const rows = desktopFixture()
+  const plan = await restartPlan(null, h.paths, rows)
+  const changed = [...rows, { ...rows[1], pid: 502, ids: [id(300)] }]
+  let called = false
+  const result = await withDesktopRestart(plan, h.paths, async () => { called = true }, () => {}, {
+    inspect: () => changed, command: async () => { called = true; return { status: 0 } }
+  })
+  assert.equal(called, false)
+  assert.match(result.error, /sessions changed/)
+})
+
+test('a slow shutdown uses only its shutdown budget and leaves held files untouched', async () => {
+  const h = await home()
+  const rows = desktopFixture()
+  const plan = await restartPlan(null, h.paths, rows)
+  let time = 0, moved = false
+  const result = await withDesktopRestart(plan, h.paths, async () => { moved = true }, () => {}, {
+    now: () => time, shutdownWait: 400, reserve: 200, inspect: () => rows,
+    wait: async (ms) => { time += ms }, command: async () => ({ status: 0 })
+  })
+  assert.equal(moved, false)
+  assert.equal(time, 400)
+  assert.equal(result.restart.outcome, 'quit-not-confirmed')
+})
+
+test('a twenty-second shutdown leaves moving and reopening their own phases', async () => {
+  const h = await home()
+  let rows = desktopFixture(), time = 0
+  const plan = await restartPlan(null, h.paths, rows), calls = []
+  const result = await withDesktopRestart(plan, h.paths, async ({ check }) => {
+    time += 21_999
+    check(true)
+    return { ok: true }
+  }, () => {}, {
+    now: () => time, inspect: () => rows,
+    command: async (file, args, timeout) => {
+      calls.push({ file, timeout })
+      time += file.endsWith('osascript') ? 20_000 : 7_999
+      rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+      return { status: 0 }
+    }
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(time, 49_998)
+  assert.equal(calls[0].timeout, 30_000)
+  assert.equal(calls[1].timeout, 8_000)
+})
+
+test('recovery reopens an interrupted approved restart without requesting another shutdown', async () => {
+  const h = await home()
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, 'restart.json'), JSON.stringify({ outcome: 'moving', desktop: { pid: 500, started: 'first' } }))
+  let rows = [], calls = []
+  const result = await sweep(h.paths, { io: {
+    inspect: () => rows, command: async (file) => { calls.push(file); rows = desktopFixture(); return { status: 0 } }
+  } })
+  assert.deepEqual(calls, ['/usr/bin/open'])
+  assert.equal(result.recovered.title, 'Interrupted restart')
+  assert.equal(JSON.parse(await readFile(path.join(h.paths.state, 'restart.json'))).outcome, 'interrupted-reopened')
+})
+
+test('an approved plan moves held records only after shutdown and keeps cloud calls outside its window', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  let rows = desktopFixture(), time = 0, calls = []
+  const io = { inspect: () => rows, now: () => time, shutdownWait: 400, reserve: 200, wait: async (ms) => { time += ms }, command: async (file) => {
+    calls.push(file)
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io, cloudRequested: true, cloud: cloudFixture(h) })
+  assert.ok(planned.plan.token)
+  assert.deepEqual(calls, [])
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.equal(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)).catch(() => null), null)
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, cloudRequested: true, report: (stage) => {
+    if (stage === 'move') assert.ok(calls.includes('/usr/bin/osascript'))
+  } })
+  assert.equal(result.restarted, true)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+  assert.equal(result.receipt.startedAt, planned.plan.requestedAt)
+  assert.equal(result.receipt.restart.outcome, 'reopened')
+})
+
+test('wrong, modified, and malformed restart approvals never quit Desktop', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const calls = [], io = { inspect: () => desktopFixture(), command: async (file) => { calls.push(file); return { status: 0 } } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  assert.equal((await executeMove([from], to, h.paths, { io, approve: '0'.repeat(64) })).ok, false)
+  const file = path.join(h.paths.state, 'restart-plan.json'), changed = JSON.parse(await readFile(file))
+  changed.held = []
+  await writeFile(file, JSON.stringify(changed))
+  assert.equal((await executeMove([from], to, h.paths, { io, approve: planned.plan.token })).ok, false)
+  assert.deepEqual(calls, [])
+  const malformed = await cli(h.root, ['restart', '--restart-approved', 'invalid', '--json'])
+  assert.equal(malformed.code, 1)
+  assert.match(malformed.stderr, /approval token/)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+test('failed source authentication stays pending after an approved restart', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  let rows = desktopFixture()
+  const io = { inspect: () => rows, command: async (file) => {
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io, cloudRequested: true, cloudError: 'authentication unavailable' })
+  const result = await executeMove([from], to, h.paths, { io, cloudRequested: true, approve: planned.plan.token })
+  assert.equal(result.receipt.cloudChecks[0].account, from.account)
+  assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+  assert.equal(result.complete, false)
+})
+
+test('held continuation shares one receipt and Undo restores both phases', async () => {
+  const h = await home()
+  const cold = id(300)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.write(cold, [entry('user', 300, null, cold)])
+  await h.record('P', SOURCE)
+  await h.record('P', cold)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  let rows = desktopFixture()
+  const first = await executeMove([from], to, h.paths, { processes: rows, moveOnly: true })
+  assert.equal(first.ok, true)
+  assert.equal(first.receipt.sessions.length, 1)
+  assert.equal(first.receipt.sessions[0].id, cold)
+  assert.equal(first.receipt.held.length, 1)
+  assert.equal(first.complete, false)
+  rows = []
+  const finished = await finishHeld(h.paths, { processes: rows })
+  assert.equal(finished.file, first.file)
+  assert.equal(finished.receipt.sessions.length, 2)
+  assert.equal(finished.receipt.held.length, 0)
+  assert.equal(finished.ok, true)
+  const result = await undo(h.paths)
+  assert.ok(result.dest)
+  assert.deepEqual((await readdir(h.dir('P'))).sort(), [`local_${SOURCE}.json`, `local_${cold}.json`].sort())
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('an interrupted 4.1.6 continuation recovers while an older interrupted receipt is left to its own version', async () => {
+  for (const writer of ['4.1.6', 'older']) {
+    const h = await home()
+    const cold = id(300)
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.write(cold, [entry('user', 300, null, cold)])
+    await h.record('P', SOURCE)
+    await h.record('P', cold)
+    const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+    const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+    assert.equal(first.receipt.writer, JSON.parse(await readFile(path.join(here, 'package.json'))).version)
+    await assert.rejects(finishHeld(h.paths, { processes: [], report: (stage, text) => { if (stage === 'retire' && text === 'checking') throw new Error('interrupted append') } }), /interrupted append/)
+    const interrupted = JSON.parse(await readFile(first.file))
+    assert.equal(interrupted.appendCheckpoint.taskTransfers, 0)
+    delete interrupted.writer
+    if (writer === 'older') { delete interrupted.appendCheckpoint.taskTransfers; delete interrupted.taskTransfers }
+    await writeFile(first.file, JSON.stringify(interrupted))
+    if (writer === 'older') {
+      const before = await fixtureSnapshot(h), line = 'An older version started this move and must finish it'
+      for (const command of ['finish', 'undo', 'sweep', 'keep-local']) {
+        const output = await cli(h.root, [command, '--json'])
+        assert.equal(output.code, 1, command)
+        assert.equal(lines(output.stdout).at(-1).reason, line, command)
+      }
+      assert.equal((await cli(h.root, ['finish'])).stderr, `claude-handoff: ${line}\n`)
+      assert.ok(JSON.parse((await cli(h.root, ['accounts', '--json'])).stdout).every(row => row.recoveryProblem?.error === line && row.recoveryProblem.code === 'OLDER_MOVE'))
+      assert.deepEqual(await fixtureSnapshot(h), before)
+      continue
+    }
+    const recovered = await undo(h.paths)
+    assert.ok(recovered.reconciled)
+    const receipt = JSON.parse(await readFile(first.file))
+    assert.equal(receipt.sessions.length, 1)
+    assert.equal(receipt.sessions[0].id, cold)
+    assert.equal(receipt.held.length, 1)
+    assert.ok(await readFile(path.join(h.dir('T'), `local_${cold}.json`)))
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    assert.equal(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)).catch(() => null), null)
+    const retry = await finishHeld(h.paths, { processes: [] })
+    assert.equal(retry.ok, true)
+    assert.deepEqual(retry.receipt.failed, [])
+    assert.ok((await undo(h.paths)).dest)
+  }
+})
+
+test('a stale held continuation cannot start a new move after Undo', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  await undo(h.paths)
+  const stale = await executeMove([from], to, h.paths, { processes: [], resume: true, resumeFile: first.file })
+  assert.equal(stale.ok, false)
+  assert.match(stale.reason, /pending move changed/)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('held parents retain workerless children in the same continuation', async () => {
+  const h = await home(), child = id(701)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  await h.write(child, [entry('user', 701, null, child)])
+  await h.record('P', child, { forkedFromSessionId: `local_${SOURCE}` })
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  assert.deepEqual(first.receipt.held.map((row) => row.id), [SOURCE, child])
+  const finished = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finished.ok, true)
+  assert.deepEqual(finished.receipt.sessions.map((row) => row.id), [SOURCE, child])
+  assert.deepEqual(await readdir(h.dir('P')), [])
+})
+
+test('completed cold records may grow before the held phase finishes', async () => {
+  const h = await home(), cold = id(300)
+  for (const session of [SOURCE, cold]) {
+    await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  const row = first.receipt.sessions[0]
+  const record = JSON.parse(await readFile(row.record))
+  await writeFile(row.record, JSON.stringify({ ...record, lastFocusedAt: 1000, completedTurns: 2, bridgeSessionIds: ['session_new'] }))
+  await appendFile(row.targetTranscript, JSON.stringify(entry('assistant', 301, 300, cold)) + '\n')
+  const result = await finishHeld(h.paths, { processes: [] })
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, 2)
+})
+
+test('a successful held phase cannot hide an earlier placement verification failure', async () => {
+  const h = await home(), cold = id(300)
+  for (const session of [SOURCE, cold]) {
+    await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const restore = touchPlaced(path.join(h.dir('T'), `local_${cold}.json`))
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true }).finally(restore)
+  assert.deepEqual(first.receipt.sessions, [])
+  assert.match(first.summary.notMoved.find(row => row.id === cold).error, /desktop changed during the move/)
+  const result = await finishHeld(h.paths, { processes: [] })
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [SOURCE])
+  assert.ok(result.summary.notMoved.some(row => row.id === cold))
+})
+
+test('Keep local reports earlier verification failure while cancelling held work', async () => {
+  const h = await home(), cold = id(300)
+  for (const session of [SOURCE, cold]) {
+    await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const restore = touchPlaced(path.join(h.dir('T'), `local_${cold}.json`))
+  await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true }).finally(restore)
+  const kept = await keepLocal(h.paths)
+  assert.equal(kept.heldCancelled, 1)
+  assert.ok(kept.notMoved.some(row => row.id === cold))
+  assert.deepEqual(kept.receipt.held, [])
+})
+
+test('Keep local can abandon held work without undoing completed cold moves', async () => {
+  const h = await home(), cold = id(300)
+  for (const session of [SOURCE, cold]) {
+    await h.write(session, [entry('user', session === SOURCE ? 1 : 300, null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  const kept = await keepLocal(h.paths)
+  assert.equal(kept.file, first.file)
+  assert.equal(kept.heldCancelled, 1)
+  assert.deepEqual(kept.receipt.held, [])
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${cold}.json`)))
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+test('placed verification ignores activity and bridge registration but records title drift without repairing it', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const result = await move(await inventory([from], to, h.paths), to, h.paths)
+  const file = result.receipt.sessions[0].record
+  const record = JSON.parse(await readFile(file))
+  record.lastFocusedAt = Date.now()
+  record.completedTurns = 100
+  record.bridgeSessionIds = ['session_new']
+  record.writtenBranches = ['main', 'feature/anything']
+  record.prs = [{ prNumber: 1, url: 'https://github.com/example/repo/pull/1' }]
+  record.branch = 'feature/anything'
+  record.prState = 'merged'
+  record.model = 'claude-opus-5'
+  record.contextExceededCount = 3
+  record.alwaysAllowedReasons = ['Bash']
+  record.someFutureDesktopField = { anything: true }
+  await writeFile(file, JSON.stringify(record))
+  assert.deepEqual((await verifyPlaced(h.paths)).changed, [])
+  record.title = 'Different title after placement'
+  record.isArchived = true
+  await writeFile(file, JSON.stringify(record))
+  const changed = await verifyPlaced(h.paths)
+  assert.equal(changed.changed.length, 1)
+  assert.deepEqual(changed.changed[0].fields.sort(), ['isArchived', 'title'])
+  assert.ok(await readFile(changed.changed[0].placed))
+  assert.ok(await readFile(changed.changed[0].found))
+  assert.equal(JSON.parse(await readFile(file)).title, record.title)
+  record.lastFocusedAt++
+  await writeFile(file, JSON.stringify(record))
+  assert.equal((await verifyPlaced(h.paths)).changed[0].found, changed.changed[0].found)
+})
+
+test('automatic retries never request a restart and leave held workers alone', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.T)
+  const rows = desktopFixture()
+  const partial = await executeMove([from], to, h.paths, { processes: rows, moveOnly: true })
+  assert.equal(partial.receipt.held.length, 1)
+  const checked = await sweep(h.paths, { processes: rows })
+  assert.equal(checked.result.pendingLocal, true)
+  assert.equal(await readFile(path.join(h.paths.state, 'restart-plan.json')).catch(() => null), null)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+async function hold(file, native = false) {
+  const command = native
+    ? ['/usr/bin/lockf', '-k', '-t', '0', file, '/bin/sh', '-c', 'printf ready; cat >/dev/null']
+    : ['/usr/bin/perl', '-MFcntl=:flock', '-e', 'open(my $lock, ">>", $ARGV[0]) or die $!; flock($lock, LOCK_EX) or die $!; $| = 1; print "ready"; 1 while <STDIN>;', file]
+  const guard = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
+  await once(guard.stdout, 'data')
+  return guard
+}
+
+async function duringSecondRead(file, text, action) {
+  const first = await open(file, 'w')
+  await first.writeFile(text)
+  await unlink(file)
+  await promisify(execFile)('/usr/bin/mkfifo', [file])
+  const secondOpening = open(file, 'w')
+  await first.close()
+  const second = await secondOpening
+  await action()
+  await second.writeFile(text)
+  await second.close()
+  await unlink(file)
+  await writeFile(file, text)
+}
+
+function fork(entries, sourceId, targetId, title) {
+  const kept = entries.filter((entry) => MESSAGES.has(entry.type) && typeof entry.uuid === 'string' && !entry.isSidechain)
+  const fresh = new Map(kept.map((entry) => [entry.uuid, randomUUID()]))
+  const moved = kept.map((entry) => ({
+    ...entry,
+    uuid: fresh.get(entry.uuid),
+    parentUuid: fresh.get(entry.parentUuid) ?? null,
+    logicalParentUuid: entry.logicalParentUuid == null ? entry.logicalParentUuid : fresh.get(entry.logicalParentUuid) ?? null,
+    sessionId: targetId,
+    isSidechain: false,
+    forkedFrom: { sessionId: sourceId, messageUuid: entry.uuid }
+  }))
+  moved.push({ type: 'custom-title', sessionId: targetId, customTitle: title, uuid: randomUUID(), timestamp: new Date().toISOString() })
+  return moved
+}
+
+test('normalize collapses replays and reports conflicts', () => {
+  const a = entry('user', 1, null, id(0))
+  const b = entry('user', 2, 1, id(0), { toolUseResult: { stdout: '', stderr: '' } })
+  const rich = { ...b, toolUseResult: { stdout: 'rich', stderr: '' } }
+  const replay = normalize([a, b, rich])
+  assert.equal(replay.replays, 1)
+  assert.deepEqual(replay.entries, [a, rich])
+  const c = entry('assistant', 3, 2, id(0))
+  const moved = { ...c, parentUuid: id(1), cwd: '/elsewhere', gitBranch: 'other', slug: 'x', promptId: 'p' }
+  assert.equal(normalize([a, b, c, moved]).replays, 1)
+  assert.equal(normalize([a, b, { ...b, parentUuid: id(9) }]).conflicts, 1)
+  const conflict = normalize([a, b, { ...b, message: { role: 'user', content: 'other' } }])
+  assert.equal(conflict.conflicts, 1)
+  assert.equal(conflict.entries.length, 3)
+})
+
+test('file-read replays keep the full payload and refuse incompatible copies', () => {
+  const parent = entry('assistant', 1, null, SOURCE)
+  for (const [type, key, file, snapshot] of [
+    ['text', 'content', { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 }, '1eb370dc75ffeb3c25ea8cbd9b5cf2c10916baa3441492ac4749a156a23d8c91'],
+    ['image', 'base64', { base64: Buffer.alloc(96 * 1024, 0xab).toString('base64'), dimensions: { width: 256, height: 128 }, originalSize: 96 * 1024, type: 'image/png' }, 'ce9edbd7fdd2d1531c89919b8cd343335e3f784f633e92f07f386cf86c8b5e8a']
+  ]) {
+    const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type, file } })
+    assert.equal(semantic([parent, full], SOURCE), snapshot)
+    for (const omitted of [false, true]) {
+      const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...file, [key]: '' } } }
+      if (omitted) delete replay.toolUseResult.file[key]
+      for (const rows of [[parent, full, replay], [parent, replay, full]]) {
+        const before = structuredClone(rows), result = normalize(rows)
+        assert.equal(result.conflicts, 0)
+        assert.equal(result.replays, 1)
+        assert.deepEqual(result.entries, [parent, full])
+        assert.equal(result.entries[1], full)
+        assert.equal(semantic(rows, SOURCE), snapshot)
+        assert.deepEqual(rows, before)
+        if (key === 'base64') assert.deepEqual(Buffer.from(result.entries[1].toolUseResult.file.base64, 'base64'), Buffer.alloc(96 * 1024, 0xab))
+      }
+    }
+    const incompatible = [
+      ...[Buffer.from('different payload').toString('base64'), 42, { text: 'unexpected shape' }].map(value => ({ ...file, [key]: value })),
+      ...(type === 'text' ? [{ filePath: '/tmp/other.txt' }, { numLines: 2 }] : [{ dimensions: { width: 512, height: 128 } }, { originalSize: 1 }, { type: 'image/jpeg' }]).map(changed => ({ ...file, [key]: '', ...changed })),
+      { ...file, [key]: '', extra: true }
+    ]
+    for (const changedFile of incompatible) {
+      const changed = { ...full, toolUseResult: { ...full.toolUseResult, file: changedFile } }
+      for (const rows of [[parent, full, changed], [parent, changed, full]]) {
+        const result = normalize(rows)
+        assert.equal(result.conflicts, 1)
+        assert.equal(result.replays, 0)
+        assert.deepEqual(result.entries, rows)
+      }
+    }
+    const fileOnly = { ...full, toolUseResult: { ...full.toolUseResult, stdout: '', stderr: '' } }
+    const outputOnly = { ...full, toolUseResult: { ...full.toolUseResult, stdout: 'command output', stderr: 'command error', file: { ...file, [key]: '' } } }
+    const complete = { ...full, toolUseResult: { ...outputOnly.toolUseResult, file } }
+    for (const copies of [[fileOnly, outputOnly], [outputOnly, fileOnly]]) {
+      assert.equal(normalize([parent, ...copies]).conflicts, 1)
+      for (const rows of [[parent, ...copies, complete], [parent, complete, ...copies]]) {
+        const result = normalize(rows)
+        assert.equal(result.conflicts, 0)
+        assert.deepEqual(result.entries, [parent, complete])
+        assert.equal(result.entries[1], complete)
+      }
+    }
+  }
+})
+
+test('edited-text attachment replays ignore only their display path', () => {
+  const parent = entry('assistant', 1, null, SOURCE)
+  const original = entry('attachment', 2, 1, SOURCE, { attachment: { type: 'edited_text_file', filename: '/tmp/fixture.txt', snippet: 'synthetic file edit' } })
+  const replay = { ...original, attachment: { ...original.attachment, displayPath: 'fixture.txt' } }
+  assert.equal(semantic([parent, original], SOURCE), '3a7e37a2ae90a9f7fbf77ef203cf3ec5ba6427da4fe10508d8774052f1cba8fa')
+  assert.equal(semantic([parent, replay], SOURCE), 'c53ead433799ea63ec5dfda594a9bb3f6ce9fb74699f9913238f080ab637236c')
+  for (const rows of [[parent, original, replay], [parent, replay, original]]) {
+    const before = structuredClone(rows), result = normalize(rows)
+    assert.equal(result.conflicts, 0)
+    assert.equal(result.replays, 1)
+    assert.deepEqual(result.entries, [parent, rows[1]])
+    assert.equal(result.entries[1], rows[1])
+    assert.deepEqual(rows, before)
+  }
+  for (const attachment of [
+    { ...replay.attachment, filename: '/tmp/other.txt' },
+    { ...replay.attachment, snippet: 'different edit' },
+    { ...replay.attachment, type: 'other' },
+    { ...replay.attachment, extra: true }
+  ]) {
+    const changed = { ...replay, attachment }
+    for (const rows of [[parent, original, changed], [parent, changed, original]]) assert.equal(normalize(rows).conflicts, 1)
+  }
+  assert.equal(normalize([parent, original, { ...replay, displayPath: 'top-level.txt' }]).conflicts, 1)
+  for (const [type, kind] of [['attachment', 'other'], ['user', 'edited_text_file'], ['system', 'edited_text_file'], ['progress', 'edited_text_file']]) {
+    const other = { ...original, type, attachment: { ...original.attachment, type: kind } }
+    const otherReplay = { ...other, attachment: { ...other.attachment, displayPath: 'fixture.txt' } }
+    for (const rows of [[parent, other, otherReplay], [parent, otherReplay, other]]) assert.equal(normalize(rows).conflicts, 1)
+  }
+})
+
+test('a transcript with a compact file-read replay rehomes intact and is not retired into a poorer fork', async () => {
+  for (const [type, key, file] of [
+    ['text', 'content', { filePath: '/tmp/fixture.txt', content: 'full file body', numLines: 1 }],
+    ['image', 'base64', { base64: Buffer.alloc(96 * 1024, 0xab).toString('base64'), dimensions: { width: 256, height: 128 }, originalSize: 96 * 1024, type: 'image/png' }]
+  ]) {
+    const h = await home()
+    const parent = entry('assistant', 1, null, SOURCE)
+    const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type, file } })
+    const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...file, [key]: '' } } }
+    await h.write(SOURCE, [parent, full, replay])
+    await h.record('P', SOURCE, rehomeRecord({ title: 'Replayed file read' }))
+    await h.write(id(991), fork([parent, replay], SOURCE, id(991), 'Poorer fork'))
+    await h.record('T', id(991), rehomeRecord({ title: 'Poorer fork' }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+    const before = await readFile(transcript), beforeStat = await stat(transcript)
+    const inv = await inventory([from], to, h.paths)
+    assert.equal(inv.blocked.length, 0)
+    assert.equal(inv.there.length, 0)
+    assert.equal(inv.move.length, 1)
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions[0].strategy, 'rehome')
+    assert.deepEqual(await readFile(transcript), before)
+    assert.equal((await stat(transcript)).ino, beforeStat.ino)
+    assert.equal((await accounts(h.paths)).find(row => row.account === h.acct.P).sessions.length, 0)
+  }
+})
+
+test('semantic change detection keeps richer output and parse state', () => {
+  const a = entry('user', 1, null, id(0))
+  const plain = entry('user', 2, 1, id(0), { toolUseResult: { stdout: '', stderr: '' } })
+  const rich = { ...plain, toolUseResult: { stdout: 'finished', stderr: '' } }
+  assert.equal(semantic([a, plain, rich], id(0)), '79163d4f82bf5ea15a60aa7fd8993e49fb2788ca942eca14951f5796bc5a113c')
+  assert.notEqual(semantic([a, plain], id(0)), semantic([a, rich], id(0)))
+  assert.notEqual(semantic([a, rich], id(0)), semantic([a, rich], id(0), 1))
+  const before = [a, rich, { type: 'relocated', sessionId: id(0), relocatedCwd: '/before' }]
+  const after = [a, rich, { type: 'relocated', sessionId: id(0), relocatedCwd: '/after' }]
+  assert.notEqual(semantic(before, id(0)), semantic(after, id(0)))
+})
+
+test('generic replay omissions keep an existing complete row and protect filled values and structure', () => {
+  const parent = entry('assistant', 1, null, SOURCE)
+  const row = toolUseResult => entry('user', 2, 1, SOURCE, { toolUseResult })
+  for (const value of ['full file', 0, false, [1, { nested: 'value' }]]) {
+    const rich = row({ invented: { nested: value } })
+    for (const blank of [undefined, null, '', [], {}]) {
+      const poor = row({ invented: { nested: blank } })
+      for (const copies of [[rich, poor], [poor, rich]]) {
+        const result = normalize([parent, ...copies])
+        assert.equal(result.conflicts, 0)
+        assert.equal(result.entries[1], rich)
+      }
+    }
+  }
+  for (const [a, b] of [
+    [{ originalFile: 'first' }, { originalFile: 'second' }],
+    [{ a: 'filled', b: '' }, { a: '', b: 'filled' }],
+    [{ 'a.b': 'filled' }, { a: { b: 'filled' } }],
+    [{ a: [1, 2] }, { a: [2, 1] }],
+    [{ a: [1] }, { a: [1, 2] }],
+    [{ a: 0 }, { a: false }]
+  ]) assert.equal(normalize([parent, row(a), row(b)]).conflicts, 1)
+  const rich = row({ originalFile: 'full' }), poor = row({ originalFile: '' })
+  assert.equal(semantic([parent, rich, poor], SOURCE), 'abe8cf96e0c1c0d00bf5fb8c58791cc5f08890e923c97e34967d98713fcf9ae9')
+  assert.equal(semantic([parent, poor, rich], SOURCE), 'a751c53b3a13d465d865ee4a3383320e2620f48090c4aaa2eacfbe18c0472d67')
+  for (const changed of [{ ...poor, message: { role: 'user', content: 'different' } }, { ...poor, parentUuid: id(999) }]) {
+    assert.equal(normalize([parent, rich, changed]).conflicts, 1)
+  }
+  const first = row({ stdout: 'full' }), later = { ...first, cwd: '/a/much/longer/runtime/path' }
+  assert.equal(normalize([parent, first, later]).entries[1], first)
+  for (const stdout of ['', 'stdout']) for (const stderr of ['', 'stderr']) for (const content of ['', 'file']) {
+    const complete = row({ stdout, stderr, file: { content } })
+    const copies = [complete, { ...complete, cwd: '/long/runtime/value' }, row({ stdout: '', stderr: '', file: { content: '' } })]
+    for (const rows of [[parent, ...copies], [parent, ...copies.toReversed()]]) {
+      const legacy = normalize(rows, false)
+      assert.equal(legacy.conflicts, 0)
+      assert.equal(normalize(rows).entries[1], legacy.entries[1])
+    }
+  }
+})
+
+test('replay metadata preserves complete copies, content checks and existing receipt hashes', () => {
+  const parent = entry('user', 1, null, SOURCE)
+  const rich = entry('assistant', 2, 1, SOURCE, { message: { role: 'assistant', content: 'same response', usage: { input_tokens: 2, output_tokens: 42, cache_read_input_tokens: 100 } },
+    origin: { kind: 'local', producer: 'desktop' }, toolUseResult: { originalFile: 'full file' } })
+  const poor = { ...rich, message: { ...rich.message, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 } }, origin: { kind: 'local' }, toolUseResult: { originalFile: '' } }
+  const snapshots = ['9b73e0209da9afbaf4cdc9db54bfe2e80481455c906e278b3a1931e81cc45b33', '13f7544b251996252fcac3d0954cf42e25cecb13c55eafadd51504f2c68f0692']
+  for (const [index, copies] of [[rich, poor], [poor, rich]].entries()) {
+    const rows = [parent, ...copies], before = structuredClone(rows), result = normalize(rows)
+    assert.equal(result.conflicts, 0)
+    assert.equal(result.entries[1], rich)
+    assert.equal(semantic(rows, SOURCE), snapshots[index])
+    assert.deepEqual(rows, before)
+  }
+  for (const origin of [{ kind: 'local' }, { kind: 'local', producer: null }, { kind: 'local', producer: '' }]) {
+    const replay = { ...rich, origin }
+    for (const copies of [[rich, replay], [replay, rich]]) assert.equal(normalize([parent, ...copies]).entries[1], rich)
+  }
+  for (const origin of [undefined, {}]) {
+    const full = { ...rich, origin: { producer: 'desktop' } }, replay = { ...full, origin }
+    assert.equal(normalize([parent, replay, full]).entries[1], full)
+  }
+  for (const changed of [
+    { ...poor, origin: { kind: 'local', producer: 'other' } },
+    { ...poor, origin: { kind: 'remote' } },
+    { ...poor, message: { ...poor.message, content: 'different response' } },
+    { ...poor, message: { ...poor.message, role: 'user' } },
+    { ...poor, toolUseResult: { originalFile: 'different file' } },
+    { ...poor, parentUuid: id(999) },
+    { ...rich, message: { ...rich.message, futureContent: 'different' } }
+  ]) for (const copies of [[rich, changed], [changed, rich]]) assert.equal(normalize([parent, ...copies]).conflicts, 1)
+  const producerOnly = { ...rich, toolUseResult: poor.toolUseResult }, contentOnly = { ...rich, origin: poor.origin }
+  assert.equal(normalize([parent, producerOnly, contentOnly]).conflicts, 1)
+})
+
+test('originalFile replays rehome and retire intact while lineage covers only poorer histories', async () => {
+  for (const metadata of [false, true]) for (const order of [false, true]) for (const richerTarget of [false, true]) {
+    const h = await home(), parent = entry('assistant', 1, null, SOURCE)
+    const rich = entry('user', 2, 1, SOURCE, { toolUseResult: { originalFile: 'synthetic complete file', invented: { nested: false } } })
+    const poor = { ...rich, toolUseResult: { originalFile: '', invented: {} } }
+    if (metadata) {
+      rich.origin = { producer: 'desktop' }
+      rich.message = { ...rich.message, usage: { output_tokens: 42 } }
+      poor.message = { ...poor.message, usage: { output_tokens: 0 } }
+    }
+    const entries = [parent, ...(order ? [poor, rich] : [rich, poor])]
+    await h.write(SOURCE, richerTarget ? [parent, poor] : entries)
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(id(991), fork([parent, richerTarget ? rich : poor], SOURCE, id(991), 'Fork'))
+    await h.record('T', id(991), rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const before = await readFile(path.join(h.project, `${SOURCE}.jsonl`))
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    assert.equal(inv.blocked.length, 0)
+    assert.equal(inv.there.length, richerTarget ? 1 : 0)
+    const result = await move(inv, to, h.paths)
+    assert.equal(result.ok, true)
+    assert.equal(result.receipt.superseded.filter(row => row.source).length, 1)
+    assert.deepEqual(await readFile(path.join(h.project, `${SOURCE}.jsonl`)), before)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+  }
+})
+
+test('a sole Desktop owner moves by identity when its replay history cannot be parsed', async () => {
+  const parent = entry('user', 1, null, SOURCE)
+  const read = entry('user', 2, 1, SOURCE, { toolUseResult: { originalFile: 'synthetic complete file' } })
+  const reply = entry('assistant', 2, 1, SOURCE, { message: { role: 'assistant', content: 'same response', usage: { output_tokens: 42 } }, origin: { kind: 'local', producer: 'desktop' } })
+  const shapes = {
+    'Oct 3': [read, { ...read, toolUseResult: { originalFile: '' } }, { origin: { producer: 'desktop' } }],
+    'Oct 7': [reply, { ...reply, message: { ...reply.message, usage: { output_tokens: 0 } }, origin: { kind: 'local' } }, { toolUseResult: { originalFile: 'replay only' } }]
+  }
+  for (const [name, [full, replay, complement]] of Object.entries(shapes)) for (const mode of ['conflict', 'unparseable', 'unreadable']) for (const shared of [false, true]) {
+    const h = await home(), label = `${name} ${mode} ${shared ? 'shared' : 'sole'}`, transcript = path.join(h.project, `${SOURCE}.jsonl`)
+    const entries = [parent, full, mode === 'conflict' ? { ...replay, ...complement } : replay]
+    assert.equal(normalize(entries).conflicts, mode === 'conflict' ? 1 : 0, label)
+    await h.write(SOURCE, entries)
+    if (mode === 'unparseable') await appendFile(transcript, '{"type":"user","uuid":"broken\n')
+    await h.record('P', SOURCE, rehomeRecord())
+    if (shared) await h.record('Q', SOURCE, rehomeRecord())
+    const before = await readFile(transcript), native = fs.readFile
+    if (mode === 'unreadable') {
+      fs.readFile = async (file, ...args) => String(file) === transcript ? Promise.reject(new Error('forced parse failure')) : native(file, ...args)
+      syncBuiltinESMExports()
+    }
+    try {
+      const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+      const result = await move(await inventory([from], to, h.paths, () => {}, { processes: [] }), to, h.paths)
+      if (shared) {
+        assert.equal(result.receipt.sessions.length, 0, label)
+        assert.match(result.receipt.failed[0].error, { conflict: /conflicting duplicate uuids/, unparseable: /unparseable lines/, unreadable: /forced parse failure/ }[mode], label)
+        assert.deepEqual(await readdir(h.dir('T')), [], label)
+        assert.deepEqual(await readdir(h.dir('P')), [`local_${SOURCE}.json`], label)
+      } else {
+        assert.equal(result.ok, true, label)
+        assert.equal(result.receipt.sessions.length, 1, label)
+        assert.equal(result.receipt.superseded.filter(row => row.source).length, 1, label)
+        assert.deepEqual(await readdir(h.dir('P')), [], label)
+        assert.deepEqual(await readdir(h.dir('T')), [`local_${SOURCE}.json`], label)
+        assert.ok((await undo(h.paths, { processes: [] })).dest, label)
+        assert.deepEqual(await readdir(h.dir('T')), [], label)
+      }
+    } finally { fs.readFile = native; syncBuiltinESMExports() }
+    assert.deepEqual(await readFile(transcript), before, label)
+  }
+})
+
+test('a transcript with fork lineage stays non-sole when its ancestor read fails', async () => {
+  const h = await home(), ancestor = id(740), base = branchEntries(2, ancestor, 740)
+  await h.write(ancestor, base)
+  await h.write(SOURCE, fork(base, ancestor, SOURCE, 'Fork'))
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const native = fs.readFile, blocked = path.join(h.project, `${ancestor}.jsonl`)
+  let failed = false
+  fs.readFile = async (file, ...args) => {
+    if (String(file) === blocked) { failed = true; throw new Error('forced ancestor read failure') }
+    return native(file, ...args)
+  }
+  syncBuiltinESMExports()
+  let inv
+  try { inv = await inventory([from], to, h.paths, () => {}, { processes: [] }) }
+  finally { fs.readFile = native; syncBuiltinESMExports() }
+  assert.equal(failed, true)
+  const source = inv.sources.find(row => row.id === SOURCE)
+  assert.deepEqual(source.lineage, [ancestor])
+  assert.equal(source.sole, false)
+  assert.ok(!inv.move.some(row => row.id === SOURCE))
+})
+
+test('cli exits nonzero on partial failure and undoes over json', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)])
+  await h.record('P', SOURCE)
+  await h.write(id(600), [entry('user', 600, null, id(600))])
+  await appendFile(path.join(h.project, `${id(600)}.jsonl`), '{"type":"user","uuid":"broken\n')
+  await h.record('P', id(600))
+  await h.record('Q', id(600))
+  const run = (args) => cli(h.root, args)
+  const orphan = path.join(h.project, `${id(900)}.jsonl`)
+  const orphanEntry = { ...entry('user', 900, null, id(900)), forkedFrom: { sessionId: id(1), messageUuid: id(901) } }
+  await writeFile(orphan, JSON.stringify(orphanEntry) + '\n')
+  await mkdir(h.paths.state, { recursive: true })
+  const interrupted = {
+    at: '2026-01-01T00-00-00-000',
+    from: [],
+    to: 'x',
+    sessions: [],
+    failed: [],
+    pending: { strategy: 'remote', id: id(900), title: 'Orphan', targetId: id(900), made: [orphan], targetSemantic: semantic([orphanEntry], id(900)), targetSemanticVersion: 3 }
+  }
+  await writeFile(path.join(h.paths.state, `${interrupted.at}.json`), JSON.stringify(interrupted))
+  const dry = await run(['--from', 'p@example.com', '--to', 'z@example.com', '--dry-run', '--json'])
+  assert.equal(dry.code, 1)
+  assert.ok(dry.stdout.includes('"stage":"pending"'))
+  assert.equal(JSON.parse(dry.stdout.trim().split('\n').at(-1)).recoveryRequired, true)
+  assert.ok(await readFile(orphan))
+  assert.equal(await readdir(path.join(h.paths.state, 'quarantine')).catch(() => 'none'), 'none')
+  const list = JSON.parse((await run(['accounts', '--json'])).stdout)
+  assert.equal(list.some((a) => a.active), false)
+  assert.equal(list.every((a) => a.identityState === 'unknown'), true)
+  assert.ok(await readFile(orphan))
+  const recovered = await run(['--from', 'p@example.com', '--to', 'z@example.com', '--json'])
+  assert.equal(recovered.code, 1)
+  const recovery = recovered.stdout.trim().split('\n').map((l) => JSON.parse(l))
+  assert.ok(recovery.some((e) => e.stage === 'reconciled'))
+  assert.equal(recovery.at(-1).recoveryRequired, true)
+  assert.equal(await readFile(orphan).catch(() => 'gone'), 'gone')
+  const moved = await run(['--from', 'p@example.com', '--to', 'z@example.com', '--json'])
+  assert.equal(moved.code, 1)
+  const events = moved.stdout.trim().split('\n').map((l) => JSON.parse(l))
+  const done = events.at(-1)
+  assert.equal(done.ok, false)
+  assert.equal(done.complete, true)
+  assert.equal(done.moved, 1)
+  assert.equal(done.failed.length, 1)
+  assert.equal(done.restart, false)
+  const rejected = await run(['undo', '--dry-run'])
+  assert.equal(rejected.code, 1)
+  assert.match(rejected.stderr, /undo accepts only --json/)
+  const undone = await run(['undo', '--json'])
+  assert.equal(undone.code, 0)
+  assert.equal(JSON.parse(undone.stdout.trim().split('\n').at(-1)).sessions, 1)
+})
+
+test('menubar-style cloud moves do not invent pending work for a cleared source', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Offline source' }))
+  const moved = await cli(h.root, ['--from', 'p@example.com personal', '--to', 'z@example.com personal', '--cloud', '--json'])
+  assert.equal(moved.code, 0)
+  const result = JSON.parse(moved.stdout.trim().split('\n').at(-1))
+  assert.equal(result.moved, 1)
+  assert.equal(result.pendingCloud, 0)
+  assert.equal(result.complete, true)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
+
+  const listed = await cli(h.root, ['accounts', '--json'])
+  const accountRows = JSON.parse(listed.stdout)
+  assert.equal(accountRows.find((account) => account.account === h.acct.P && account.org === h.org.P).pending, null)
+  assert.ok(accountRows.every(account => account.receiptDone === result.destinationLabel))
+  const done = async () => [...new Set(JSON.parse((await cli(h.root, ['accounts', '--json'])).stdout).map(account => account.receiptDone))]
+  const saved = JSON.parse(await readFile(result.receipt))
+  await writeFile(result.receipt, JSON.stringify({ ...saved, cloudChecks: [{ account: h.acct.P, org: h.org.P, label: 'P', sessionIds: ['session_old'], status: 'pending' }] }))
+  assert.deepEqual(await done(), [null])
+  await writeFile(result.receipt, JSON.stringify({ ...saved, verification: { ok: false, problems: [{ id: SOURCE, check: 'transcript' }] } }))
+  assert.deepEqual(await done(), [null])
+  await writeFile(result.receipt, JSON.stringify(saved))
+  assert.deepEqual(await done(), [result.destinationLabel])
+
+  const undone = await cli(h.root, ['undo', '--json'])
+  assert.equal(undone.code, 0)
+  assert.deepEqual(await readdir(h.dir('P')), [`local_${SOURCE}.json`])
+  assert.deepEqual(await readdir(h.dir('Z')), [])
+  assert.ok(JSON.parse((await cli(h.root, ['accounts', '--json'])).stdout).every(account => account.receiptDone === null))
+})
+
+test('human CLI names staged Undo instead of printing false success', async () => {
+  const h = await home()
+  const at = '2099-01-03T00-00-00-000'
+  const receipt = {
+    at,
+    from: ['source'],
+    to: 'target',
+    sessions: [],
+    failed: [],
+    superseded: [],
+    undoing: [],
+    remoteUndoing: [{ id: 'cse_pending_undo', title: 'Pending undo', account: h.acct.T, org: h.org.T, accountLabel: 't@example.com · Team T' }]
+  }
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, `${at}.json`), JSON.stringify(receipt))
+  const result = await cli(h.root, ['undo'])
+
+  assert.equal(result.code, 1)
+  assert.match(result.stdout, /pending.*t@example.com/i)
+  assert.doesNotMatch(result.stdout, /quarantine\s+undefined/)
+  assert.doesNotMatch(result.stdout, /chat messages (?:unchanged|preserved)/)
+  const continued = await cli(h.root, ['finish', '--json'])
+  assert.equal(continued.code, 1)
+  assert.equal(JSON.parse(continued.stdout.trim().split('\n').at(-1)).pendingUndo.length, 1)
+})
+
+test('human CLI reports Finish recovery without an undefined pending count', async () => {
+  const h = await home()
+  const at = '2099-01-04T00-00-00-000'
+  const receipt = {
+    at,
+    from: ['source'],
+    to: 'target',
+    sessions: [],
+    failed: [],
+    superseded: [],
+    finalizing: true,
+    cloudChecks: [{ account: h.acct.T, org: h.org.T, label: 't@example.com · Team T', status: 'pending' }]
+  }
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, `${at}.json`), JSON.stringify(receipt))
+  const result = await cli(h.root, ['finish'])
+
+  assert.equal(result.code, 1)
+  assert.match(result.stdout, /recovered.*finalization rolled back/i)
+  assert.doesNotMatch(result.stdout, /undefined cloud checks/)
+})
+
+test('native and fallback helpers share the kernel lock and release it after a move', async () => {
+  const nativeAvailable = await stat('/usr/bin/lockf').then(() => true, () => false)
+  for (const [native, fallback] of nativeAvailable ? [[false, false], [false, true], [true, false], [true, true]] : [[false, true]]) {
+    const h = await home()
+    await h.write(id(999), [entry('user', 999, null, id(999))])
+    await h.record('P', id(999))
+    await mkdir(h.paths.state, { recursive: true })
+    const file = path.join(h.paths.state, 'lock'), setup = fallback ? withoutLockf : ''
+    const guard = await hold(file, native), inode = (await stat(file)).ino
+    const args = ['--from', 'p@example.com', '--to', 'z@example.com', '--json']
+    try {
+      const result = await cli(h.root, args, setup)
+      assert.equal(result.code, 1)
+      assert.equal(lines(result.stdout).at(-1).code, 'LOCK_BUSY')
+      assert.equal((await readdir(h.dir('Z'))).length, 0)
+    } finally {
+      const exited = once(guard, 'exit')
+      guard.stdin.end()
+      await exited
+    }
+    const moved = await cli(h.root, args, setup)
+    assert.equal(moved.code, 0, moved.stderr)
+    assert.equal((await readdir(h.dir('Z'))).length, 1)
+    assert.equal((await stat(file)).ino, inode)
+    const undone = await cli(h.root, ['undo', '--json'], setup)
+    assert.equal(undone.code, 0, undone.stderr)
+    assert.equal((await readdir(h.dir('P'))).length, 1)
+  }
+})
+
+test('fallback lock releases after an interrupted move so recovery can run', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const crashed = await cli(h.root, ['--from', 'p@example.com', '--to', 'z@example.com', '--json'], `${withoutLockf}
+    const link = lockFs.link
+    lockFs.link = async (...args) => { await link(...args); process.exit(23) }
+  `)
+  assert.equal(crashed.code, 23)
+  const recovered = await cli(h.root, ['finish', '--json'], withoutLockf)
+  assert.ok(lines(recovered.stdout).at(-1).reconciled, recovered.stderr)
+  assert.equal((await readdir(h.dir('P'))).length, 1)
+  assert.equal(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)).catch(() => null), null)
+  const moved = await cli(h.root, ['--from', 'p@example.com', '--to', 'z@example.com', '--json'], withoutLockf)
+  assert.equal(moved.code, 0, moved.stderr)
+})
+
+test('a non-Claude process mentioning a session id is not a worker', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)', SOURCE], { stdio: 'ignore' })
+  await new Promise((resolve, reject) => {
+    child.once('spawn', resolve)
+    child.once('error', reject)
+  })
+  try {
+    const by = Object.fromEntries((await accounts(h.paths)).map((account) => [account.account, account]))
+    const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+    assert.equal(inv.move.length, 1)
+    assert.equal((await move(inv, by[h.acct.Z], h.paths)).ok, true)
+  } finally {
+    child.kill()
+    await once(child, 'exit')
+  }
+})
+
+test('unreadable Desktop records are counted and fail the move', async () => {
+  const h = await home()
+  const file = path.join(h.dir('P'), `local_${id(934)}.json`)
+  const target = path.join(h.dir('Z'), `local_${id(933)}.json`)
+  await writeFile(file, '{broken')
+  await writeFile(target, '{broken')
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  assert.deepEqual(by[h.acct.P].unreadable, [file])
+  assert.match(by[h.acct.P].stats, /1 unreadable/)
+  const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  assert.equal(inv.total, 1)
+  assert.equal(inv.unreadable.length, 2)
+  const result = await move(inv, by[h.acct.Z], h.paths)
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.receipt.failed.map((failure) => failure.error), ['unreadable Desktop record', 'unreadable Desktop record'])
+})
+
+test('an invalid duplicate is refused, never hidden behind a valid twin', async () => {
+  const h = await home()
+  const k1 = [entry('user', 950, null, id(950)), entry('assistant', 951, 950, id(950))]
+  await h.write(id(950), k1)
+  await h.record('P', id(950))
+  await h.write(id(960), fork(k1, id(950), id(960), 'K'))
+  await appendFile(path.join(h.project, `${id(960)}.jsonl`), '{"type":"user","uuid":"broken\n')
+  await h.record('T', id(960))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.deepEqual(inv.move.map((s) => s.id), [id(950)])
+  assert.deepEqual(inv.blocked.map((s) => s.id), [id(960)])
+  assert.match(inv.blocked[0].error, /1 unparseable lines/)
+  const result = await move(inv, by[h.acct.Z], h.paths)
+  assert.deepEqual(result.receipt.failed.map((f) => f.error), ['1 unparseable lines'])
+  assert.equal(result.receipt.sessions.length, 1)
+})
+
+test('same-root histories with different content are never folded together', async () => {
+  const h = await home()
+  const source = [entry('user', 940, null, id(940)), entry('assistant', 941, 940, id(940))]
+  await h.write(id(940), source)
+  await h.record('P', id(940))
+  const changed = fork(source, id(940), id(945), 'Changed')
+  changed.push({ type: 'content-replacement', sessionId: id(945), replacements: [{ uuid: id(940), text: 'different' }], uuid: id(946), timestamp: '2026-09-01T00:00:46.000Z' })
+  await h.write(id(945), changed)
+  await h.record('T', id(945))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.equal(inv.twice, 0)
+  assert.equal(inv.apart, 2)
+  assert.deepEqual(inv.move.map((s) => s.id).sort(), [id(940), id(945)])
+})
+
+test('compatible source versions that need merging are blocked', async () => {
+  const h = await home()
+  const source = [entry('user', 942, null, id(942), { toolUseResult: { stdout: '', stderr: '' } })]
+  await h.write(id(942), source)
+  await h.record('P', id(942))
+  const richer = fork(source, id(942), id(943), 'Richer')
+  richer[0].toolUseResult = { stdout: 'finished', stderr: '' }
+  await h.write(id(943), richer)
+  await h.record('T', id(943))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.deepEqual(inv.move, [])
+  assert.equal(inv.blocked.length, 1)
+  assert.match(inv.blocked[0].error, /multiple compatible source versions require merging/)
+  assert.equal(inv.twice, 1)
+})
+
+test('runtime latch drift remains one blocked history', async () => {
+  const h = await home()
+  const source = [entry('user', 944, null, id(944)), { type: 'atis-latch', sessionId: id(944), atis: 'first' }]
+  await h.write(id(944), source)
+  await h.record('P', id(944))
+  const copy = [...fork(source, id(944), id(947), 'Latch'), { type: 'atis-latch', sessionId: id(947), atis: 'second' }]
+  await h.write(id(947), copy)
+  await h.record('T', id(947))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.equal(inv.move.length, 0)
+  assert.equal(inv.blocked.length, 1)
+  assert.equal(inv.twice, 1)
+})
+
+test('different relocation state keeps both histories', async () => {
+  const h = await home()
+  const source = [entry('user', 948, null, id(948)), { type: 'relocated', sessionId: id(948), relocatedCwd: '/first' }]
+  await h.write(id(948), source)
+  await h.record('P', id(948))
+  const copy = [...fork(source, id(948), id(949), 'Relocated'), { type: 'relocated', sessionId: id(949), relocatedCwd: '/second' }]
+  await h.write(id(949), copy)
+  await h.record('T', id(949))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.deepEqual(inv.move.map((s) => s.id).sort(), [id(948), id(949)])
+})
+
+test('a conflicting same-root history is refused instead of hidden', async () => {
+  const h = await home()
+  const source = [entry('user', 935, null, id(935)), entry('assistant', 936, 935, id(935))]
+  await h.write(id(935), source)
+  await h.record('P', id(935))
+  const conflict = fork(source, id(935), id(937), 'Conflict')
+  const repeated = conflict.find((e) => e.type === 'assistant')
+  conflict.push({ ...repeated, message: { role: 'assistant', content: 'different' } })
+  await h.write(id(937), conflict)
+  await h.record('T', id(937))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.deepEqual(inv.move.map((s) => s.id), [id(935)])
+  assert.deepEqual(inv.blocked.map((s) => s.id), [id(937)])
+  const result = await move(inv, by[h.acct.Z], h.paths)
+  assert.match(result.receipt.failed[0].error, /conflicting duplicate uuids/)
+})
+
+test('idle Finish reports refused sessions quietly while verification errors remain failures', async () => {
+  const h = await home()
+  const bad = entry('user', 1, null, SOURCE)
+  await h.write(SOURCE, [bad, { ...bad, message: { role: 'user', content: 'conflicting body' } }])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Needs attention' }))
+  await h.record('Q', SOURCE, rehomeRecord({ title: 'Needs attention' }))
+  await h.write(id(994), [entry('user', 2, null, id(994))])
+  await h.record('P', id(994), rehomeRecord({ title: 'Good history' }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+  assert.equal(moved.receipt.sessions.length, 1)
+  assert.equal(moved.receipt.failed.length, 1)
+  const result = await cli(h.root, ['finish', '--json'])
+  assert.equal(result.code, 0)
+  const idle = lines(result.stdout).find(row => row.nothing)
+  assert.match(idle.failed[0].error, /conflicting duplicate uuids/)
+  const text = await cli(h.root, ['finish'])
+  assert.equal(text.code, 0)
+  assert.match(text.stdout, /nothing pending\n.*not moved.*conflicting duplicate uuids/s)
+  const refused = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(refused.receipt, moved.file)
+  assert.equal(refused.complete, true)
+  assert.equal(refused.failed.length, 0)
+  assert.equal(refused.notMoved.length, 1)
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  receipt.failed = []
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const clean = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(clean.complete, true)
+  assert.equal(clean.receipt, moved.file)
+  receipt.verification = { ok: false, problems: [{ id: id(994), check: 'transcript' }] }
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const unverified = await cli(h.root, ['finish', '--json'])
+  assert.equal(unverified.code, 1)
+  assert.deepEqual(lines(unverified.stdout).find(row => row.done).problems, receipt.verification.problems)
+  const details = await cli(h.root, ['finish'])
+  assert.equal(details.code, 1)
+  assert.ok(details.stdout.includes(`${id(994)} | transcript verification failed`))
+  const checked = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(checked.ok, false)
+  assert.match(checked.error, /transcript verification failed/)
+  await writeFile(moved.file, '{')
+  const corrupt = lines((await cli(h.root, ['sweep', '--json'])).stdout)[0]
+  assert.equal(corrupt.ok, false)
+  assert.match(corrupt.error, /corrupt receipt/)
+})
+
+test('new sidecars remain visible through a shared transcript', async () => {
+  const h = await home()
+  const n1 = [entry('user', 985, null, id(985)), entry('assistant', 986, 985, id(985))]
+  await h.write(id(985), n1)
+  await h.record('P', id(985))
+  const pick = async () => { const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a])); return { from: [by[h.acct.P]], to: by[h.acct.Z] } }
+  let p = await pick()
+  const first = await move(await inventory(p.from, p.to, h.paths), p.to, h.paths)
+  const older = first.receipt.sessions[0].targetId
+  await mkdir(path.join(h.project, id(985), 'subagents'), { recursive: true })
+  await writeFile(path.join(h.project, id(985), 'subagents', 'agent-n.jsonl'), '{"agent":"n"}\n')
+  await h.record('P', id(985))
+  p = await pick()
+  const inv = await inventory(p.from, p.to, h.paths)
+  assert.equal(inv.there.length, 1)
+  assert.deepEqual(inv.move, [])
+  const second = await move(inv, p.to, h.paths)
+  assert.equal(second.ok, true)
+  assert.equal(second.receipt.sessions.length, 0)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual((await readdir(h.dir('Z'))).map((f) => f.slice(6, -5)), [older])
+})
+
+test('nested histories with split sidecars are blocked instead of copied', async () => {
+  const h = await home()
+  const base = [entry('user', 860, null, id(860)), entry('assistant', 861, 860, id(860))]
+  await h.write(id(860), base)
+  await h.record('P', id(860))
+  await mkdir(path.join(h.project, id(860), 'subagents'), { recursive: true })
+  await writeFile(path.join(h.project, id(860), 'subagents', 'old.jsonl'), '{"old":true}\n')
+  await h.write(id(870), [...fork(base, id(860), id(870), 'Merged'), entry('user', 862, null, id(870))])
+  await h.record('T', id(870))
+  await mkdir(path.join(h.project, id(870), 'subagents'), { recursive: true })
+  await writeFile(path.join(h.project, id(870), 'subagents', 'new.jsonl'), '{"new":true}\n')
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.equal(inv.twice, 1)
+  assert.deepEqual(inv.move, [])
+  assert.equal(inv.blocked.length, 1)
+  assert.match(inv.blocked[0].error, /multiple compatible source versions require merging/)
+  assert.equal((await readdir(h.dir('P'))).length, 1)
+  assert.equal((await readdir(h.dir('T'))).length, 1)
+})
+
+test('a conflicting sidecar path keeps both nested histories', async () => {
+  const h = await home()
+  const base = [entry('user', 880, null, id(880)), entry('assistant', 881, 880, id(880))]
+  await h.write(id(880), base)
+  await h.record('P', id(880))
+  await mkdir(path.join(h.project, id(880), 'subagents'), { recursive: true })
+  await writeFile(path.join(h.project, id(880), 'subagents', 'agent.jsonl'), '{"version":1}\n')
+  await h.write(id(890), [...fork(base, id(880), id(890), 'Conflict'), entry('user', 882, null, id(890))])
+  await h.record('T', id(890))
+  await mkdir(path.join(h.project, id(890), 'subagents'), { recursive: true })
+  await writeFile(path.join(h.project, id(890), 'subagents', 'agent.jsonl'), '{"version":2}\n')
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.equal(inv.twice, 0)
+  assert.deepEqual(inv.move.map((s) => s.id).sort(), [id(880), id(890)].sort())
+})
+
+test('target sidecar drift after inventory keeps the source record', async () => {
+  const h = await home()
+  const source = [entry('user', 987, null, id(987)), entry('assistant', 988, 987, id(987))]
+  await h.write(id(987), source)
+  const sidecar = path.join(h.project, id(987), 'subagents', 'agent.jsonl')
+  await mkdir(path.dirname(sidecar), { recursive: true })
+  await writeFile(sidecar, '{"agent":true}\n')
+  await h.record('P', id(987))
+  const pick = async () => { const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a])); return { from: [by[h.acct.P]], to: by[h.acct.Z] } }
+  let p = await pick()
+  const first = await move(await inventory(p.from, p.to, h.paths), p.to, h.paths)
+  const older = first.receipt.sessions[0].targetId
+  await appendFile(path.join(h.project, `${id(987)}.jsonl`), JSON.stringify(entry('user', 989, 988, id(987))) + '\n')
+  await h.record('P', id(987))
+  p = await pick()
+  const inv = await inventory(p.from, p.to, h.paths)
+  await unlink(sidecar)
+  const second = await move(inv, p.to, h.paths)
+  assert.equal(second.ok, false)
+  assert.match(second.receipt.failed[0].error, /destination changed since inventory/)
+  assert.deepEqual(second.receipt.superseded, [])
+  assert.ok((await readdir(h.dir('Z'))).includes(`local_${older}.json`))
+})
+
+test('a contained destination supersedes only its Desktop record', async () => {
+  const h = await home()
+  const q1 = [entry('user', 940, null, id(940)), entry('assistant', 941, 940, id(940))]
+  await h.write(id(940), [...q1, entry('user', 942, 941, id(940))])
+  await h.record('P', id(940))
+  await h.write(id(945), fork(q1, id(940), id(945), 'Q'))
+  const olderTranscript = path.join(h.project, `${id(945)}.jsonl`)
+  await h.record('Z', id(945))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  assert.deepEqual(inv.move.map((s) => s.id), [id(940)])
+  const result = await move(inv, by[h.acct.Z], h.paths)
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.receipt.superseded.filter((s) => !s.source).map((s) => s.id), [id(945)])
+  assert.ok(await readFile(olderTranscript))
+  assert.deepEqual((await readdir(h.dir('Z'))).map((f) => f.slice(6, -5)), [result.receipt.sessions[0].targetId])
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.ok((await undo(h.paths)).dest)
+  assert.ok(await readFile(olderTranscript))
+  assert.deepEqual((await readdir(h.dir('Z'))).map((f) => f.slice(6, -5)), [id(945)])
+  assert.equal((await readdir(h.dir('P'))).length, 1)
+})
+
+test('an existing bridge makes target supersession a separate refusal, not a restart', async () => {
+  const h = await home()
+  const entries = [entry('user', 940, null, id(940)), entry('assistant', 941, 940, id(940))]
+  await h.write(id(940), [...entries, entry('user', 942, 941, id(940))])
+  await h.record('P', id(940))
+  await h.write(id(945), fork(entries, id(940), id(945), 'Q'))
+  await h.record('Z', id(945), { bridgeSessionIds: ['session_existing'] })
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
+  const rows = desktopFixture(id(945))
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: rows })
+  assert.equal(await restartPlan(inv, h.paths, rows), null)
+})
+
+test('a target without a Desktop record id never covers and retires a valid source', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Valid source' }))
+  await h.record('Z', SOURCE, rehomeRecord({ sessionId: null, title: 'Invalid target identity' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths)
+
+  assert.equal(inv.there.length, 0)
+  assert.equal(inv.move.length, 0)
+  assert.match(inv.blocked[0].error, /target session id collision/)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+test('a malformed source already present in the target is named and left untouched', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ sessionId: null, title: 'Malformed source' }))
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Valid target' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths)
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(inv.there.length, 0)
+  assert.match(inv.rejected[0].error, /Desktop record identity is invalid/)
+  assert.equal(result.ok, false)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+test('stale source entries retire when the destination already holds them', async () => {
+  const h = await home()
+  await h.write(id(960), [entry('user', 960, null, id(960)), entry('assistant', 961, 960, id(960))])
+  await h.record('P', id(960))
+  const pick = async () => { const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a])); return { from: [by[h.acct.P]], to: by[h.acct.Z] } }
+  let p = await pick()
+  const first = await move(await inventory(p.from, p.to, h.paths), p.to, h.paths)
+  assert.equal(first.receipt.sessions.length, 1)
+  await h.record('P', id(960))
+  p = await pick()
+  const inv = await inventory(p.from, p.to, h.paths)
+  assert.equal(inv.move.length, 0)
+  assert.equal(inv.there.length, 1)
+  const stages = []
+  const second = await move(inv, p.to, h.paths, (stage, text, extra = {}) => { if (!extra.live) stages.push(`${stage} ${text}`) })
+  assert.deepEqual(stages, ['retired 1 source records → quarantine | chat messages unchanged'])
+  assert.equal(second.receipt.sessions.length, 0)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.ok(await readFile(path.join(h.project, `${id(960)}.jsonl`), 'utf8'))
+  assert.equal((await readdir(h.dir('Z'))).length, 1)
+  assert.ok((await undo(h.paths)).dest)
+  assert.equal((await readdir(h.dir('P'))).length, 1)
+  assert.equal((await readdir(h.dir('Z'))).length, 1)
+})
+
+test('retirement rereads only potential destination carriers and preserves sources when carriers change', async () => {
+  for (const changed of [false, true]) {
+    const h = await home(), carrier = id(2), unrelated = [id(3), id(4)]
+    const source = [entry('user', 1, null, SOURCE)]
+    await h.write(SOURCE, source)
+    await h.record('P', SOURCE)
+    await h.write(carrier, fork(source, SOURCE, carrier, 'Carrier'))
+    await h.record('Z', carrier)
+    for (const [i, sid] of unrelated.entries()) {
+      await h.write(sid, [entry('user', 10 + i, null, sid)])
+      await h.record('Z', sid)
+    }
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const inv = await inventory([from], to, h.paths)
+    assert.equal(inv.move.length, 0)
+    assert.equal(inv.there.length, 1)
+    if (changed) await h.write(carrier, [entry('user', 20, null, carrier)])
+    const reads = new Map(), read = fs.readFile
+    fs.readFile = async (...args) => {
+      const file = String(args[0])
+      if (file.endsWith('.jsonl')) reads.set(file, (reads.get(file) ?? 0) + 1)
+      return read(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await move(inv, to, h.paths) }
+    finally { fs.readFile = read; syncBuiltinESMExports() }
+    assert.ok(reads.get(path.join(h.project, `${carrier}.jsonl`)) > 0)
+    for (const sid of unrelated) assert.equal(reads.get(path.join(h.project, `${sid}.jsonl`)) ?? 0, 0)
+    assert.equal(result.ok, !changed)
+    assert.deepEqual(result.receipt.superseded.filter(row => row.source).map(row => row.id), changed ? [] : [SOURCE])
+    assert.equal(Boolean(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)).catch(() => null)), changed)
+    if (changed) assert.match(result.receipt.failed[0].error, /destination changed since inventory/)
+  }
+})
+
+test('a vanished existing destination keeps the source entry', async () => {
+  const h = await home()
+  await h.write(id(920), [entry('user', 920, null, id(920))])
+  await h.record('P', id(920))
+  const pick = async () => { const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a])); return { from: [by[h.acct.P]], to: by[h.acct.Z] } }
+  let p = await pick()
+  const first = await move(await inventory(p.from, p.to, h.paths), p.to, h.paths)
+  await h.record('P', id(920))
+  p = await pick()
+  const inv = await inventory(p.from, p.to, h.paths)
+  assert.equal(inv.there.length, 1)
+  await unlink(first.receipt.sessions[0].targetTranscript)
+  const second = await move(inv, p.to, h.paths)
+  assert.equal(second.ok, false)
+  assert.match(second.receipt.failed[0].error, /destination changed since inventory/)
+  assert.equal((await readdir(h.dir('P'))).length, 1)
+})
+
+test('undo refuses before removing the destination when a source recovery artifact is missing', async () => {
+  const h = await home()
+  await h.write(id(921), [entry('user', 921, null, id(921))])
+  await h.record('P', id(921))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths)
+  const [original, parked] = result.receipt.superseded.find((row) => row.source).moved[0]
+  await unlink(parked)
+  const refused = await undo(h.paths)
+  assert.match(refused.restoreProblems[0], /recovery artifact missing/)
+  assert.ok(await readFile(result.receipt.sessions[0].record))
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  await writeFile(original, '{broken')
+  const corrupt = await undo(h.paths)
+  assert.match(corrupt.restoreProblems[0], /recovery artifact changed/)
+  assert.ok(await readFile(result.receipt.sessions[0].record))
+})
+
+test('cloud bridges rehome while destination task ownership stays locked', async () => {
+  const h = await home()
+  const base = [entry('user', 922, null, id(922))]
+  await h.write(id(922), [...base, entry('assistant', 923, 922, id(922)), { type: 'bridge-session', sessionId: id(922), bridgeSessionId: 'remote' }])
+  await h.record('P', id(922), { bridgeSessionIds: ['remote'] })
+  await h.write(id(924), fork(base, id(922), id(924), 'Owned'))
+  await h.record('Z', id(924))
+  await writeFile(path.join(h.dir('Z'), 'scheduled-tasks.json'), JSON.stringify({ scheduledTasks: [{ id: 'task', notifySessionId: `local_${id(924)}` }] }))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths)
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.receipt.failed.map((row) => row.error), ['scheduled task registry kept in destination'])
+  assert.deepEqual(JSON.parse(await readFile(result.receipt.sessions[0].record, 'utf8')).bridgeSessionIds, [])
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.ok((await readdir(h.dir('Z'))).includes(`local_${id(924)}.json`))
+})
+
+test('an unreadable scheduled task registry fails closed', async () => {
+  const h = await home()
+  await h.write(id(929), [entry('user', 929, null, id(929))])
+  await h.record('P', id(929))
+  const taskFile = path.join(h.dir('P'), 'scheduled-tasks.json')
+  await writeFile(taskFile, '[]')
+  let by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  assert.match(by[h.acct.P].taskError, /invalid scheduled task registry/)
+  assert.match(by[h.acct.P].stats, /task registry unreadable/)
+  const blocked = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  assert.equal(blocked.move.length, 0)
+  assert.match(blocked.blocked[0].error, /invalid scheduled task registry/)
+  await writeFile(taskFile, JSON.stringify({ scheduledTasks: [] }))
+  by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  await assert.rejects(move(inv, by[h.acct.Z], h.paths, (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 0) writeFileSync(taskFile, '{broken')
+  }), /unreadable scheduled task registry/)
+  assert.equal((await readdir(h.dir('P'))).filter((file) => file.startsWith('local_')).length, 1)
+})
+
+test('undo allows shared sidecar growth but refuses Desktop record changes', async () => {
+  const h = await home()
+  await h.write(id(925), [entry('user', 925, null, id(925))])
+  await mkdir(path.join(h.project, id(925), 'subagents'), { recursive: true })
+  await writeFile(path.join(h.project, id(925), 'subagents', 'before.jsonl'), 'before\n')
+  await h.record('P', id(925))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths)
+  const row = result.receipt.sessions[0]
+  await writeFile(path.join(row.targetDir, 'subagents', 'after.jsonl'), 'after\n')
+  const changedRecord = JSON.parse(await readFile(row.record, 'utf8'))
+  changedRecord.title = 'changed after move'
+  await writeFile(row.record, JSON.stringify(changedRecord))
+  const refused = await undo(h.paths)
+  assert.match(refused.changed[0], /desktop record changed/)
+  assert.ok(await readFile(row.record))
+})
+
+test('undo allows harmless Desktop focus drift', async () => {
+  const h = await home()
+  await h.write(id(928), [entry('user', 928, null, id(928))])
+  await h.record('P', id(928))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths)
+  const row = result.receipt.sessions[0]
+  const focused = JSON.parse(await readFile(row.record, 'utf8'))
+  focused.lastFocusedAt++
+  await writeFile(row.record, JSON.stringify(focused))
+  assert.ok((await undo(h.paths)).dest)
+})
+
+test('retirement records the exact bytes after harmless source focus drift', async () => {
+  const h = await home()
+  await h.write(id(928), [entry('user', 928, null, id(928))])
+  await h.record('P', id(928))
+  const sourceRecord = path.join(h.dir('P'), `local_${id(928)}.json`)
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths, (stage, _text, progress) => {
+    if (stage !== 'verify' || progress?.completed !== 0) return
+    const focused = JSON.parse(readFileSync(sourceRecord, 'utf8'))
+    writeFileSync(sourceRecord, JSON.stringify({ ...focused, lastFocusedAt: focused.lastFocusedAt + 1 }))
+  })
+  assert.equal(result.ok, true)
+  assert.ok((await undo(h.paths)).dest)
+  assert.equal(JSON.parse(await readFile(sourceRecord, 'utf8')).lastFocusedAt, 3)
+})
+
+test('duplicate source records for one transcript move once and retire every owner', async () => {
+  const h = await home()
+  await h.write(id(926), [entry('user', 926, null, id(926))])
+  await h.record('P', id(926))
+  await h.record('T', id(926))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.equal(inv.sources.length, 2)
+  assert.equal(inv.move.length, 1)
+  assert.equal(inv.blocked.length, 0)
+  const result = await move(inv, by[h.acct.Z], h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(result.receipt.superseded.filter((row) => row.source).length, 2)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('T')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${id(926)}.json`])
+})
+
+test('a Desktop record changing inside the final guard stays visible and undoable', async () => {
+  const h = await home()
+  const session = id(936)
+  const record = path.join(h.dir('P'), `local_${session}.json`)
+  const taskFile = path.join(h.dir('P'), 'scheduled-tasks.json')
+  const validTasks = JSON.stringify({ scheduledTasks: [] })
+  await h.write(session, [entry('user', 936, null, session)])
+  await h.record('P', session)
+  await writeFile(taskFile, validTasks)
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  await unlink(taskFile)
+  await promisify(execFile)('/usr/bin/mkfifo', [taskFile])
+  const coordinate = duringSecondRead(taskFile, validTasks, async () => {
+    const current = JSON.parse(await readFile(record, 'utf8'))
+    await writeFile(record, JSON.stringify({ ...current, title: 'changed inside final guard' }))
+  })
+  const reports = [], result = await move(inv, by[h.acct.Z], h.paths, stage => reports.push(stage))
+  await coordinate
+  assert.ok(reports.includes('recovery'))
+  assert.equal(result.ok, true)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${session}.json`), 'utf8')).title, 'changed inside final guard')
+  assert.ok((await undo(h.paths)).dest)
+  assert.equal(JSON.parse(await readFile(record, 'utf8')).title, 'changed inside final guard')
+})
+
+test('unsupported sidecar entries name the path instead of looking like drift', async () => {
+  const h = await home()
+  await h.write(id(984), [entry('user', 984, null, id(984))])
+  const dir = path.join(h.project, id(984))
+  await mkdir(dir, { recursive: true })
+  await promisify(execFile)('/usr/bin/mkfifo', [path.join(dir, 'linked')])
+  await h.record('P', id(984))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
+  assert.match(inv.rejected[0].error, /unsupported entry .*linked/)
+  const result = await move(inv, by[h.acct.Z], h.paths)
+  assert.equal(result.validationOnly, true)
+  assert.equal(result.receipt.failed[0].id, id(984))
+})
+
+test('versions that grew apart both move and are counted', async () => {
+  const h = await home()
+  const m1 = [entry('user', 980, null, id(980)), entry('assistant', 981, 980, id(980))]
+  await h.write(id(980), [...m1, entry('user', 982, 981, id(980))])
+  await h.record('P', id(980))
+  await h.write(id(990), [...fork(m1, id(980), id(990), 'M'), entry('user', 983, null, id(990))])
+  await h.record('T', id(990))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const inv = await inventory([by[h.acct.P], by[h.acct.T]], by[h.acct.Z], h.paths)
+  assert.equal(inv.apart, 2)
+  assert.deepEqual(inv.move.map((s) => s.id).sort(), [id(980), id(990)])
+})
+
+test('real-shape sync replays collapse without conflicts', async () => {
+  const shaped = normalize(await fixture('replay.jsonl'))
+  assert.equal(shaped.replays, 20)
+  assert.equal(shaped.conflicts, 0)
+})
+
+test('interrupted undo resumes from its journal', async () => {
+  const h = await home()
+  await h.write(id(918), [entry('user', 918, null, id(918))])
+  await h.record('P', id(918))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const result = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths)
+  const receipt = JSON.parse(await readFile(result.file, 'utf8'))
+  const row = receipt.sessions[0]
+  const dest = path.join(h.paths.state, 'quarantine', receipt.at)
+  const items = [row.record]
+  receipt.undoing = [{
+    id: row.targetId,
+    title: row.title,
+    required: items,
+    hashes: [],
+    trees: [],
+    semantics: [[row.record, row.recordSemantic]],
+    moved: items.map((file) => [file, path.join(dest, path.basename(file))])
+  }]
+  await writeFile(result.file, JSON.stringify(receipt))
+  const source = receipt.superseded.find((item) => item.source).moved[0]
+  await rename(source[1], source[0])
+  await mkdir(dest, { recursive: true })
+  await rename(row.record, path.join(dest, path.basename(row.record)))
+  const resumed = await undo(h.paths)
+  assert.equal(resumed.dest, dest)
+  assert.ok(await readFile(source[0]))
+  assert.equal(await readFile(row.record).catch(() => null), null)
+  assert.ok(await readFile(path.join(dest, path.basename(row.record))))
+})
+
+test('a corrupt latest receipt stops undo before the previous batch', async () => {
+  const h = await home()
+  await h.write(id(905), [entry('user', 905, null, id(905))])
+  await h.record('P', id(905))
+  const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
+  const moved = await move(await inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths)
+  const target = moved.receipt.sessions[0].targetTranscript
+  const corrupt = path.join(h.paths.state, '2099-12-31T23-59-59-999.json')
+  await writeFile(corrupt, '{broken')
+  const result = await undo(h.paths)
+  assert.match(result.reconciled.error, /corrupt receipt/)
+  assert.ok(await readFile(target))
+  assert.ok(await readFile(`${corrupt}.corrupt`))
+})
+
+test('a changed interrupted copy stays tracked and blocks undo', async () => {
+  const h = await home()
+  const targetId = id(899)
+  const target = path.join(h.project, `${targetId}.jsonl`)
+  await h.write(targetId, [entry('user', 899, null, targetId)])
+  await mkdir(h.paths.state, { recursive: true })
+  const receipt = {
+    at: '2099-01-01T00-00-00-000',
+    from: [],
+    to: 'x',
+    sessions: [],
+    failed: [],
+    pending: { strategy: 'remote', id: id(898), title: 'Changed', targetId, made: [target], targetSemantic: semantic([entry('user', 898, null, targetId)], targetId), targetSemanticVersion: 3 }
+  }
+  const file = path.join(h.paths.state, `${receipt.at}.json`)
+  await writeFile(file, JSON.stringify(receipt))
+  assert.ok((await undo(h.paths)).reconciled)
+  const recovered = JSON.parse(await readFile(file, 'utf8'))
+  assert.equal(recovered.retained[0].targetId, targetId)
+  assert.deepEqual(recovered.retained[0].artifacts, [target])
+  assert.equal((await undo(h.paths)).retained[0].targetId, targetId)
+  assert.ok(await readFile(target))
+})
+
+test('dry-run describes interrupted retirement without changing it', async () => {
+  const h = await home()
+  await mkdir(h.paths.state, { recursive: true })
+  const receipt = { at: '2099-01-01T00-00-00-000', from: [], to: 'x', sessions: [], failed: [], superseded: [], finalizing: true, retiring: [{ id: 'x', title: 'x', by: 'y', moved: [] }] }
+  const file = path.join(h.paths.state, `${receipt.at}.json`)
+  await writeFile(file, JSON.stringify(receipt))
+  const result = await cli(h.root, ['--from', 'p@example.com', '--to', 'z@example.com', '--dry-run', '--json'])
+  assert.equal(result.code, 1)
+  assert.match(result.stdout, /interrupted retirement/)
+  assert.equal(JSON.parse(result.stdout.trim().split('\n').at(-1)).planned, null)
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), receipt)
+})
+
+test('interrupted retirement restores partially parked entries', async () => {
+  const h = await home()
+  const at = '2099-01-01T00-00-00-000'
+  const original = path.join(h.project, 'retired.json')
+  const parked = path.join(h.paths.state, 'quarantine', at, 'sources', 'retired.json')
+  await writeFile(original, '{}')
+  await mkdir(path.dirname(parked), { recursive: true })
+  await rename(original, parked)
+  const receipt = { at, from: [], to: 'x', sessions: [], failed: [], superseded: [], finalizing: true, retiring: [{ id: 'x', title: 'x', by: 'y', required: [original], moved: [[original, parked]] }] }
+  const file = path.join(h.paths.state, `${at}.json`)
+  await writeFile(file, JSON.stringify(receipt))
+  const result = await undo(h.paths)
+  assert.match(result.reconciled.error, /retirement rolled back/)
+  assert.equal(await readFile(original, 'utf8'), '{}')
+  assert.equal(await readFile(parked).catch(() => null), null)
+  const recovered = JSON.parse(await readFile(file, 'utf8'))
+  assert.equal(recovered.retiring, null)
+  assert.equal(recovered.finalizing, false)
+})
+
+test('retirement recovery after a crash leaves exactly one record per session', async () => {
+  const h = await home()
+  for (const [index, sid] of [SOURCE, id(710)].entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await executeMove([from], to, h.paths, { processes: [] }), receipt = moved.receipt
+  receipt.finalizing = true
+  receipt.retiring = receipt.superseded
+  receipt.superseded = []
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const result = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(result.recoveryRequired, true)
+  assert.match(result.reconciled.error, /retirement rolled back/)
+  const recovered = await readReceipt(moved.file)
+  assert.equal(recovered.finalizing, false)
+  assert.equal(recovered.sessions.length, 0)
+  assert.equal((await readdir(h.dir('P'))).length, 2)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+  const summary = (await finishWorkflow(h.paths, { processes: [] })).summary
+  assert.deepEqual([summary.moved, summary.notMoved.length], [0, 2])
+})
+
+const unwindFixture = async () => {
+  const h = await home(), sessions = [SOURCE, id(720)]
+  for (const [index, sid] of sessions.entries()) {
+    await h.write(sid, [entry('user', 820 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths, [])
+  return { h, from: all.find(row => row.account === h.acct.P), to: all.find(row => row.account === h.acct.T) }
+}
+const placedRecords = (dir, change) => {
+  const link = fs.link, placed = []
+  fs.link = async (...args) => {
+    const result = await link(...args)
+    if (path.dirname(args[1]) === dir) {
+      placed.push(path.basename(args[1]))
+      writeFileSync(args[1], JSON.stringify({ ...JSON.parse(readFileSync(args[1])), ...change(placed.length) }))
+    }
+    return result
+  }
+  syncBuiltinESMExports()
+  return { placed, restore: () => { fs.link = link; syncBuiltinESMExports() } }
+}
+const localRecords = async dir => (await readdir(dir).catch(() => [])).filter(name => name.startsWith('local_')).sort()
+
+test('a crash between two units\' unwinds recovers to one record per session without ghost rows', async () => {
+  const { h, from, to } = await unwindFixture(), original = fs.rename
+  const placing = placedRecords(h.dir('T'), () => ({ lastFocusedAt: 1000 }))
+  let parked = 0
+  fs.rename = async (...args) => {
+    if (path.dirname(args[0]) === h.dir('T') && args[1].includes(`${path.sep}failed${path.sep}`) && ++parked === 2) throw new Error('simulated crash between unwinds')
+    return original(...args)
+  }
+  syncBuiltinESMExports()
+  try { await assert.rejects(executeMove([from], to, h.paths, { processes: [] }), /simulated crash between unwinds/) }
+  finally { fs.rename = original; placing.restore() }
+  assert.equal(parked, 2)
+  const recovery = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(recovery.recoveryRequired, true)
+  const [name] = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
+  const receipt = await readReceipt(path.join(h.paths.state, name))
+  assert.equal(receipt.finalizing, false)
+  assert.deepEqual(receipt.sessions, [])
+  assert.ok(!receipt.failed.some(row => /missing|changed since/.test(row.error)), JSON.stringify(receipt.failed))
+  const sources = [SOURCE, id(720)].map(sid => `local_${sid}.json`).sort()
+  assert.deepEqual(await localRecords(h.dir('P')), sources)
+  assert.deepEqual(await localRecords(h.dir('T')), [])
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(await localRecords(h.dir('P')), sources)
+  assert.deepEqual(await localRecords(h.dir('T')), [])
+})
+
+test('a changed copy in a later unit is kept with its failure while earlier units unwind', async () => {
+  const { h, from, to } = await unwindFixture()
+  const placing = placedRecords(h.dir('T'), count => count === 2 ? { title: 'Renamed in the destination' } : { lastFocusedAt: 1000 })
+  let result
+  try { result = await executeMove([from], to, h.paths, { processes: [] }) }
+  finally { placing.restore() }
+  const [first, second] = placing.placed
+  assert.notEqual(result.code, 'LOCAL_RECOVERY_BLOCKED')
+  assert.equal(result.recoveryRequired, undefined)
+  assert.deepEqual(await localRecords(h.dir('T')), [second])
+  assert.deepEqual(await localRecords(h.dir('P')), [first, second].sort())
+  assert.deepEqual(result.receipt.sessions.map(row => `local_${row.id}.json`), [second])
+  assert.ok(result.receipt.failed.some(row => `local_${row.id}.json` === second && /changed after placement/.test(row.error)), JSON.stringify(result.receipt.failed))
+  assert.ok(result.summary.notMoved.some(row => `local_${row.id}.json` === first))
+  assert.equal(new Set(result.receipt.failed.map(row => JSON.stringify(row))).size, result.receipt.failed.length)
+})
+
+test('interrupted retirement keeps its journal when a required artifact vanished', async () => {
+  const h = await home()
+  const at = '2099-01-01T00-00-00-000'
+  const original = path.join(h.project, 'missing.json')
+  const parked = path.join(h.paths.state, 'quarantine', at, 'sources', 'missing.json')
+  const receipt = { at, from: [], to: 'x', sessions: [], failed: [], superseded: [], finalizing: true, retiring: [{ id: 'x', title: 'x', by: 'y', required: [original], moved: [[original, parked]] }] }
+  const file = path.join(h.paths.state, `${at}.json`)
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(file, JSON.stringify(receipt))
+  const result = await undo(h.paths)
+  assert.match(result.reconciled.error, /recovery artifact missing/)
+  const unresolved = JSON.parse(await readFile(file, 'utf8'))
+  assert.ok(unresolved.retiring)
+  assert.equal(unresolved.finalizing, true)
+})
+
+test('picker reducer', () => {
+  let s = { cursor: 0, chosen: new Set(), size: 3, multi: true }
+  s = step(s, 'up')
+  assert.equal(s.cursor, 2)
+  s = step(step(s, 'down'), 'space')
+  assert.deepEqual([...s.chosen], [0])
+  assert.equal(step({ ...s, chosen: new Set() }, 'return').done, undefined)
+  assert.equal(step(s, 'return').done, true)
+  const single = step({ cursor: 1, chosen: new Set(), size: 3, multi: false }, 'return')
+  assert.deepEqual([...single.chosen], [1])
+  assert.equal(single.done, true)
+})
+
+const localTime = (time) => {
+  const date = new Date(time)
+  const part = (value) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${part(date.getMonth() + 1)}-${part(date.getDate())} ${part(date.getHours())}:${part(date.getMinutes())}:${part(date.getSeconds())}`
+}
+
+async function identityFixture(h) {
+  const started = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000) * 1000
+  const processes = [{ pid: 500, started: new Date(started).toString(), executable: '/Applications/Claude.app/Contents/MacOS/Claude' }]
+  const event = (offset, text) => `${localTime(started + offset * 1000)} [info] ${text}\n`
+  const init = (offset = 0, account = h.acct.P, org = h.org.P) => event(offset, `[LocalSessionManager] Initialization succeeded \u2014 accountId=${account}, orgId=${org}, existingSessions=0`)
+  await mkdir(h.paths.logs, { recursive: true })
+  const write = (text, name = 'main.log') => writeFile(path.join(h.paths.logs, name), text)
+  await write(init())
+  return { started, processes, event, init, write }
+}
+
+test('signed-in identity survives inactivity and ignores usage, focus, and allowlist refreshes', async () => {
+  const h = await home(), f = await identityFixture(h)
+  const team = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(team, { recursive: true })
+  await writeFile(path.join(team, `local_${id(999)}.json`), JSON.stringify({ sessionId: `local_${id(999)}`, cliSessionId: id(999), cwd: '/tmp/fixture', lastFocusedAt: Date.now() }))
+  await writeFile(path.join(path.dirname(h.paths.desktop), 'plan-usage-history.json'), JSON.stringify({ samples: [{ org: h.org.T, t: Date.now() }] }))
+  const scope = path.join(path.dirname(h.paths.desktop), 'sentry/scope_v3.json')
+  await mkdir(path.dirname(scope), { recursive: true })
+  await writeFile(scope, JSON.stringify({ scope: { breadcrumbs: [{ timestamp: Date.now(), data: { url: `https://claude.ai/api/organizations/${h.org.T}/usage` } }] } }))
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.P, [`dxt:allowlistLastUpdated:${h.org.T}`]: new Date().toISOString() }))
+  const result = await signedIn(h.paths, f.processes)
+  assert.deepEqual(result, { account: h.acct.P, org: h.org.P, state: 'known', source: 'log', at: new Date(f.started).toISOString() })
+  const list = await accounts(h.paths, f.processes)
+  assert.deepEqual(list.filter((row) => row.active).map((row) => row.org), [h.org.P])
+  assert.equal(list.filter((row) => row.account === h.acct.P).every((row) => row.signedIn), true)
+  assert.equal(list.filter((row) => row.account !== h.acct.P).some((row) => row.signedIn), false)
+})
+
+test('signed-in identity invalidates incomplete transitions, logout, and initialization failures', async () => {
+  const h = await home(), f = await identityFixture(h)
+  for (const [event, state] of [
+    [`[LocalSessionManager] Org changed from ${h.org.P} to ${h.org.T}, reinitializing sessions`, 'unknown'],
+    [`[LocalSessionManager] Org changed from null to ${h.org.T}, reinitializing sessions`, 'unknown'],
+    [`[account] Login-state transition (loggedOut: false \u2192 true, uuid: ${h.acct.P} \u2192 <none>), clearing oauth cache`, 'logged-out'],
+    [`[account] Login-state transition (loggedOut: false \u2192 false, uuid: ${h.acct.P} \u2192 ${h.acct.T}), clearing oauth cache`, 'unknown'],
+    ['[LocalSessionManager] Account logged out, marking for re-init on next login', 'logged-out'],
+    ['[LocalSessionManager] Cannot initialize sessions: accountId=null, orgId=null. Keeping existing sessions.', 'unknown'],
+    ['[LocalSessionManager] loadSessions failed during account transition', 'unknown'],
+    ['[LocalSessionManager] Initialization succeeded, accountId=invalid, orgId=invalid', 'unknown']
+  ]) {
+    await f.write(f.init() + f.event(1, event))
+    const result = await signedIn(h.paths, f.processes)
+    assert.equal(result.state, state, event)
+    assert.equal(result.account, null)
+    assert.equal(result.org, null)
+    await f.write(f.init() + f.event(1, event) + f.init(2, h.acct.P, h.org.T))
+    assert.equal((await signedIn(h.paths, f.processes)).org, h.org.T)
+  }
+})
+
+test('signed-in identity reads rotations, accepts the launch second, and rejects a previous launch', async () => {
+  const h = await home(), f = await identityFixture(h)
+  await f.write(f.event(10, '[display] unrelated display event'))
+  await f.write(f.init(), 'main1.log')
+  await f.write(f.init(-30, h.acct.T, h.org.T), 'main2.log')
+  assert.equal((await signedIn(h.paths, f.processes)).org, h.org.P)
+  const restarted = [{ ...f.processes[0], started: new Date(f.started + 1000).toString() }]
+  assert.equal((await signedIn(h.paths, restarted)).state, 'unknown')
+  await f.write(f.event(15, '[LocalSessionManager] Initialization wording changed'))
+  assert.equal((await signedIn(h.paths, restarted)).state, 'unknown')
+  assert.equal((await signedIn(h.paths, [])).state, 'unknown')
+  assert.equal((await signedIn(h.paths, [...f.processes, { ...f.processes[0], pid: 501 }])).state, 'unknown')
+})
+
+test('signed-in identity rejects account conflicts and recovers only from a paired entry', async () => {
+  const h = await home(), f = await identityFixture(h)
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.T }))
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+  await f.write(f.init() + f.event(1, `[LocalSessionManager] Org changed from ${h.org.P} to ${h.org.T}, reinitializing sessions`))
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+  await f.write(f.init() + f.init(2, h.acct.T, h.org.T))
+  assert.equal((await signedIn(h.paths, f.processes)).account, h.acct.T)
+  await writeFile(h.paths.desktop, '{}')
+  assert.equal((await signedIn(h.paths, f.processes)).account, h.acct.T)
+})
+
+test('signed-in identity handles missing, future, and partially written log evidence', async () => {
+  const h = await home(), f = await identityFixture(h)
+  await f.write(f.init() + f.init(2, h.acct.P, h.org.T).trimEnd())
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+  await f.write(f.init(48 * 60 * 60))
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+  await unlink(path.join(h.paths.logs, 'main.log'))
+  assert.equal((await signedIn(h.paths, f.processes)).state, 'unknown')
+})
+
+test('signed-in identity follows an offline switch without using network-dependent markers', async (t) => {
+  const h = await home(), f = await identityFixture(h)
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('offline') })
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.P, [`dxt:allowlistLastUpdated:${h.org.P}`]: new Date().toISOString() }))
+  await f.write(f.init() + f.event(1, `[LocalSessionManager] Org changed from ${h.org.P} to ${h.org.T}, reinitializing sessions`) + f.init(2, h.acct.P, h.org.T) + f.event(3, 'Failed to check allowlist status: offline'))
+  assert.equal((await signedIn(h.paths, f.processes)).org, h.org.T)
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('Finish uses the active Desktop organization when its saved cookie still names the previous organization', async (t) => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Switched organization' }))
+  await h.record('P', id(997), rehomeRecord({ title: 'Pending source' }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  assert.equal(moved.pendingCloud, 1)
+  await unlink(path.join(h.dir('P'), `local_${id(997)}.json`))
+  const requestedOrgs = []
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const endpoint = new URL(url).pathname
+    if (endpoint === '/api/account') return Response.json({ uuid: h.acct.P })
+    if (endpoint === '/api/organizations') return Response.json([{ uuid: h.org.P }, { uuid: h.org.T }])
+    assert.equal(endpoint, '/v1/code/sessions')
+    assert.equal(options.method ?? 'GET', 'GET')
+    requestedOrgs.push(options.headers['x-organization-uuid'])
+    return Response.json({ data: [] }, { headers: { 'anthropic-organization-id': options.headers['x-organization-uuid'] } })
+  })
+  const cloud = await cloudClient(h.paths, null, {
+    active: { account: h.acct.P, org: h.org.P, state: 'known' },
+    cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.T]]),
+    userAgent: 'fixture'
+  })
+  const finished = await finishPending(h.paths, { cloud })
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.pendingCloud, 0)
+  assert.deepEqual(requestedOrgs, [h.org.P])
+})
+
+test('cloud identity rejects a stale authenticated account even when both logins share the organization', async (t) => {
+  const h = await home(), requested = []
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    requested.push(new URL(url).pathname)
+    if (requested.at(-1) === '/api/account') return Response.json({ uuid: h.acct.T })
+    return Response.json([{ uuid: h.org.P }])
+  })
+  await assert.rejects(cloudClient(h.paths, null, {
+    active: { account: h.acct.P, org: h.org.P, state: 'known' },
+    cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.P]]),
+    userAgent: 'fixture'
+  }), /login is still updating/)
+  assert.deepEqual(requested, ['/api/account'])
+})
+
+test('cloud identity retains verified cookie fallback for unknown Desktop state and rejects an explicit logout', async (t) => {
+  const h = await home(), requested = []
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    requested.push(new URL(url).pathname)
+    return Response.json(requested.at(-1) === '/api/account' ? { uuid: h.acct.P } : [{ uuid: h.org.P }, { uuid: h.org.T }])
+  })
+  const io = { active: { state: 'unknown', account: null, org: null }, cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.P]]), userAgent: 'fixture' }
+  assert.equal((await cloudClient(h.paths, null, io)).org, h.org.P)
+  assert.equal((await cloudClient(h.paths, { account: h.acct.P, org: h.org.T, label: 'Team' }, io)).org, h.org.T)
+  requested.length = 0
+  await assert.rejects(cloudClient(h.paths, null, { ...io, active: { state: 'logged-out' } }), /signed out/)
+  assert.deepEqual(requested, [])
+  await assert.rejects(cloudClient(h.paths, { account: h.acct.T, org: h.org.T, label: 'Other login' }, io), /sign Claude Desktop into Other login/)
+  assert.deepEqual(requested, ['/api/account'])
+})
+
+test('cloud history reads past 10000 events and refuses incomplete or oversized pagination', async t => {
+  for (const scenario of ['large', 'full last page', 'exact event limit', 'repeated cursor', 'repeated sequence', 'oversized page', 'event limit', 'memory pressure']) await t.test(scenario, async t => {
+    const h = await home(), limit = scenario === 'exact event limit' ? 1_000_000 : scenario === 'full last page' ? 10000 : 10501
+    let pages = 0
+    t.mock.method(globalThis, 'fetch', async url => {
+      const request = new URL(url)
+      if (request.pathname === '/api/account') return Response.json({ uuid: h.acct.P })
+      if (request.pathname === '/api/organizations') return Response.json([{ uuid: h.org.P }])
+      assert.equal(request.pathname, '/v1/code/sessions/session_large/events')
+      assert.equal(request.searchParams.get('limit'), '500')
+      assert.equal(request.searchParams.get('sort_order'), 'asc')
+      const start = pages++ * 500
+      if (pages > 1) assert.equal(request.searchParams.get('cursor'), scenario === 'repeated cursor' ? 'same' : String(start))
+      const length = scenario === 'oversized page' ? 501 : scenario === 'event limit' || scenario === 'memory pressure' ? 500 : Math.min(500, limit - start)
+      const payload = scenario === 'memory pressure' ? { content: 'x'.repeat(2000) } : {}
+      return Response.json({ data: Array.from({ length }, (_, i) => ({ event_type: 'user', sequence_num: scenario === 'repeated sequence' ? i : start + i, payload })),
+        resume_cursor: scenario === 'repeated cursor' ? 'same' : String(start + length) }, { headers: { 'anthropic-organization-id': h.org.P } })
+    })
+    const memory = scenario === 'memory pressure' ? memoryBudget({ total: 10 * 1024 * 1024, heap: 2 ** 30, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 2 ** 30 }) : undefined
+    const cloud = await cloudClient(h.paths, null, { active: { state: 'known', account: h.acct.P, org: h.org.P }, cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture', memory })
+    const error = { 'repeated cursor': /cursor did not advance/, 'repeated sequence': /sequence changed/, 'oversized page': /response changed/, 'event limit': /exceeded 1,000,000 events/, 'memory pressure': /memory budget/ }[scenario]
+    if (error) await assert.rejects(cloud.eventRows('cse_large'), error)
+    else {
+      const rows = await cloud.eventRows('cse_large')
+      assert.equal(rows.length, limit)
+      assert.equal(rows.at(-1).sequence_num, limit - 1)
+      assert.equal(pages, Math.floor(limit / 500) + 1)
+    }
+    if (scenario === 'event limit') assert.equal(pages, 2001)
+    if (scenario === 'memory pressure' || scenario === 'oversized page') assert.equal(pages, 1)
+  })
+})
+
+test('operation memory scales to RAM and reduces concurrency before its ceiling', () => {
+  for (const gib of [16, 48]) {
+    let rss = 0, heapUsed = 0, available = 8 * 2 ** 30
+    const budget = memoryBudget({ platform: 'linux', total: gib * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss, heapUsed }), available: () => available })
+    assert.equal(budget.limit, Math.floor(gib * 2 ** 30 * 0.2))
+    assert.equal(budget.parallel(), 8)
+    rss = budget.limit * 0.6
+    assert.equal(budget.parallel(), 2)
+    rss = budget.limit * 0.8
+    assert.equal(budget.parallel(), 1)
+    rss = budget.limit
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_BUDGET' })
+    rss = 0; heapUsed = 4 * 2 ** 30
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_BUDGET' })
+    heapUsed = 0; available = 0
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+    available = 2 ** 30
+    assert.doesNotThrow(() => budget.check())
+  }
+})
+
+test('concurrent cloud bodies share reservations and return them after refusal', async () => {
+  const budget = memoryBudget({ total: 10000, heap: 10000, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 10000 })
+  let started, resume
+  const ready = new Promise(resolve => { started = resolve }), paused = new Promise(resolve => { resume = resolve })
+  const first = budget.read({ body: (async function* () {
+    yield Buffer.from('"' + 'x'.repeat(150))
+    started()
+    await paused
+    yield Buffer.from('"')
+  })() })
+  await ready
+  await assert.rejects(budget.read(Response.json('x'.repeat(300))), { code: 'CLOUD_MEMORY_BUDGET' })
+  resume()
+  assert.equal(await first, 'x'.repeat(150))
+  assert.equal(await budget.read(Response.json('x'.repeat(300))), 'x'.repeat(300))
+  await assert.rejects(budget.read(new Response('{bad')), SyntaxError)
+  assert.deepEqual(await budget.read(Response.json({ recovered: true })), { recovered: true })
+})
+
+test('memory pressure during final cloud proof keeps its source active until a complete retry', async () => {
+  const h = await home(), entries = branchEntries(4, SOURCE, 1)
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Memory history', bridgeSessionIds: ['session_memory'] }))
+  let pressure = false, reads = 0, status = 'active'
+  const memory = memoryBudget({ platform: 'darwin', total: 16 * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss: 0, heapUsed: 0 }), pressure: () => pressure ? 4 : 1, now: () => pressure ? 2000 : 0 })
+  const cloud = cloudFixture(h, { memory, list: async () => [remoteSession({ id: 'cse_memory', title: 'Memory history', status })],
+    session: async () => remoteState(status), archive: async () => { status = 'archived' },
+    eventRows: async () => { if (++reads === 2) pressure = true; return memory.read(Response.json(remoteRows(entries))) } })
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud, processes: [] }), to, h.paths)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(result.receipt.remote.length, 0)
+  assert.equal(result.receipt.failed[0].code, 'CLOUD_MEMORY_PRESSURE')
+  assert.equal(status, 'active')
+  pressure = false
+  const retried = await finishPending(h.paths, { cloud, active: { state: 'known', account: h.acct.P, org: h.org.P }, processes: [] })
+  assert.equal(retried.complete, true)
+  assert.equal(retried.ok, true)
+  assert.equal(status, 'archived')
+})
+
+async function home() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-home-'))
+  const paths = layout(root)
+  const project = path.join(paths.pool, '-tmp-fixture')
+  const acct = { P: id(901), T: id(902), Z: id(903), Q: id(904) }
+  const org = { P: id(911), T: id(912), Z: id(913), Q: id(914) }
+  const dir = (a) => path.join(paths.records, acct[a], org[a])
+  for (const a of ['P', 'T', 'Z', 'Q']) await mkdir(dir(a), { recursive: true })
+  await mkdir(path.join(root, '.claude-x'))
+  await writeFile(path.join(root, '.claude-x', '.claude.json'), JSON.stringify({
+    oauthAccount: {
+      accountUuid: acct.Z,
+      organizationUuid: org.Z,
+      emailAddress: 'z@example.com',
+      organizationName: 'Zed Person',
+      organizationType: 'claude_max'
+    }
+  }))
+  await mkdir(project, { recursive: true })
+  await mkdir(paths.backups, { recursive: true })
+  await writeFile(paths.desktop, JSON.stringify({ lastKnownAccountUuid: acct.P }))
+  await writeFile(paths.login, JSON.stringify({ oauthAccount: { accountUuid: acct.P, organizationUuid: org.P, emailAddress: 'p@example.com', organizationName: 'Personal P' } }))
+  await writeFile(path.join(paths.backups, '.claude.json.backup.1'), JSON.stringify({
+    oauthAccount: { accountUuid: acct.T, organizationUuid: org.T, emailAddress: 't@example.com', organizationName: 'Team T' }
+  }))
+  const record = (a, sid, extra = {}) => writeFile(path.join(dir(a), `local_${sid}.json`), JSON.stringify({
+    sessionId: `local_${sid}`,
+    cliSessionId: sid,
+    cwd: '/tmp/fixture',
+    originCwd: '/tmp/fixture',
+    createdAt: 1,
+    lastActivityAt: 2,
+    lastFocusedAt: 2,
+    model: 'x',
+    isArchived: false,
+    title: `Session ${sid.slice(-3)}`,
+    titleSource: 'user',
+    permissionMode: 'auto',
+    bridgeSessionIds: [],
+    spawnSeed: { a: 1 },
+    ...extra
+  }, null, 2))
+  const write = (sid, entries) => writeFile(path.join(project, `${sid}.jsonl`), entries.map((e) => JSON.stringify(e)).join('\n') + '\n')
+  return { root, paths, project, acct, org, dir, record, write }
+}
+
+async function pendingOrganizations({ orgs = ['P', 'T'], to: targetOrg = null } = {}) {
+  const h = await home(), identity = await identityFixture(h), rows = []
+  for (const [index, name] of orgs.entries()) {
+    const sid = id(9200 + index), org = h.org[name], directory = path.join(h.paths.records, h.acct.P, org)
+    const entries = branchEntries(4, sid, 9300 + index * 10), remote = `cse_org${index}`
+    await mkdir(directory, { recursive: true })
+    await h.write(sid, entries)
+    await h.record('P', sid, rehomeRecord({ title: `Organization ${index}`, bridgeSessionIds: [`session_org${index}`] }))
+    if (directory !== h.dir('P')) await rename(path.join(h.dir('P'), `local_${sid}.json`), path.join(directory, `local_${sid}.json`))
+    rows.push({ sid, org, entries, remote, status: 'active', mode: 'ready' })
+  }
+  if (targetOrg) await mkdir(path.join(h.paths.records, h.acct.P, h.org[targetOrg]), { recursive: true })
+  const all = await accounts(h.paths, identity.processes), from = rows.map(row => all.find(account => account.account === h.acct.P && account.org === row.org))
+  const to = all.find(account => account.account === (targetOrg ? h.acct.P : h.acct.Z) && account.org === (targetOrg ? h.org[targetOrg] : h.org.Z))
+  const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  const moved = await move(await inventory(from, to, h.paths, () => {}, { cloudRequested: true, processes: [] }), to, h.paths)
+  const calls = [], requested = []
+  const client = source => {
+    assert.equal(source.account, h.acct.P)
+    const row = rows.find(row => row.org === source.org)
+    assert.ok(row)
+    calls.push(source.org)
+    if (row.mode === 'transient') throw Object.assign(new Error('Fixture source unavailable'), { code: 'FIXTURE_UNAVAILABLE' })
+    const check = id => { assert.equal(id, row.remote); requested.push([source.org, id]) }
+    return cloudFixture(h, { org: row.org,
+      list: async () => [remoteSession({ id: row.remote, title: `Organization ${rows.indexOf(row)}`, status: row.status, updated_at: row.updated }), remoteSession({ id: 'cse_unselected', title: 'Unselected source' })],
+      session: async id => { check(id); return remoteState(row.status, row.mode === 'waiting' ? { connection_status: 'connected' } : {}) },
+      eventRows: async id => { check(id); return remoteRows(row.entries) },
+      archive: async id => { check(id); row.status = 'archived' },
+      unarchive: async id => { check(id); row.status = 'active' }
+    })
+  }
+  return { h, identity, rows, from, to, before, moved, calls, requested, client, options: { cloud: client, processes: identity.processes } }
+}
+
+test('same-login cleanup addresses the recorded source organization in either direction without switching Desktop', async t => {
+  for (const [sourceOrg, activeOrg] of [['P', 'T'], ['T', 'P']]) {
+    const f = await pendingOrganizations({ orgs: [sourceOrg], to: activeOrg }), { h, identity } = f, row = f.rows[0]
+    await identity.write(identity.init(1, h.acct.P, h.org[activeOrg]))
+    const desktop = await readFile(h.paths.desktop), logs = await readFile(path.join(h.paths.logs, 'main.log')), requests = []
+    const mocked = t.mock.method(globalThis, 'fetch', async (url, options) => {
+      const endpoint = new URL(url).pathname
+      requests.push([endpoint, options.method ?? 'GET', options.headers['x-organization-uuid']])
+      if (endpoint === '/api/account') return Response.json({ uuid: h.acct.P })
+      if (endpoint === '/api/organizations') return Response.json([{ uuid: h.org.P }, { uuid: h.org.T }])
+      assert.equal(options.headers['x-organization-uuid'], row.org)
+      const headers = { 'anthropic-organization-id': row.org }
+      if (endpoint === '/v1/code/sessions') return Response.json({ data: [remoteSession({ id: row.remote, title: 'Organization 0', status: row.status }), remoteSession({ id: 'cse_unselected' })] }, { headers })
+      assert.ok(endpoint.startsWith('/v1/code/sessions/session_org0'))
+      if (endpoint.endsWith('/events')) return Response.json({ data: remoteRows(row.entries) }, { headers })
+      if (options.method === 'POST') { assert.ok(endpoint.endsWith('/archive') || endpoint.endsWith('/unarchive')); row.status = endpoint.endsWith('/unarchive') ? 'active' : 'archived' }
+      return Response.json(remoteState(row.status), { headers })
+    })
+    try {
+      const cloud = async expected => {
+        assert.deepEqual(expected, { account: h.acct.P, org: row.org, label: f.from[0].label })
+        return cloudClient(h.paths, expected, { active: await signedIn(h.paths, identity.processes), cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org[activeOrg]]]), userAgent: 'fixture' })
+      }
+      const listing = `500 1 ${new Date(identity.started).toString().replace(/^(\w+ \w+ \d+) (\d+) ([\d:]+).*$/, '$1 $3 $2')} /Applications/Claude.app/Contents/MacOS/Claude\n`
+      const shown = await cli(h.root, ['accounts', '--json'], processSetup({ list: listing, commands: listing }))
+      assert.equal(shown.code, 0, shown.stderr)
+      const pending = JSON.parse(shown.stdout).find(account => account.account === h.acct.P && account.org === row.org)
+      assert.equal(pending.signedIn, true)
+      assert.equal(pending.active, false)
+      assert.equal(pending.pendingAction, 'wait')
+      const finished = await sweep(h.paths, { cloud, processes: identity.processes })
+      assert.equal(finished.result.file, f.moved.file)
+      assert.equal(finished.result.complete, true)
+      assert.equal(row.status, 'archived')
+      assert.ok((await undo(h.paths, { cloud, processes: identity.processes })).dest)
+      assert.equal(row.status, 'active')
+      assert.deepEqual(requests.filter(([, method]) => method === 'POST').map(([endpoint]) => endpoint.split('/').at(-1)), ['archive', 'unarchive'])
+      assert.deepEqual(await readFile(h.paths.desktop), desktop)
+      assert.deepEqual(await readFile(path.join(h.paths.logs, 'main.log')), logs)
+      assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), f.before)
+    } finally { mocked.mock.restore() }
+  }
+})
+
+test('pending same-login sources progress fairly past waits and transient failures', async t => {
+  for (const mode of ['waiting', 'transient']) {
+    const f = await pendingOrganizations({ orgs: ['P', 'T', 'Q'] }), { h } = f
+    f.rows[0].mode = mode
+    let now = Date.now()
+    const clock = t.mock.method(Date, 'now', () => now)
+    try {
+      const progress = []
+      const first = await sweep(h.paths, { ...f.options, report: (stage, text, extra) => progress.push({ stage, text, ...extra }) })
+      assert.equal(progress.length > 0, mode !== 'transient')
+      assert.ok(progress.every(row => row.sourceId === `${h.acct.P}/${f.rows[0].org}`))
+      assert.equal(first.result.complete, false)
+      assert.equal(f.rows[0].status, 'active')
+      if (mode === 'transient') assert.equal(first.result.failed[0].code, 'FIXTURE_UNAVAILABLE')
+      await f.identity.write(f.identity.init(2, h.acct.P, h.org.Q))
+      for (const row of f.rows.slice(1)) {
+        const progress = []
+        const next = await sweep(h.paths, { ...f.options, report: (stage, text, extra) => progress.push({ stage, text, ...extra }) })
+        assert.ok(progress.some(event => event.stage === 'cloud' && event.completed === 0 && event.total > 0))
+        assert.ok(progress.every(event => event.sourceId === `${h.acct.P}/${row.org}`))
+        assert.equal(next.result.file, f.moved.file)
+        assert.equal(next.result.complete, false)
+        assert.equal(row.status, 'archived')
+      }
+      assert.deepEqual(f.calls, f.rows.map(row => row.org))
+      await sweep(h.paths, f.options)
+      assert.equal(f.calls.length, 3)
+      const receipt = JSON.parse(await readFile(f.moved.file))
+      assert.equal(Object.keys(receipt.cloudAttempts).length, 3)
+      assert.deepEqual(receipt.cloudChecks.map(check => check.sessionIds), f.moved.receipt.cloudChecks.map(check => check.sessionIds))
+      assert.equal(receipt.startedAt, f.moved.receipt.startedAt)
+      f.rows[0].mode = 'ready'
+      f.rows[0].updated = '2026-09-02T00:00:00.000Z'
+      now += 60_001
+      const completed = await sweep(h.paths, f.options)
+      assert.equal(completed.result.complete, true)
+      assert.equal(completed.result.ok, true)
+      assert.equal(completed.result.receipt.failed.length, 0)
+      assert.equal(completed.result.receipt.remote.length, 3)
+      assert.deepEqual(f.calls, [...f.rows.map(row => row.org), f.rows[0].org])
+    } finally { clock.mock.restore() }
+  }
+})
+
+test('source cooldowns do not starve another organization or reopen cancelled checks', async () => {
+  const f = await pendingOrganizations({ orgs: ['P', 'T', 'Q'] }), receipt = JSON.parse(await readFile(f.moved.file))
+  receipt.cloudAttempts = { [`${f.h.acct.P}/${f.rows[0].org}`]: Date.now() }
+  receipt.cloudChecks[2].status = 'cancelled'
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  const completed = await sweep(f.h.paths, f.options)
+  assert.equal(completed.result.complete, false)
+  assert.deepEqual(f.calls, [f.rows[1].org])
+  await sweep(f.h.paths, f.options)
+  assert.deepEqual(f.calls, [f.rows[1].org])
+  assert.equal(JSON.parse(await readFile(f.moved.file)).cloudChecks[2].status, 'cancelled')
+  const manual = await finishPending(f.h.paths, f.options)
+  assert.equal(manual.complete, true)
+  assert.equal(f.rows[0].status, 'archived')
+  assert.equal(f.rows[2].status, 'active')
+})
+
+test('login updates retry promptly, use brief backoff and then return to normal pacing', async t => {
+  const f = await pendingOrganizations({ orgs: ['P'] })
+  let now = Date.now(), attempts = 0, ready = false
+  t.mock.method(Date, 'now', () => now)
+  const active = { account: f.h.acct.P, org: f.h.org.P, state: 'known', at: new Date(now - 1000).toISOString() }
+  const options = { ...f.options, active, cloud: source => {
+    attempts++
+    if (!ready) throw Object.assign(new Error('Claude Desktop login is still updating'), { code: 'CLOUD_AUTH_PENDING' })
+    return f.client(source)
+  } }
+  const first = await sweep(f.h.paths, options)
+  const source = first.result.receipt.cloudChecks[0]
+  assert.equal(pendingPresentation(first.result.receipt, source, { signedIn: true }, 'cloud', [], false, new Map(), active).pendingRetryAt, now + 15000)
+  for (const [elapsed, expected] of [[0, 1], [14999, 1], [1, 2], [15000, 3], [59000, 3]]) {
+    now += elapsed
+    await sweep(f.h.paths, options)
+    assert.equal(attempts, expected)
+  }
+  active.at = new Date(now).toISOString()
+  await sweep(f.h.paths, options)
+  assert.equal(attempts, 4)
+  ready = true
+  now += 15000
+  const complete = await sweep(f.h.paths, options)
+  assert.equal(complete.result.complete, true)
+  assert.equal(complete.result.receipt.failed.length, 0)
+  assert.equal(attempts, 5)
+})
+
+test('unchanged event-limit refusals do not redownload and a new engine can retry them', async t => {
+  const f = await pendingOrganizations({ orgs: ['P'] })
+  let now = Date.now(), attempts = 0
+  t.mock.method(Date, 'now', () => now)
+  const options = { ...f.options, cloud: () => { attempts++; throw Object.assign(new Error('history exceeds the event limit'), { code: 'CLOUD_HISTORY_LIMIT' }) } }
+  const first = await sweep(f.h.paths, options), receipt = first.result.receipt, source = receipt.cloudChecks[0]
+  const presentation = pendingPresentation(receipt, source, { signedIn: true }, 'cloud')
+  assert.equal(presentation.pendingState, 'limit')
+  assert.equal(presentation.pendingAutomatic, false)
+  assert.equal(presentation.pendingRetryAt, null)
+  now += 120000
+  assert.equal((await sweep(f.h.paths, options)).pending, true)
+  assert.equal(attempts, 1)
+  source.attemptEngine = 'previous-engine'
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  const complete = await sweep(f.h.paths, f.options)
+  assert.equal(complete.result.complete, true)
+  assert.equal(f.rows[0].status, 'archived')
+})
+
+test('pending cleanup refuses wrong scoped clients and defers cross-login sources without calls', async () => {
+  const f = await pendingOrganizations(), before = await readFile(f.moved.file)
+  for (const active of [{ account: f.h.acct.T, state: 'known' }, { account: null, state: 'unknown' }, { account: f.h.acct.P, state: 'unknown' }, { account: f.h.acct.P, state: 'logged-out' }]) {
+    const deferred = await sweep(f.h.paths, { ...f.options, active: { ...active, org: f.h.org.T } })
+    assert.equal(deferred.pending, true)
+    assert.equal(f.calls.length, 0)
+    assert.deepEqual(await readFile(f.moved.file), before)
+  }
+  const stale = await finishPending(f.h.paths, { processes: f.identity.processes, cloud: cloudFixture(f.h, { account: f.h.acct.T, list: async () => assert.fail('stale client must not run') }) })
+  assert.equal(stale.pending, true)
+  assert.deepEqual(await readFile(f.moved.file), before)
+  for (const patch of [{ account: f.h.acct.T }, { org: f.h.org.Q }]) {
+    const result = await finishPending(f.h.paths, { ...f.options, cloud: expected => ({ ...f.client(expected), ...patch }) })
+    assert.equal(result.ok, false)
+    assert.equal(result.complete, false)
+    assert.match(result.failed.map(row => row.error).join(' '), /does not match the recorded source/)
+    assert.ok(f.rows.every(row => row.status === 'active'))
+    assert.equal(f.requested.length, 0)
+  }
+})
+
+test('explicit Undo restores all available organizations and sweep never advances a staged Undo', async () => {
+  const f = await pendingOrganizations()
+  for (const row of f.rows) await sweep(f.h.paths, f.options)
+  assert.ok(f.rows.every(row => row.status === 'archived'))
+  const wrong = { ...f.options, active: { account: f.h.acct.T, org: f.h.org.T, state: 'known' } }
+  const pending = await undo(f.h.paths, wrong)
+  assert.deepEqual(pending.pendingUndo, [f.from[0].email])
+  const before = await readFile(f.moved.file), count = f.calls.length
+  assert.equal((await sweep(f.h.paths, f.options)).complete, false)
+  assert.equal((await finishPending(f.h.paths, { ...f.options, automatic: true })).complete, false)
+  assert.equal(f.calls.length, count)
+  assert.deepEqual(await readFile(f.moved.file), before)
+  const listing = `500 1 ${new Date(f.identity.started).toString().replace(/^(\w+ \w+ \d+) (\d+) ([\d:]+).*$/, '$1 $3 $2')} /Applications/Claude.app/Contents/MacOS/Claude\n`
+  const shown = await cli(f.h.root, ['accounts', '--json'], processSetup({ list: listing, commands: listing }))
+  assert.equal(shown.code, 0, shown.stderr)
+  assert.ok(JSON.parse(shown.stdout).filter(row => row.pending === 'undo').every(row => row.signedIn && row.pendingAction === 'finish'))
+  const finished = await finishPending(f.h.paths, f.options)
+  assert.equal(finished.complete, true)
+  assert.ok(finished.dest)
+  assert.ok(f.rows.every(row => row.status === 'active'))
+  assert.deepEqual(await fixtureSnapshot(f.h, [f.h.paths.records, f.h.paths.pool]), f.before)
+})
+
+test('background Undo preserves its checkpoint while recovering an interrupted approved reopen', async () => {
+  for (const remote of [false, true]) for (const state of ['absent', 'running', 'failed', 'stale receipt']) {
+    const f = await pendingOrganizations({ orgs: ['T'] }), { h } = f
+    await sweep(h.paths, f.options)
+    await writeFile(f.to.taskFile, JSON.stringify({ scheduledTasks: [], runRetries: {} }))
+    await undo(h.paths, { ...f.options, active: { account: h.acct.T, org: h.org.T } })
+    const receipt = JSON.parse(await readFile(f.moved.file))
+    assert.ok(receipt.undoing.length)
+    if (!remote) { receipt.remoteUndoing = []; f.rows[0].status = 'active' }
+    await writeFile(f.moved.file, JSON.stringify(receipt))
+    const journal = `${f.moved.file}.journal`
+    await writeFile(journal, JSON.stringify({ sequence: (receipt.journalSequence ?? 0) + 1, pending: null, sessions: [], failed: [], retained: [] }) + '\n')
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), bytes = await readFile(f.moved.file), journalBytes = await readFile(journal), cloudCalls = f.calls.length
+    const restartFile = path.join(h.paths.state, 'restart.json')
+    await writeFile(restartFile, JSON.stringify({ outcome: 'moving', app: h.paths.claudeApp, receiptFile: f.moved.file, desktop: { pid: 500, started: 'prior' } }))
+    let rows = state === 'running' ? [desktopFixture()[0]] : [], calls = []
+    const io = { inspect: () => rows, command: async (file, args, timeout) => {
+      calls.push(file)
+      assert.equal(file, '/usr/bin/open')
+      assert.deepEqual(args, ['-g', '-a', h.paths.claudeApp])
+      assert.equal(timeout, 8000)
+      if (state !== 'failed') rows = [desktopFixture()[0]]
+      return { status: state === 'failed' ? 1 : 0 }
+    } }
+    if (remote && state !== 'stale receipt') {
+      const automatic = finishPending(h.paths, { ...f.options, io, automatic: true, receiptFile: f.moved.file })
+      if (state === 'failed') await assert.rejects(automatic, { code: 'REOPEN_FAILED', message: /Reopen Claude Desktop manually/ })
+      else {
+        const pending = await automatic
+        assert.equal(pending.pending, true)
+        assert.equal(pending.complete, false)
+      }
+    }
+    const sweeping = sweep(h.paths, { ...f.options, io, receiptFile: state === 'stale receipt' ? `${f.moved.file}.old` : f.moved.file })
+    if (state === 'failed' && !remote) await assert.rejects(sweeping, { code: 'REOPEN_FAILED', message: /Reopen Claude Desktop manually/ })
+    else {
+      const result = await sweeping
+      if (state === 'stale receipt') assert.match(result.error, /operation receipt changed/)
+      else {
+        assert.equal(result.pending, true)
+        assert.equal(result.complete, false)
+        assert.deepEqual(result.pendingUndo, remote ? [f.from[0].email] : [])
+      }
+      assert.notEqual(result.complete, true)
+    }
+    assert.deepEqual(calls, state === 'running' ? [] : ['/usr/bin/open'])
+    const restart = JSON.parse(await readFile(restartFile))
+    assert.equal(restart.outcome, state === 'running' ? 'interrupted-app-running' : state === 'failed' ? 'reopen-failed' : 'interrupted-reopened')
+    assert.ok(restart.recoveredAt)
+    assert.equal(f.calls.length, cloudCalls)
+    assert.equal(f.rows[0].status, remote ? 'archived' : 'active')
+    assert.deepEqual(await readFile(f.moved.file), bytes)
+    assert.deepEqual(await readFile(journal), journalBytes)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+    assert.equal((await sweep(h.paths, { ...f.options, io })).complete, false)
+    assert.deepEqual(calls, state === 'running' ? [] : ['/usr/bin/open'])
+    assert.deepEqual(await readFile(f.moved.file), bytes)
+    assert.deepEqual(await readFile(journal), journalBytes)
+  }
+})
+
+test('same-login cleanup retains server account, organization membership and response organization checks', async t => {
+  for (const mismatch of ['server account', 'membership', 'response org', 'Desktop login', 'logout']) {
+    const f = await pendingOrganizations({ orgs: ['T'] }), { h } = f, requests = []
+    const mocked = t.mock.method(globalThis, 'fetch', async (url, options) => {
+      const endpoint = new URL(url).pathname
+      requests.push(endpoint)
+      assert.equal(options.method ?? 'GET', 'GET')
+      if (endpoint === '/api/account') return Response.json({ uuid: mismatch === 'server account' ? h.acct.T : h.acct.P })
+      if (endpoint === '/api/organizations') return Response.json((mismatch === 'membership' ? [h.org.P] : [h.org.P, h.org.T]).map(uuid => ({ uuid })))
+      assert.equal(endpoint, '/v1/code/sessions')
+      assert.equal(options.headers['x-organization-uuid'], h.org.T)
+      return Response.json({ data: [] }, { headers: { 'anthropic-organization-id': h.org.P } })
+    })
+    try {
+      const cloud = expected => cloudClient(h.paths, expected, {
+        active: { account: mismatch === 'Desktop login' ? h.acct.T : h.acct.P, org: h.org.P, state: mismatch === 'logout' ? 'logged-out' : 'known' },
+        cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.P]]), userAgent: 'fixture'
+      })
+      const result = await finishPending(h.paths, { ...f.options, cloud })
+      assert.equal(result.ok, false, mismatch)
+      assert.equal(result.complete, false)
+      assert.ok(result.failed.length)
+      assert.equal(f.rows[0].status, 'active')
+      assert.equal(result.receipt.remote.length, 0)
+      assert.equal(requests.length, mismatch === 'response org' ? 3 : mismatch === 'membership' ? 2 : mismatch === 'server account' ? 1 : 0)
+    } finally { mocked.mock.restore() }
+  }
+})
+
+test('local Undo continuation stays explicit after its last remote restoration checkpoint', async () => {
+  const f = await pendingOrganizations({ orgs: ['T'] })
+  await sweep(f.h.paths, f.options)
+  await undo(f.h.paths, { ...f.options, active: { account: f.h.acct.T, org: f.h.org.T } })
+  const receipt = JSON.parse(await readFile(f.moved.file))
+  receipt.remoteUndoing = []
+  f.rows[0].status = 'active'
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  const before = await readFile(f.moved.file), count = f.calls.length
+  assert.equal((await sweep(f.h.paths, f.options)).complete, false)
+  assert.equal(f.calls.length, count)
+  assert.deepEqual(await readFile(f.moved.file), before)
+  const listed = await cli(f.h.root, ['accounts', '--json'])
+  assert.equal(listed.code, 0, listed.stderr)
+  const pending = JSON.parse(listed.stdout).filter(row => row.pending === 'undo')
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0].pendingAction, 'finish')
+  const finished = await finishPending(f.h.paths, f.options)
+  assert.equal(finished.complete, true)
+  assert.ok(finished.dest)
+  assert.equal(f.calls.length, count)
+  assert.deepEqual(await fixtureSnapshot(f.h, [f.h.paths.records, f.h.paths.pool]), f.before)
+})
+
+test('accounts includes a known login organization with no Desktop directory', async () => {
+  const h = await home()
+  const account = id(920)
+  const org = id(921)
+  const profile = path.join(h.root, '.claude-known')
+  await mkdir(profile)
+  await writeFile(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress: 'known@example.com', organizationName: 'Known Team', organizationType: 'team' }
+  }))
+  const row = (await accounts(h.paths)).find((candidate) => candidate.account === account && candidate.org === org)
+
+  assert.equal(row.label, 'known@example.com · Known Team')
+  assert.equal(row.sessions.length, 0)
+  assert.equal(await stat(row.dir).then(() => true, () => false), false)
+})
+
+test('accounts tells apart organizations that share a name with their uuid prefix', async () => {
+  const h = await home()
+  const account = id(924)
+  const orgs = [id(925), id(926)]
+  for (const [index, org] of orgs.entries()) {
+    const profile = path.join(h.root, `.claude-personal-${index}`)
+    await mkdir(profile)
+    await writeFile(path.join(profile, '.claude.json'), JSON.stringify({
+      oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress: 'same@example.com', organizationName: 'Personal', organizationType: 'personal' }
+    }))
+  }
+  const rows = (await accounts(h.paths)).filter((candidate) => candidate.account === account)
+
+  assert.deepEqual(rows.map((row) => row.label).sort(), orgs.map((org) => `same@example.com · Personal · ${org.slice(0, 8)}`).sort())
+})
+
+test('tidy sets aside only empty folders Desktop left for another login personal organization', async () => {
+  const h = await home()
+  const exists = (file) => stat(file).then(() => true, () => false)
+  const [owner, guest, solo, other] = [id(930), id(931), id(932), id(933)]
+  const [ownerOrg, guestOrg, team, soloOrg, otherOrg, shared] = [id(940), id(941), id(942), id(943), id(944), id(945)]
+  const login = async (name, account, org, organizationName) => {
+    await mkdir(path.join(h.root, name))
+    await writeFile(path.join(h.root, name, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress: `${name.slice(8)}@example.com`, organizationName } }))
+  }
+  await login('.claude-owner', owner, ownerOrg, 'Personal')
+  await login('.claude-guest', guest, guestOrg, 'Personal')
+  await login('.claude-team', owner, team, 'Shared Team')
+  await login('.claude-solo', solo, soloOrg, 'Personal')
+  await login('.claude-other', other, otherOrg, 'Personal')
+  await login('.claude-shared', solo, shared, 'Personal')
+  const folder = async (root, account, org, tasks = []) => {
+    await mkdir(path.join(root, account, org), { recursive: true })
+    await writeFile(path.join(root, account, org, 'scheduled-tasks.json'), JSON.stringify({ scheduledTasks: tasks }))
+  }
+  await mkdir(path.join(h.paths.records, owner, ownerOrg), { recursive: true })
+  await writeFile(path.join(h.paths.records, owner, ownerOrg, `local_${id(950)}.json`), JSON.stringify({ sessionId: `local_${id(950)}`, cliSessionId: id(950), cwd: '/tmp', title: 'Kept', lastActivityAt: 2 }))
+  const kept = [[guest, guestOrg], [guest, team], [owner, team], [other, ownerOrg], [other, otherOrg], [solo, soloOrg], [solo, shared], [other, shared]]
+  for (const root of [h.paths.records, h.paths.agentSessions]) {
+    await folder(root, guest, ownerOrg)
+    for (const [account, org] of kept) await folder(root, account, org, account === other && org === ownerOrg ? [{ id: 'daily' }] : [])
+  }
+
+  const found = await leftovers(h.paths, await accounts(h.paths))
+  assert.deepEqual(found.map((row) => `${row.account}/${row.org}`), [`${guest}/${ownerOrg}`])
+  const result = await tidy(h.paths)
+  assert.deepEqual(result.moved.map((row) => row.account + row.org), [guest + ownerOrg])
+  for (const [tree, root] of [['claude-code-sessions', h.paths.records], ['local-agent-mode-sessions', h.paths.agentSessions]]) {
+    assert.equal(await exists(path.join(root, guest, ownerOrg)), false)
+    assert.equal(await exists(path.join(result.dest, tree, guest, ownerOrg, 'scheduled-tasks.json')), true)
+    for (const [account, org] of kept) assert.equal(await exists(path.join(root, account, org)), true)
+  }
+  assert.deepEqual((await tidy(h.paths)).moved, [])
+  await assert.rejects(tidy(h.paths, { account: owner, org: ownerOrg }), { code: 'ACCOUNT_NOT_EMPTY' })
+  await assert.rejects(tidy(h.paths, { account: other, org: ownerOrg }), { code: 'ACCOUNT_NOT_EMPTY' })
+  await assert.rejects(tidy(h.paths, { account: other, org: team }), { code: 'NO_ACCOUNT' })
+  const single = await tidy(h.paths, { account: guest, org: guestOrg })
+  assert.deepEqual(single.moved.map((row) => row.account + row.org), [guest + guestOrg])
+  for (const root of [h.paths.records, h.paths.agentSessions]) assert.equal(await exists(path.join(root, guest, guestOrg)), false)
+  assert.equal(await exists(path.join(h.paths.records, guest, team)), true)
+})
+
+test('accounts labels a login held in a claude-acc account directory', async () => {
+  const h = await home()
+  const account = id(922)
+  const org = id(923)
+  const profile = path.join(h.paths.switchAccounts, 'work')
+  await mkdir(profile, { recursive: true })
+  await writeFile(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress: 'switched@example.com', organizationName: 'Switched Team', organizationType: 'team' }
+  }))
+  const row = (await accounts(h.paths)).find((candidate) => candidate.account === account && candidate.org === org)
+
+  assert.equal(row.label, 'switched@example.com \u00b7 Switched Team')
+})
+
+test('menubar snapshot renders live accounts without installing', async () => {
+  const h = await home()
+  const output = path.join(h.root, 'snapshot', 'panel.png')
+  const result = await cli(h.root, ['menubar', '--snapshot', output])
+  const png = await readFile(output)
+
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(png.subarray(1, 4).toString(), 'PNG')
+  assert.equal(await stat(path.join(h.paths.state, 'Claude Handoff.app')).then(() => true, () => false), false)
+  assert.equal(await stat(path.join(h.root, 'Library/LaunchAgents/io.github.derek-miller.claude-handoff.plist')).then(() => true, () => false), false)
+})
+
+test('same-account organization moves rehome one record without copying history', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const entries = [
+    entry('user', 1, null, SOURCE),
+    entry('assistant', 2, 1, SOURCE),
+    { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'session_fixture', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
+  ]
+  await h.write(SOURCE, entries)
+  await mkdir(path.join(h.project, SOURCE, 'subagents'), { recursive: true })
+  await writeFile(path.join(h.project, SOURCE, 'subagents', 'agent.jsonl'), '{"fixture":true}\n')
+  const recordId = `local_${id(777)}`
+  const recordName = `${recordId}.json`
+  await h.record('P', SOURCE, rehomeRecord({ sessionId: recordId, bridgeSessionIds: ['session_fixture'] }))
+  await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('P'), recordName))
+  const before = Buffer.concat([await readFile(transcript), Buffer.from(`${JSON.stringify({ type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })}\n`)])
+
+  const select = async (fromOrg, toOrg) => {
+    const all = await accounts(h.paths)
+    return {
+      from: all.find((a) => a.account === h.acct.P && a.org === fromOrg),
+      to: all.find((a) => a.account === h.acct.P && a.org === toOrg)
+    }
+  }
+
+  let picked = await select(h.org.P, h.org.T)
+  let inv = await inventory([picked.from], picked.to, h.paths)
+  assert.equal(inv.move.length, 1)
+  assert.equal(inv.move[0].strategy, 'rehome')
+  const first = await move(inv, picked.to, h.paths)
+  assert.equal(first.ok, true)
+  assert.equal(first.receipt.sessions[0].strategy, 'rehome')
+  assert.equal(first.receipt.sessions[0].targetId, SOURCE)
+  assert.deepEqual(await readFile(transcript), before)
+  const clearedStat = await stat(transcript)
+  assert.deepEqual((await readdir(h.project)).sort(), [SOURCE, `${SOURCE}.jsonl`].sort())
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(teamDir), [recordName])
+
+  picked = await select(h.org.T, h.org.P)
+  inv = await inventory([picked.from], picked.to, h.paths)
+  assert.equal(inv.move[0].strategy, 'rehome')
+  const second = await move(inv, picked.to, h.paths)
+  assert.equal(second.ok, true)
+  assert.deepEqual(await readFile(transcript), before)
+  assert.deepEqual(await readdir(h.dir('P')), [recordName])
+  assert.deepEqual(await readdir(teamDir), [])
+
+  for (let round = 1; round < 10; round++) {
+    picked = await select(h.org.P, h.org.T)
+    inv = await inventory([picked.from], picked.to, h.paths)
+    assert.equal(inv.move[0].strategy, 'rehome')
+    assert.equal((await move(inv, picked.to, h.paths)).ok, true)
+    picked = await select(h.org.T, h.org.P)
+    inv = await inventory([picked.from], picked.to, h.paths)
+    assert.equal(inv.move[0].strategy, 'rehome')
+    assert.equal((await move(inv, picked.to, h.paths)).ok, true)
+    assert.deepEqual(await readFile(transcript), before)
+    assert.equal((await stat(transcript)).mtimeMs, clearedStat.mtimeMs)
+    assert.deepEqual((await readdir(h.project)).sort(), [SOURCE, `${SOURCE}.jsonl`].sort())
+  }
+
+  const bytes = async (root) => {
+    let total = 0
+    for (const item of await readdir(root, { withFileTypes: true })) {
+      const file = path.join(root, item.name)
+      total += item.isDirectory() ? await bytes(file) : (await stat(file)).size
+    }
+    return total
+  }
+  assert.ok(await bytes(h.paths.state) < 1_000_000)
+
+  const undone = await undo(h.paths)
+  assert.ok(undone.dest)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(teamDir), [recordName])
+  assert.deepEqual(await readFile(transcript), before)
+})
+
+test('cross-login moves rehome across same and different organizations', async () => {
+  for (const targetOrg of ['P', 'Z']) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    const targetDir = path.join(h.paths.records, h.acct.Z, h.org[targetOrg])
+    await mkdir(targetDir, { recursive: true })
+    const before = await readFile(path.join(h.project, `${SOURCE}.jsonl`))
+    const all = await accounts(h.paths)
+    const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+    const to = all.find((a) => a.account === h.acct.Z && a.org === h.org[targetOrg])
+    const inv = await inventory([from], to, h.paths)
+    assert.equal(inv.move[0].strategy, 'rehome')
+    const result = await move(inv, to, h.paths)
+    assert.equal(result.ok, true)
+    assert.equal(result.receipt.sessions[0].strategy, 'rehome')
+    assert.equal(result.receipt.sessions[0].targetId, SOURCE)
+    assert.deepEqual(await readFile(path.join(h.project, `${SOURCE}.jsonl`)), before)
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    assert.deepEqual(await readdir(targetDir), [`local_${SOURCE}.json`])
+  }
+})
+
+async function bridgeFixture() {
+  const h = await home(), transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const bridge = { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'cse_prior', lastSequenceNum: 7, ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
+  await h.write(SOURCE, [...branchEntries(2, SOURCE, 1), { type: 'history-suppression', sessionId: SOURCE }, bridge])
+  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior'] }))
+  const all = await accounts(h.paths, []), from = all.find(a => a.account === h.acct.P), to = all.find(a => a.account === h.acct.Z)
+  return { ...h, transcript: await fs.realpath(transcript), bridge, from, to, before: await readFile(transcript) }
+}
+
+function assertBridgeRestored(before, after, bridge) {
+  assert.ok(after.subarray(0, before.length).equals(before))
+  const parse = bytes => bytes.toString('utf8').split('\n').filter(line => line.trim()).map(line => [line, JSON.parse(line)])
+  const original = parse(before), current = parse(after)
+  assert.deepEqual(current.filter(([, row]) => MESSAGES.has(row.type)).map(([line]) => line), original.filter(([, row]) => MESSAGES.has(row.type)).map(([line]) => line))
+  assert.deepEqual(current.filter(([, row]) => row.type === 'bridge-session' && row.sessionId === bridge.sessionId).at(-1)?.[1], bridge)
+}
+
+test('bridge review recovery leaves committed rows outside a held continuation alone', async () => {
+  const h = await bridgeFixture(), cold = id(300)
+  await h.write(cold, [entry('user', 300, null, cold), { ...h.bridge, sessionId: cold }])
+  await h.record('P', cold, rehomeRecord())
+  const all = await accounts(h.paths, []), from = all.find(a => a.account === h.acct.P)
+  const first = await executeMove([from], h.to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  assert.deepEqual(first.receipt.sessions.map(row => row.id), [cold])
+  await assert.rejects(finishHeld(h.paths, { processes: [], report: (stage, text) => {
+    if (stage === 'retire' && text === 'checking') throw new Error('Synthetic interrupted continuation')
+  } }), /Synthetic interrupted continuation/)
+  const transcript = path.join(h.project, `${cold}.jsonl`)
+  await appendFile(transcript, `${JSON.stringify({ ...h.bridge, sessionId: cold, bridgeSessionId: 'cse_newer', ownerAccountUuid: h.to.account, ownerOrganizationUuid: h.to.org })}\n`)
+  const before = await readFile(transcript)
+  await undo(h.paths, { processes: [] })
+  const recovered = await readReceipt(first.file)
+  assert.deepEqual(recovered.sessions.map(row => row.id), [cold])
+  assert.equal(Boolean(recovered.finalizing || recovered.appendCheckpoint || recovered.pending), false)
+  assert.deepEqual(await readFile(transcript), before)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.equal(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)).catch(() => null), null)
+})
+
+test('bridge recovery of remote-only work leaves unrelated completed metadata alone', async () => {
+  const h = await bridgeFixture()
+  const moved = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
+  await appendFile(h.transcript, `${JSON.stringify({ ...h.bridge, bridgeSessionId: 'cse_newer', ownerAccountUuid: h.to.account, ownerOrganizationUuid: h.to.org })}\n`)
+  const receipt = await readReceipt(moved.file)
+  receipt.remotePending = { id: 'cse_pending', title: 'Synthetic source mirror', account: h.from.account, org: h.from.org }
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  let reads = 0
+  const cloud = cloudFixture(h, { session: async id => { reads++; assert.equal(id, 'cse_pending'); return remoteState('archived') } })
+  const result = await undo(h.paths, { processes: [], cloud })
+  assert.match(result.reconciled.error, /interrupted Remote Control archive completed/)
+  assert.equal(reads, 1)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+})
+
+test('bridge review Undo preserves a newer pointer while retaining the Desktop record guard', async t => {
+  for (const recordChanged of [false, true]) await t.test(String(recordChanged), async () => {
+    const h = await bridgeFixture()
+    const moved = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
+    await appendFile(h.transcript, `${JSON.stringify({ ...h.bridge, bridgeSessionId: 'cse_newer', ownerAccountUuid: h.to.account, ownerOrganizationUuid: h.to.org })}\n`)
+    const record = moved.receipt.sessions[0].record
+    if (recordChanged) await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), bridgeSessionIds: ['session_newer'] }))
+    const before = await readFile(h.transcript), desktop = await readFile(record)
+    const result = await undo(h.paths, { processes: [] })
+    assert.equal(Boolean(result.dest), !recordChanged)
+    assert.deepEqual(await readFile(h.transcript), before)
+    if (recordChanged) assert.deepEqual(await readFile(record), desktop)
+    else assert.deepEqual(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))).bridgeSessionIds, ['session_prior'])
+  })
+})
+
+test('bridge review Undo cannot discard a message arriving immediately before mutation', async t => {
+  const h = await bridgeFixture()
+  await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
+  const before = await readFile(h.transcript), realOpen = fs.open
+  let injected = false, truncated = false
+  const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+    const handle = await realOpen(file, flags, ...args)
+    if (file === h.transcript && mutatingOpen(flags)) for (const method of ['truncate', 'writeFile']) {
+      const original = handle[method].bind(handle)
+      t.mock.method(handle, method, async (...args) => {
+        if (!injected) { injected = true; await appendFile(file, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`) }
+        if (method === 'truncate') truncated = true
+        return original(...args)
+      })
+    }
+    return handle
+  })
+  syncBuiltinESMExports()
+  try { await undo(h.paths, { processes: [] }).catch(error => assert.match(error.message, /bridge/)) }
+  finally { mock.mock.restore(); syncBuiltinESMExports() }
+  const after = await readFile(h.transcript)
+  assert.equal(injected, true)
+  assert.ok(lines(after.toString()).some(row => row.uuid === id(3)))
+  assert.deepEqual(after.subarray(0, before.length), before)
+  assert.equal(truncated, false)
+})
+
+test('bridge review final worker guard includes distinct Desktop aliases', async t => {
+  for (const mode of ['record only', 'shared child', 'external worker']) await t.test(mode, async t => {
+    const h = await bridgeFixture(), recordUuid = id(9001), recordId = `local_${recordUuid}`
+    if (mode === 'shared child') await h.record('P', recordUuid, rehomeRecord({ cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` }))
+    else {
+      await h.record('P', SOURCE, rehomeRecord({ sessionId: recordId }))
+      await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('P'), `${recordId}.json`))
+    }
+    let active = false, injected = false
+    const inspect = () => active ? [{ worker: true, pid: 123, desktopPid: mode === 'external worker' ? null : 100, ids: [recordUuid] }] : []
+    const all = await accounts(h.paths, []), from = all.find(a => a.account === h.acct.P)
+    const inv = await inventory([from], h.to, h.paths, () => {}, { inspect }), realOpen = fs.open
+    const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+      if (file === h.transcript && mutatingOpen(flags)) { active = true; injected = true }
+      return realOpen(file, flags, ...args)
+    })
+    syncBuiltinESMExports()
+    let result
+    try { result = await move(inv, h.to, h.paths) }
+    finally { mock.mock.restore(); syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    assert.equal(result.ok, false)
+    assert.deepEqual(await readFile(h.transcript), h.before)
+    assert.deepEqual(await readdir(h.dir('Z')), [])
+  })
+})
+
+test('bridge byte verification parses history only when inventory found metadata', async t => {
+  for (const mode of ['no bridge metadata', 'bridge metadata', 'shared transcript records']) await t.test(mode, async t => {
+    const bridge = mode !== 'no bridge metadata'
+    const h = await bridgeFixture(), messages = branchEntries(48, SOURCE, 1).map(row => ({ ...row, message: { ...row.message, content: 'synthetic history '.repeat(128) } }))
+    await h.write(SOURCE, [...messages, ...(bridge ? [h.bridge] : [])])
+    if (mode === 'shared transcript records') {
+      await h.record('P', id(777), rehomeRecord({ cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` }))
+      h.from = (await accounts(h.paths, [])).find(row => row.account === h.acct.P)
+    }
+    const before = await readFile(h.transcript), inv = await inventory([h.from], h.to, h.paths, () => {}, { processes: [] })
+    let parsed = 0
+    const parse = JSON.parse, mock = t.mock.method(JSON, 'parse', (text, ...args) => {
+      if (/^\{"type":"(?:user|assistant)"/.test(String(text))) parsed++
+      return parse(text, ...args)
+    })
+    let result
+    try { result = await move(inv, h.to, h.paths) }
+    finally { mock.mock.restore() }
+    assert.equal(result.ok, true)
+    assert.equal(parsed, bridge ? messages.length : 0)
+    assert.ok((await readFile(h.transcript)).subarray(0, before.length).equals(before))
+  })
+})
+
+test('bridge append rejects the reproduced partial write and concurrent rewrite failures', async t => {
+  for (const mode of ['partial-write', 'concurrent-rewrite']) await t.test(mode, async t => {
+    const h = await bridgeFixture(), inv = await inventory([h.from], h.to, h.paths, () => {}, { processes: [] })
+    const realOpen = fs.open
+    let injected = false
+    const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+      if (file !== h.transcript || !mutatingOpen(flags) || injected) return realOpen(file, flags, ...args)
+      injected = true
+      if (mode === 'concurrent-rewrite') await writeFile(file, h.before.toString().replace('message 1', 'concurrently changed history'))
+      const handle = await realOpen(file, flags, ...args)
+      if (mode === 'partial-write') {
+        const write = handle.writeFile.bind(handle)
+        t.mock.method(handle, 'writeFile', async data => {
+          await write(data.slice(0, 25))
+          throw Object.assign(new Error('Synthetic partial append'), { code: 'ENOSPC' })
+        })
+      }
+      return handle
+    })
+    syncBuiltinESMExports()
+    let result
+    try { result = await move(inv, h.to, h.paths) }
+    finally { mock.mock.restore(); syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    assert.equal(result.ok, true)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    const after = await readFile(h.transcript)
+    assertBridgeRestored(mode === 'partial-write' ? h.before : Buffer.from(h.before.toString().replace('message 1', 'concurrently changed history')), after, h.bridge)
+    assert.deepEqual(lines(after.toString()).at(-1), h.bridge)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  })
+})
+
+test('a rehome clears the source bridge and Undo restores its original attachment', async () => {
+  const h = await home()
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  await h.write(SOURCE, [
+    entry('user', 1, null, SOURCE),
+    entry('assistant', 2, 1, SOURCE),
+    { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'cse_prior', lastSequenceNum: 7, ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
+  ])
+  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior'] }))
+  const targetDir = path.join(h.paths.records, h.acct.Z, h.org.Z)
+  await mkdir(targetDir, { recursive: true })
+  const before = await readFile(transcript)
+  const cleared = Buffer.concat([before, Buffer.from(`${JSON.stringify({ type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })}\n`)])
+  const moveOnce = async () => {
+    const all = await accounts(h.paths)
+    const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+    const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+    const inv = await inventory([from], to, h.paths)
+    assert.equal(inv.move[0].strategy, 'rehome')
+    return move(inv, to, h.paths)
+  }
+  const first = await moveOnce()
+  assert.equal(first.ok, true)
+  assert.deepEqual(await readFile(transcript), cleared)
+  assert.deepEqual(JSON.parse(await readFile(path.join(targetDir, `local_${SOURCE}.json`), 'utf8')).bridgeSessionIds, [])
+  assert.ok((await undo(h.paths)).dest)
+  assert.deepEqual(await readdir(targetDir), [])
+  const restored = await readFile(transcript)
+  assertBridgeRestored(before, restored, lines(before.toString()).at(-1))
+  assert.equal((await moveOnce()).ok, true)
+  assertBridgeRestored(restored, await readFile(transcript), { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })
+})
+
+test('a move to another account drops the source account error and Undo restores it', async () => {
+  const h = await home(), saved = { error: "You've hit your weekly limit · resets Oct 31 at 8am", errorAt: 1793385600000, priorErrorMark: 1793385600000 }
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord(saved))
+  const source = path.join(h.dir('P'), `local_${SOURCE}.json`), original = await readFile(source)
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+  assert.equal(moved.ok, true)
+  const placed = JSON.parse(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`), 'utf8'))
+  for (const key of Object.keys(saved)) assert.equal(Object.hasOwn(placed, key), false, key)
+  assert.deepEqual(await readFile(moved.receipt.superseded.find(row => row.source).moved[0][1]), original)
+  assert.ok((await undo(h.paths)).dest)
+  assert.deepEqual(await readFile(source), original)
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('bridge rehome preserves SSH mirrors and records through Move and Undo', async t => {
+  const sshConfig = { sshHost: 'fixture.invalid' }, sshRemoteTranscriptPath = `/home/fixture/.claude/projects/-home-fixture/${SOURCE}.jsonl`
+  for (const [mode, extra] of [
+    ['remote path', { sshRemoteTranscriptPath }],
+    ['configuration and remote path', { sshConfig, sshRemoteTranscriptPath }],
+    ['configuration without cached path', { sshConfig }],
+    ['configuration with empty cached path', { sshConfig, sshRemoteTranscriptPath: '' }],
+    ['shared configuration', { sshConfig }],
+    ['shared remote path', { sshRemoteTranscriptPath }],
+    ['native mirror location', {}],
+    ['native mirror alias', {}]
+  ]) await t.test(mode, async () => {
+    const h = await bridgeFixture(), shared = mode.startsWith('shared')
+    await h.record('P', shared ? id(777) : SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior'], ...extra,
+      ...(shared ? { cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` } : {}) }))
+    if (mode.startsWith('native mirror')) {
+      const project = path.join(h.paths.pool, `ssh-${SOURCE}`)
+      await rename(h.project, project)
+      if (mode === 'native mirror alias') await symlink(project, h.project)
+      h.transcript = await fs.realpath(path.join(project, `${SOURCE}.jsonl`))
+    }
+    const originals = await Promise.all((await readdir(h.dir('P'))).map(async name => ({ name, bytes: await readFile(path.join(h.dir('P'), name)) })))
+    const from = (await accounts(h.paths, [])).find(a => a.account === h.acct.P)
+    const inv = await inventory([from], h.to, h.paths, () => {}, { processes: [] })
+    assert.equal(inv.move.length, originals.length)
+    assert.equal(inv.move[0].record.sessionId, `local_${SOURCE}`)
+    if (mode === 'native mirror alias') assert.equal(inv.move[0].transcript, path.join(h.project, `${SOURCE}.jsonl`))
+    assert.ok(inv.move.every(row => row.strategy === 'rehome'))
+    const moved = await move(inv, h.to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.ok(moved.receipt.sessions.every(row => !row.bridgeAppend))
+    assert.deepEqual(await readFile(h.transcript), h.before)
+    for (const { name, bytes } of originals) assert.deepEqual(JSON.parse(await readFile(path.join(h.dir('Z'), name))), { ...JSON.parse(bytes), bridgeSessionIds: [] })
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(await readFile(h.transcript), h.before)
+    for (const { name, bytes } of originals) assert.deepEqual(await readFile(path.join(h.dir('P'), name)), bytes)
+    assert.deepEqual(await readdir(h.dir('Z')), [])
+  })
+})
+
+test('bridge append honors native ownership, formatting, aliases and an already cleared pointer', async t => {
+  for (const mode of ['foreign', 'unknown owner', 'destination owner', 'other organization', 'legacy', 'spaced', 'no newline', 'empty', 'foreign session', 'parent alias']) await t.test(mode, async () => {
+    const h = await bridgeFixture(), entries = lines(h.before.toString())
+    if (mode === 'unknown owner') { delete h.bridge.ownerAccountUuid; delete h.bridge.ownerOrganizationUuid }
+    if (mode === 'destination owner' || mode === 'other organization') h.bridge.ownerAccountUuid = h.to.account
+    if (mode === 'destination owner') h.bridge.ownerOrganizationUuid = h.to.org
+    if (mode === 'legacy') { h.bridge.bridge_session_id = h.bridge.bridgeSessionId; delete h.bridge.bridgeSessionId }
+    if (mode === 'empty') h.bridge.bridgeSessionId = ''
+    if (mode === 'foreign session') h.bridge.sessionId = id(799)
+    entries[entries.length - 1] = h.bridge
+    const text = entries.map(e => mode === 'spaced' ? JSON.stringify(e, null, 1).replaceAll('\n', ' ') : JSON.stringify(e)).join('\n') + (mode === 'no newline' ? '' : '\n')
+    await writeFile(h.transcript, text)
+    if (mode === 'parent alias') {
+      const actual = path.join(h.root, 'actual-project')
+      await rename(h.project, actual)
+      await symlink(actual, h.project)
+      h.transcript = await fs.realpath(path.join(h.project, `${SOURCE}.jsonl`))
+    }
+    const sidecar = path.join(h.project, SOURCE, 'agent.jsonl')
+    await mkdir(path.dirname(sidecar), { recursive: true })
+    await writeFile(sidecar, 'synthetic sidecar\n')
+    const before = await readFile(h.transcript), output = []
+    const result = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths, (stage, text) => output.push(`${stage} ${text}`))
+    assert.equal(result.ok, true)
+    assert.equal(result.receipt.failed.length, 0)
+    assert.doesNotMatch(output.join('\n'), /warning|suppressed|bridge/i)
+    const cleared = !['destination owner', 'empty', 'foreign session'].includes(mode)
+    const after = await readFile(h.transcript), records = lines(after.toString())
+    assert.deepEqual(after.subarray(0, before.length), before)
+    assert.equal(records.length, entries.length + Number(cleared))
+    assert.deepEqual(records.filter(e => MESSAGES.has(e.type)), entries.filter(e => MESSAGES.has(e.type)))
+    assert.deepEqual(records.filter(e => e.type === 'history-suppression'), entries.filter(e => e.type === 'history-suppression'))
+    assert.equal(records.at(-1).bridgeSessionId, cleared ? '' : h.bridge.bridgeSessionId)
+    assert.equal(await readFile(sidecar, 'utf8'), 'synthetic sidecar\n')
+    const all = await accounts(h.paths, []), next = all.find(a => a.account === h.acct.T), source = all.find(a => a.account === h.acct.Z)
+    if (cleared) {
+      const again = await move(await inventory([source], next, h.paths, () => {}, { processes: [] }), next, h.paths)
+      assert.equal(again.ok, true)
+      assert.deepEqual(await readFile(h.transcript), after)
+    } else {
+      assert.ok((await undo(h.paths, { processes: [] })).dest)
+      assert.deepEqual(await readFile(h.transcript), before)
+    }
+  })
+})
+
+test('bridge rehome keeps ordinary lines just over 16 MiB movable', async t => {
+  for (const bridge of [false, true]) for (const tool of [false, true]) await t.test(`${bridge ? 'bridge' : 'no bridge'}, ${tool ? 'tool output' : 'message'}`, async () => {
+    const h = await bridgeFixture(), entries = lines(h.before.toString()).filter(e => bridge || e.type !== 'bridge-session')
+    const content = 'x'.repeat(16 * 1024 * 1024 + 1)
+    entries[0].message.content = tool ? [{ type: 'tool_result', tool_use_id: 'synthetic', content }] : content
+    await h.write(SOURCE, entries)
+    const before = await readFile(h.transcript)
+    const inv = await inventory([h.from], h.to, h.paths, () => {}, { processes: [] })
+    assert.equal(inv.move.length, 1)
+    const moved = await move(inv, h.to, h.paths)
+    assert.equal(moved.ok, true, moved.receipt.failed.map(row => row.error).join(', '))
+    assert.equal(moved.receipt.verification.ok, true)
+    const after = await readFile(h.transcript)
+    assert.ok(after.subarray(0, before.length).equals(before))
+    assert.equal(after.length > before.length, bridge)
+    assert.ok(JSON.stringify(moved.receipt.sessions[0].bridgeAppend ?? null).length < 4096)
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    if (bridge) assertBridgeRestored(after, await readFile(h.transcript), h.bridge)
+    else assert.ok((await readFile(h.transcript)).equals(before))
+    assert.deepEqual(await readdir(h.dir('Z')), [])
+  })
+})
+
+test('bridge append crash checkpoints recover through the placement receipt', async t => {
+  for (const checkpoint of ['intent', 'partial', 'synced', 'applied', 'settled', 'synced with later messages', 'ack failed with later messages', 'unacknowledged newer bridge']) await t.test(checkpoint, async t => {
+    const h = await bridgeFixture(), inv = await inventory([h.from], h.to, h.paths, () => {}, { processes: [] })
+    const realOpen = fs.open
+    let injected = false
+    const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+      const handle = await realOpen(file, flags, ...args)
+      if (String(file).endsWith('.journal') || file === h.transcript && mutatingOpen(flags)) {
+        const write = handle.writeFile.bind(handle), sync = handle.sync.bind(handle)
+        t.mock.method(handle, 'writeFile', async data => {
+          const patch = String(file).endsWith('.journal') ? JSON.parse(data) : null
+          if (checkpoint === 'ack failed with later messages' && patch?.pending?.bridgeAppend?.applied && !injected) {
+            injected = true
+            throw Object.assign(new Error('Synthetic crash checkpoint'), { code: 'JOURNAL_WRITE' })
+          }
+          const matches = checkpoint === 'intent' ? patch?.pending?.bridgeAppend && !patch.pending.bridgeAppend.applied
+            : checkpoint === 'applied' ? patch?.pending?.bridgeAppend?.applied
+              : checkpoint === 'settled' ? patch?.sessions.some(row => row.bridgeAppend) : checkpoint === 'partial' && file === h.transcript
+          await write(matches && checkpoint === 'partial' ? data.slice(0, 25) : data)
+          if (matches && !injected) { injected = true; throw Object.assign(new Error('Synthetic crash checkpoint'), { code: 'JOURNAL_WRITE' }) }
+        })
+        t.mock.method(handle, 'sync', async () => {
+          await sync()
+          if (['synced', 'synced with later messages', 'unacknowledged newer bridge'].includes(checkpoint) && file === h.transcript && !injected) { injected = true; throw Object.assign(new Error('Synthetic crash checkpoint'), { code: 'JOURNAL_WRITE' }) }
+        })
+      }
+      return handle
+    })
+    syncBuiltinESMExports()
+    try { await assert.rejects(move(inv, h.to, h.paths), /Synthetic crash checkpoint/) }
+    finally { mock.mock.restore(); syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name))), receipt = await readReceipt(file)
+    const plan = receipt.pending?.bridgeAppend ?? receipt.sessions[0].bridgeAppend
+    assert.equal(plan.length, h.before.length)
+    assert.equal(plan.sha, createHash('sha256').update(h.before).digest('hex'))
+    assert.deepEqual(plan.original, h.bridge)
+    const later = checkpoint.endsWith('later messages') || checkpoint === 'unacknowledged newer bridge'
+    if (later) {
+      assert.equal(plan.applied, undefined)
+      assert.equal(lines(await readFile(h.transcript, 'utf8')).at(-1).bridgeSessionId, '')
+      await appendFile(h.transcript, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`)
+      if (checkpoint === 'unacknowledged newer bridge') await appendFile(h.transcript, `${JSON.stringify({ ...h.bridge, bridgeSessionId: 'cse_newer', ownerAccountUuid: h.to.account, ownerOrganizationUuid: h.to.org })}\n`)
+    }
+    const beforeRecovery = await readFile(h.transcript)
+    assert.equal((await keepLocal(h.paths)).recoveryRequired, true)
+    const recovered = await undo(h.paths, { processes: [] })
+    if (checkpoint === 'unacknowledged newer bridge') {
+      assert.match(recovered.reconciled.error, /transcript restoration witness changed/)
+      assert.deepEqual(await readFile(h.transcript), beforeRecovery)
+      assert.ok(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)))
+      return
+    }
+    assert.match(recovered.reconciled.error, /interrupted/)
+    const after = await readFile(h.transcript)
+    if (later) {
+      assert.deepEqual(after.subarray(0, beforeRecovery.length), beforeRecovery)
+      assert.equal(lines(after.toString()).filter(e => MESSAGES.has(e.type)).length, 3)
+    } else assertBridgeRestored(h.before, after, h.bridge)
+    assert.deepEqual(after.subarray(0, beforeRecovery.length), beforeRecovery)
+    assert.deepEqual(lines(after.toString()).at(-1), h.bridge)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    assert.deepEqual(await readdir(h.dir('Z')), [])
+    await undo(h.paths, { processes: [] })
+    assert.deepEqual(await readFile(h.transcript), after)
+  })
+})
+
+test('bridge append refuses changed paths and active writers before mutation', async t => {
+  for (const mode of ['missing', 'replacement', 'symlink', 'directory', 'parent replacement', 'worker']) await t.test(mode, async t => {
+    const h = await bridgeFixture(), realOpen = fs.open
+    let injected = false, active = false
+    const inspect = () => active ? [{ worker: true, pid: 123, desktopPid: null, ids: [SOURCE] }] : []
+    const inv = await inventory([h.from], h.to, h.paths, () => {}, { inspect })
+    const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+      if (file === h.transcript && mutatingOpen(flags) && !injected) {
+        injected = true
+        if (mode === 'worker') active = true
+        else if (mode === 'parent replacement') {
+          await rename(path.dirname(file), `${path.dirname(file)}.old`)
+          await mkdir(path.dirname(file))
+          await writeFile(file, h.before)
+        } else {
+          await rename(file, `${file}.old`)
+          if (mode === 'replacement') await writeFile(file, h.before)
+          if (mode === 'symlink') await symlink(`${file}.old`, file)
+          if (mode === 'directory') await mkdir(file)
+        }
+      }
+      return realOpen(file, flags, ...args)
+    })
+    syncBuiltinESMExports()
+    let result
+    try { result = await move(inv, h.to, h.paths) }
+    finally { mock.mock.restore(); syncBuiltinESMExports() }
+    const healed = ['replacement', 'parent replacement'].includes(mode)
+    assert.equal(injected, true)
+    assert.equal(result.ok, healed)
+    assert.deepEqual(await readdir(h.dir('Z')), healed ? [`local_${SOURCE}.json`] : [])
+    if (mode === 'missing') assert.equal(await lstat(h.transcript).catch(() => null), null)
+    else if (mode === 'directory') assert.equal((await lstat(h.transcript)).isDirectory(), true)
+    else if (healed) assertBridgeRestored(h.before, await readFile(h.transcript), { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })
+    else assert.deepEqual(await readFile(h.transcript), h.before)
+    if (mode === 'symlink') assert.equal((await lstat(h.transcript)).isSymbolicLink(), true)
+    if (!healed) assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  })
+})
+
+test('bridge append keeps unexpected post-write changes pending and untouched', async t => {
+  for (const mode of ['growth', 'rewrite', 'replacement', 'partial growth', 'worker']) await t.test(mode, async t => {
+    const h = await bridgeFixture(), realOpen = fs.open
+    let injected = false, active = false
+    const inspect = () => active ? [{ worker: true, pid: 123, desktopPid: null, ids: [SOURCE] }] : []
+    const inv = await inventory([h.from], h.to, h.paths, () => {}, { inspect })
+    const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+      const handle = await realOpen(file, flags, ...args)
+      if (file === h.transcript && mutatingOpen(flags) && !injected) {
+        const write = handle.writeFile.bind(handle)
+        t.mock.method(handle, 'writeFile', async data => {
+          await write(mode === 'partial growth' ? data.slice(0, 25) : data)
+          injected = true
+          if (mode === 'replacement') { await rename(file, `${file}.old`); await writeFile(file, h.before) }
+          else if (mode === 'rewrite') await writeFile(file, (await readFile(file, 'utf8')).replace('message 1', 'concurrent history'))
+          else if (mode === 'worker') active = true
+          else await appendFile(file, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`)
+        })
+      }
+      return handle
+    })
+    syncBuiltinESMExports()
+    try { await assert.rejects(move(inv, h.to, h.paths), /Local bridge metadata/) }
+    finally { mock.mock.restore(); syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    const after = await readFile(h.transcript)
+    assert.equal((await keepLocal(h.paths)).recoveryRequired, true)
+    const recovered = await undo(h.paths, { inspect })
+    const restored = await readFile(h.transcript)
+    if (mode === 'growth') {
+      assert.match(recovered.reconciled.error, /interrupted/)
+      assert.deepEqual(restored.subarray(0, after.length), after)
+      assert.deepEqual(lines(restored.toString()).at(-1), h.bridge)
+      assert.equal(lines(restored.toString()).filter(e => MESSAGES.has(e.type)).length, 3)
+    } else {
+      assert.match(recovered.reconciled.error, /bridge|worker/)
+      assert.deepEqual(restored, after)
+    }
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  })
+})
+
+test('bridge Undo preserves later messages, newer bridges and replaced transcripts', async t => {
+  for (const mode of ['later messages', 'newer bridge', 'rewritten prefix', 'replacement']) await t.test(mode, async () => {
+    const h = await bridgeFixture()
+    assert.equal((await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)).ok, true)
+    await appendFile(h.transcript, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`)
+    if (mode === 'newer bridge') await appendFile(h.transcript, `${JSON.stringify({ ...h.bridge, bridgeSessionId: 'cse_newer', ownerAccountUuid: h.to.account, ownerOrganizationUuid: h.to.org })}\n`)
+    if (mode === 'rewritten prefix') await writeFile(h.transcript, (await readFile(h.transcript, 'utf8')).replace('message 1', 'changed history'))
+    if (mode === 'replacement') { await rename(h.transcript, `${h.transcript}.old`); await writeFile(h.transcript, await readFile(`${h.transcript}.old`)) }
+    const before = await readFile(h.transcript), undone = await undo(h.paths, { processes: [] }), after = await readFile(h.transcript)
+    assert.ok(undone.dest)
+    if (mode !== 'later messages') {
+      assert.deepEqual(after, before)
+      assert.deepEqual(await readdir(h.dir('Z')), [])
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+      return
+    }
+    assert.ok(undone.dest)
+    assert.deepEqual(after.subarray(0, before.length), before)
+    assert.deepEqual(lines(after.toString()).at(-1), h.bridge)
+    assert.equal(lines(after.toString()).filter(e => MESSAGES.has(e.type)).length, 3)
+    assert.deepEqual(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))).bridgeSessionIds, ['session_prior'])
+    assert.deepEqual(await readdir(h.dir('Z')), [])
+  })
+})
+
+test('bridge recovery refuses corrupt receipt metadata before changing transcripts or records', async t => {
+  const cases = [
+    ['missing original', 'undo', row => { delete row.bridgeAppend.original }],
+    ['null original', 'undo', row => { row.bridgeAppend.original = null }],
+    ['wrong-session original', 'undo', row => { row.bridgeAppend.original.sessionId = id(799) }],
+    ['message original', 'undo', row => { row.bridgeAppend.original = entry('user', 4, 3, SOURCE) }],
+    ['substituted original owner', 'undo', row => { row.bridgeAppend.original.ownerAccountUuid = id(999) }],
+    ['invalid appended metadata', 'undo', row => { row.bridgeAppend.bytes = 'undefined\n' }],
+    ['missing original during retirement', 'retirement', row => { delete row.bridgeAppend.original }],
+    ['invalid length during retirement', 'retirement', row => { row.bridgeAppend.length = -1 }],
+    ['missing original during placement', 'pending', row => { delete row.bridgeAppend.original }],
+    ['message append during placement', 'pending', row => { row.bridgeAppend.bytes = `${JSON.stringify(entry('user', 4, 3, SOURCE))}\n` }],
+    ['wrong-session append during placement', 'pending', row => { row.bridgeAppend.bytes = row.bridgeAppend.bytes.replace(SOURCE, id(799)) }],
+    ['malformed content hash', 'undo', row => { row.bridgeAppend.sha = null }],
+    ['inconsistent append hash', 'undo', row => { row.bridgeAppend.afterSha = '0'.repeat(64) }],
+    ['missing identity witness', 'undo', row => { delete row.bridgeAppend.fingerprint }],
+    ['missing worker aliases', 'undo', row => { delete row.bridgeAppend.recordIds }],
+    ['invalid worker alias', 'undo', row => { row.bridgeAppend.recordIds = ['not-a-record'] }],
+    ['missing owning record alias', 'undo', row => { row.bridgeAppend.recordIds = [`local_${id(799)}`] }],
+    ['missing shared record alias', 'shared', row => { row.bridgeAppend.recordIds = [`local_${SOURCE}`] }],
+    ['invalid Undo append', 'interrupted undo', row => { row.bridgeUndo.bytes = 'undefined\n' }],
+    ['wrong-session Undo original', 'interrupted undo', row => { row.bridgeUndo.original.sessionId = id(799) }]
+  ]
+  for (const [name, phase, corrupt] of cases) await t.test(name, async t => {
+    const h = await bridgeFixture()
+    if (phase === 'shared') {
+      await h.record('P', id(799), rehomeRecord({ cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` }))
+      h.from = (await accounts(h.paths, [])).find(row => row.account === h.acct.P)
+    }
+    const moved = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
+    assert.equal(moved.ok, true)
+    await appendFile(h.transcript, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`)
+    if (phase === 'interrupted undo') {
+      const realRename = fs.rename
+      const mock = t.mock.method(fs, 'rename', async (from, to) => {
+        if (to === moved.file && JSON.parse(await readFile(from)).sessions[0].bridgeUndo) {
+          await realRename(from, to)
+          throw new Error('Synthetic receipt corruption checkpoint')
+        }
+        return realRename(from, to)
+      })
+      syncBuiltinESMExports()
+      try { await assert.rejects(undo(h.paths, { processes: [] }), /Synthetic receipt corruption checkpoint/) }
+      finally { mock.mock.restore(); syncBuiltinESMExports() }
+    }
+    const receipt = await readReceipt(moved.file), row = receipt.sessions[0]
+    corrupt(row)
+    if (phase === 'retirement') {
+      receipt.finalizing = true
+      receipt.retiring = receipt.superseded
+      receipt.superseded = []
+    }
+    if (phase === 'pending') {
+      receipt.finalizing = true
+      receipt.pending = { ...row, made: [row.record] }
+      receipt.sessions = []
+    }
+    await writeFile(moved.file, JSON.stringify(receipt))
+    const roots = [h.paths.records, h.paths.pool, path.join(h.paths.state, 'quarantine')]
+    const before = await fixtureSnapshot(h, roots), transcript = await readFile(h.transcript)
+    const result = await undo(h.paths, { processes: [] })
+    assert.equal(Boolean(result.dest), false)
+    assert.ok(result.restoreProblems?.length || result.changed?.length || result.reconciled?.error)
+    assert.deepEqual(await readFile(h.transcript), transcript)
+    assert.deepEqual(await fixtureSnapshot(h, roots), before)
+  })
+})
+
+test('bridge Undo append checkpoints resume without dropping later content', async t => {
+  for (const checkpoint of ['intent', 'partial', 'partial twice', 'synced', 'restored']) await t.test(checkpoint, async t => {
+    const h = await bridgeFixture()
+    const moved = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
+    await appendFile(h.transcript, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`)
+    const before = await readFile(h.transcript), realOpen = fs.open, realRename = fs.rename
+    let injected = false
+    const mocks = [t.mock.method(fs, 'open', async (file, flags, ...args) => {
+      const handle = await realOpen(file, flags, ...args)
+      if (file === h.transcript && mutatingOpen(flags)) {
+        const write = handle.writeFile.bind(handle), sync = handle.sync.bind(handle)
+        t.mock.method(handle, 'writeFile', async data => {
+          await write(checkpoint.startsWith('partial') && !injected ? data.slice(0, 25) : data)
+          if (checkpoint.startsWith('partial') && !injected) { injected = true; throw new Error('Synthetic Undo interruption') }
+        })
+        t.mock.method(handle, 'sync', async () => {
+          await sync()
+          if (checkpoint === 'synced' && !injected) { injected = true; throw new Error('Synthetic Undo interruption') }
+        })
+      }
+      return handle
+    }), t.mock.method(fs, 'rename', async (from, to) => {
+      if (checkpoint === 'intent' && to === moved.file && !injected && JSON.parse(await readFile(from)).sessions[0].bridgeUndo) {
+        await realRename(from, to); injected = true; throw new Error('Synthetic Undo interruption')
+      }
+      if (checkpoint === 'restored' && from === moved.file && !injected) { injected = true; throw new Error('Synthetic Undo interruption') }
+      return realRename(from, to)
+    })]
+    syncBuiltinESMExports()
+    try { await assert.rejects(undo(h.paths, { processes: [] }), /Synthetic Undo interruption/) }
+    finally { for (const mock of mocks) mock.mock.restore(); syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    if (checkpoint === 'partial twice') {
+      const partial = await readFile(h.transcript)
+      let repeated = false
+      const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+        const handle = await realOpen(file, flags, ...args)
+        if (file === h.transcript && mutatingOpen(flags) && !repeated) {
+          const write = handle.writeFile.bind(handle)
+          t.mock.method(handle, 'writeFile', async bytes => {
+            const plan = (await readReceipt(moved.file)).sessions[0].bridgeUndo
+            assert.equal(plan.continuation.bytes, bytes.toString('base64'))
+            assert.equal(plan.continuation.length, partial.length)
+            repeated = true
+            await write(bytes.subarray(0, 7))
+            throw new Error('Synthetic continuation interruption')
+          })
+        }
+        return handle
+      })
+      syncBuiltinESMExports()
+      try { await assert.rejects(undo(h.paths, { processes: [] }), /Synthetic continuation interruption/) }
+      finally { mock.mock.restore(); syncBuiltinESMExports() }
+      assert.equal(repeated, true)
+      assert.deepEqual((await readFile(h.transcript)).subarray(0, partial.length), partial)
+    }
+    if (checkpoint === 'synced' || checkpoint === 'restored') await appendFile(h.transcript, `${JSON.stringify(entry('assistant', 4, 3, SOURCE))}\n`)
+    const recovered = await undo(h.paths, { processes: [] })
+    assert.ok(recovered.dest)
+    const after = await readFile(h.transcript)
+    assert.deepEqual(after.subarray(0, before.length), before)
+    assert.deepEqual(lines(after.toString()).filter(e => e.type === 'bridge-session').at(-1), h.bridge)
+    assert.equal(lines(after.toString()).filter(e => MESSAGES.has(e.type)).length, ['synced', 'restored'].includes(checkpoint) ? 4 : 3)
+    assert.equal(lines(after.toString()).filter(e => e.type === 'bridge-session').length, 3)
+    assert.deepEqual(await readdir(h.dir('Z')), [])
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    await undo(h.paths, { processes: [] })
+    assert.deepEqual(await readFile(h.transcript), after)
+  })
+})
+
+test('bridge append is shared by distinct parent and child Desktop records', async () => {
+  const h = await bridgeFixture(), child = id(777)
+  await h.record('P', child, rehomeRecord({ cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` }))
+  const all = await accounts(h.paths, []), from = all.find(a => a.account === h.acct.P)
+  const inv = await inventory([from], h.to, h.paths, () => {}, { processes: [] })
+  assert.equal(inv.move.length, 2)
+  const moved = await move(inv, h.to, h.paths)
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.sessions.length, 2)
+  assert.equal(moved.receipt.sessions.filter(row => row.bridgeAppend).length, 1)
+  assert.equal(lines(await readFile(h.transcript, 'utf8')).filter(e => e.type === 'bridge-session').length, 2)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${child}.json`))).forkedFromSessionId, `local_${SOURCE}`)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assertBridgeRestored(h.before, await readFile(h.transcript), h.bridge)
+  assert.deepEqual((await readdir(h.dir('P'))).sort(), [SOURCE, child].map(sid => `local_${sid}.json`).sort())
+})
+
+test('bridge restoration follows task-family publication rollback and continuation', async t => {
+  for (const later of [false, true]) await t.test(later ? 'later messages' : 'unchanged transcript', async t => {
+    const h = await taskFamilyFixture(), transcript = path.join(h.project, `${SOURCE}.jsonl`)
+    const bridge = { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'cse_family', lastSequenceNum: 9, ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
+    await appendFile(transcript, `${JSON.stringify(bridge)}\n`)
+    const before = await readFile(transcript), { from, to } = await h.selection(), realRename = fs.rename
+    let injected = false
+    const mock = t.mock.method(fs, 'rename', async (source, target) => {
+      if (target === h.targetFile && !injected) {
+        injected = true
+        if (later) await appendFile(transcript, `${JSON.stringify(entry('user', 900, 80, SOURCE))}\n`)
+        throw new Error('Synthetic task publication failure')
+      }
+      return realRename(source, target)
+    })
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { processes: [] }) }
+    finally { mock.mock.restore(); syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    assert.equal(result.ok, true)
+    assert.equal(result.receipt.sessions.length, 4)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    const restored = await readFile(transcript)
+    assert.ok(restored.subarray(0, before.length).equals(before))
+    assert.deepEqual(lines(restored.toString()).filter(e => e.type === 'bridge-session').at(-1), bridge)
+    assert.equal(lines(restored.toString()).filter(e => MESSAGES.has(e.type)).length, later ? 2 : 1)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  })
+})
+
+test('local moves finish while inaccessible source cloud checks stay pending', async () => {
+  const h = await home()
+  const first = id(701)
+  const second = id(702)
+  await h.write(first, [entry('user', 1, null, first)])
+  await h.record('P', first, rehomeRecord({ title: 'First source' }))
+  await h.record('T', second, rehomeRecord({ title: 'Second source' }))
+  const cloud = cloudFixture(h)
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory(from, to, h.paths, () => {}, { cloud, cloudRequested: true })
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(result.ok, true)
+  assert.equal(result.complete, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.deepEqual(result.receipt.cloudChecks.map(({ label, status }) => ({ label, status })), [
+    { label: from[0].label, status: 'complete' },
+    { label: from[1].label, status: 'pending' }
+  ])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${first}.json`])
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('T')), [`local_${second}.json`])
+  const blocked = await cli(h.root, ['--from', 'z@example.com personal', '--to', 'p@example.com personal', '--json'])
+  assert.equal(blocked.code, 1)
+  assert.match(JSON.parse(blocked.stdout.trim().split('\n').at(-1)).reason, /pending move/)
+})
+
+test('a zero-record source creates no speculative cloud check', async () => {
+  const h = await home()
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+
+  assert.equal(result, null)
+  assert.equal(await readdir(h.paths.state).then((names) => names.filter((name) => /^\d.*\.json$/.test(name)).length), 0)
+})
+
+test('completed local movement suppresses speculative pending', async () => {
+  const h = await home()
+  const cloudError = 'authentication unavailable'
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudError })
+  assert.deepEqual(inv.cloudCheckAccounts, [])
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(result.ok, true)
+  assert.equal(result.complete, true)
+  assert.equal(result.pendingCloud, 0)
+  assert.deepEqual(result.receipt.cloudChecks, [])
+  assert.equal(result.receipt.sessions[0].strategy, 'rehome')
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
+  assert.equal(result.receipt.cloudError, cloudError)
+  const idle = await finishPending(h.paths), swept = await sweep(h.paths)
+  assert.deepEqual([idle, swept].map(({ ok, complete }) => ({ ok, complete })), [
+    { ok: true, complete: true }, { ok: true, complete: true }
+  ])
+  assert.equal(idle.nothing, true)
+  assert.equal(JSON.parse(await readFile(result.file)).cloudError, cloudError)
+})
+
+test('known source mirrors stay queued after local retirement and only finish under their source login', async () => {
+  for (const source of ['record', 'transcript', 'local-only']) {
+    const h = await home(), entries = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, [...entries, ...(source === 'transcript' ? [{ type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'cse_known' }] : [])])
+    await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds: source === 'transcript' ? [] : ['session_known'] }))
+    const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.T), to = all.find(a => a.account === h.acct.Z)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: source !== 'local-only', cloud: source === 'local-only' ? null : cloudFixture(h, { account: to.account, org: to.org, list: async () => assert.fail('destination login must not list the source') }) })
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.deepEqual(await readdir(h.dir('T')), [])
+    if (source === 'local-only') { assert.equal(moved.pendingCloud, 0); continue }
+    assert.equal(moved.pendingCloud, 1)
+    assert.equal(moved.complete, false)
+    assert.deepEqual(moved.receipt.cloudChecks[0].sessionIds, ['session_known'])
+    const placed = moved.receipt.sessions[0].record
+    await writeFile(placed, JSON.stringify({ ...JSON.parse(await readFile(placed)), isArchived: true }))
+    const snapshot = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const pending = lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].find(a => a.account === from.account)
+    assert.equal(pending.pendingAction, 'sign-in')
+    let reads = 0, status = 'active'
+    const cloud = cloudFixture(h, { account: from.account, org: from.org,
+      list: async () => { reads++; return ['cse_known', 'cse_unrelated'].map(id => remoteSession({ id, title: 'Remote title', status })) },
+      eventRows: async id => { assert.equal(id, 'cse_known'); return remoteRows(entries) },
+      session: async id => { assert.equal(id, 'cse_known'); return remoteState(status) },
+      archive: async id => { assert.equal(id, 'cse_known'); status = 'archived' }
+    })
+    const waiting = await sweep(h.paths, { active: to, processes: [], cloud })
+    assert.equal(waiting.pending, true)
+    assert.equal(reads, 0)
+    const finished = await sweep(h.paths, { active: from, processes: [], cloud })
+    assert.equal(finished.ok, true)
+    assert.equal(finished.result.complete, true)
+    assert.equal(finished.result.file, moved.file)
+    assert.equal(finished.result.cloudArchived, 1)
+    assert.equal(status, 'archived')
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), snapshot)
+  }
+})
+
+test('held continuations merge new mirror scopes without reopening unchanged or cancelled checks', async () => {
+  for (const [status, scoped, added] of [
+    ['pending', true, true], ['complete', true, true], ['pending', false, true], ['complete', false, true],
+    ['complete', true, false], ['cancelled', true, true]
+  ]) {
+    const h = await home(), cold = id(809), coldEntries = branchEntries(2, cold, 501), heldEntries = branchEntries(2, SOURCE, 511)
+    await h.write(cold, coldEntries)
+    await h.write(SOURCE, heldEntries)
+    await h.record('P', cold, rehomeRecord({ bridgeSessionIds: ['session_cold'] }))
+    await h.record('P', SOURCE, rehomeRecord({ isArchived: true, bridgeSessionIds: [added ? 'session_held' : 'session_cold'] }))
+    const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.P), to = all.find(a => a.account === h.acct.T)
+    const moved = await executeMove([from], to, h.paths, { cloudRequested: true, moveOnly: true, processes: desktopFixture() })
+    assert.equal(moved.receipt.held.length, 1)
+    const check = moved.receipt.cloudChecks[0]
+    assert.deepEqual(check.sessionIds, ['session_cold'])
+    check.status = status
+    if (!scoped) delete check.sessionIds
+    await writeFile(moved.file, JSON.stringify(moved.receipt))
+    const resumed = await finishHeld(h.paths, { processes: [] })
+    assert.equal(resumed.receipt.sessions.length, 2)
+    const pending = status === 'pending' || status === 'complete' && added
+    assert.equal(resumed.receipt.cloudChecks[0].status, pending ? 'pending' : status)
+    assert.deepEqual(resumed.receipt.cloudChecks[0].sessionIds, scoped ? ['session_cold', ...(added && status !== 'cancelled' ? ['session_held'] : [])] : undefined)
+    if (!pending) { assert.equal(resumed.pendingCloud, 0); continue }
+    const states = { cse_cold: status === 'complete' ? 'archived' : 'active', cse_held: 'active' }
+    const cloud = cloudFixture(h, {
+      list: async () => [...Object.entries(states).map(([id, status]) => remoteSession({ id, status })), ...(scoped ? [remoteSession({ id: 'cse_unrelated' })] : [])],
+      eventRows: async id => { assert.ok(Object.hasOwn(states, id)); return remoteRows(id === 'cse_cold' ? coldEntries : heldEntries) },
+      session: async id => { assert.ok(Object.hasOwn(states, id)); return remoteState(states[id]) },
+      archive: async id => { assert.ok(Object.hasOwn(states, id)); states[id] = 'archived' }
+    })
+    const finished = await finishPending(h.paths, { cloud })
+    assert.equal(finished.ok, true)
+    assert.equal(finished.complete, true)
+    assert.deepEqual(Object.values(states), ['archived', 'archived'])
+  }
+})
+
+test('round trips keep transcript mirrors with their explicit account and organization across cache generations', async () => {
+  for (const sameLogin of [false, true]) for (const cache of ['cold', 'warm', 'legacy']) {
+    const h = await home(), entries = branchEntries(2, SOURCE, 1)
+    if (sameLogin) { h.acct.T = h.acct.P; await mkdir(h.dir('T'), { recursive: true }) }
+    await h.write(SOURCE, [...entries, { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'session_prior_owner', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }])
+    await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior_owner'] }))
+    const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.P && a.org === h.org.P), to = all.find(a => a.account === h.acct.T && a.org === h.org.T)
+    let status = 'active'
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_prior_owner', title: 'Old source', status })],
+      session: async () => remoteState(status), eventRows: async () => remoteRows(entries), archive: async () => { status = 'archived' }
+    })
+    const first = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloud, writeCache: cache !== 'cold' }), to, h.paths)
+    assert.equal(first.pendingCloud, 0)
+    assert.equal(status, 'archived')
+    const current = await accounts(h.paths), source = current.find(a => a.account === to.account && a.org === to.org), target = current.find(a => a.account === from.account && a.org === from.org)
+    if (cache !== 'cold') {
+      await inventory([source], target, h.paths, () => {}, { cloudRequested: true, cloud, writeCache: true })
+      const warm = await inventory([source], target, h.paths, () => {}, { cloudRequested: true, cloud })
+      assert.ok(warm.cacheStats.historyHits > 0)
+      assert.equal(warm.cacheStats.historyMisses, 0)
+    }
+    if (cache === 'legacy') {
+      const file = path.join(h.paths.state, 'cache.json'), stored = JSON.parse(await readFile(file))
+      for (const row of Object.values(stored.histories)) delete row.value.result.bridgeOwners
+      await writeFile(file, JSON.stringify(stored))
+    }
+    const inv = await inventory([source], target, h.paths, () => {}, { cloudRequested: true, cloud })
+    assert.ok(inv.cacheStats[cache === 'warm' ? 'historyHits' : 'historyMisses'] > 0)
+    const second = await move(inv, target, h.paths)
+    assert.equal(second.ok, true)
+    assert.equal(second.pendingCloud, 0)
+    assert.deepEqual(second.receipt.cloudLinks, [])
+  }
+})
+
+test('task and restarted moves retain known mirror cleanup and Keep completed can cancel it', async () => {
+  for (const restart of [false, true]) {
+    const h = await taskFamilyFixture(), { io } = taskHarness()
+    await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_task_mirror'] }))
+    const { from, to } = await h.selection(), cloud = cloudFixture(h, { account: to.account, org: to.org, list: async () => assert.fail('wrong source login') })
+    const options = { cloudRequested: true, cloud, ...(restart ? { io } : { processes: [] }) }
+    let moved = await executeMove([from], to, h.paths, options)
+    if (restart) {
+      assert.deepEqual(moved.plan.deferredCloudSources, [])
+      moved = await executeMove([from], to, h.paths, { ...options, approve: moved.plan.token })
+      assert.equal(moved.restarted, true)
+    }
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions.length, 4)
+    assert.equal(moved.pendingCloud, 1)
+    assert.deepEqual(moved.receipt.cloudChecks[0].sessionIds, ['session_task_mirror'])
+    assert.equal(moved.complete, false)
+    const kept = await keepLocal(h.paths)
+    assert.equal(kept.cancelled, 1)
+    assert.equal(kept.complete, true)
+    assert.equal((await sweep(h.paths, { active: from, processes: [], cloud })).complete, true)
+  }
+})
+
+test('deferred mirror links follow a recorded rewind and keep a remote-only branch unarchived', async () => {
+  const h = await home(), current = id(797), oldEntries = branchEntries(2, SOURCE, 1)
+  await h.write(SOURCE, oldEntries)
+  await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_rewound'] }))
+  const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.T), to = all.find(a => a.account === h.acct.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths)
+  const row = moved.receipt.sessions[0], original = await readFile(row.targetTranscript)
+  await h.write(current, branchEntries(1, current, 51))
+  await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), cliSessionId: current, priorCliSessionIds: [SOURCE], bridgeSessionIds: [], title: 'Renamed after rewind' }))
+  const record = await readFile(row.record), transcript = await readFile(path.join(h.project, `${current}.jsonl`))
+  let status = 'active'
+  const cloud = cloudFixture(h, { account: from.account, org: from.org,
+    list: async () => [remoteSession({ id: 'cse_rewound', title: 'Remote title', status })], eventRows: async () => remoteRows([...oldEntries, entry('assistant', 4, 2, SOURCE)]),
+    session: async () => remoteState(status), archive: async () => { status = 'archived' }
+  })
+  const finished = await finishPending(h.paths, { cloud })
+  assert.equal(finished.ok, true)
+  assert.deepEqual(finished.failed, [])
+  assert.deepEqual(finished.summary.kept.map(row => row.code), ['CLOUD_UNPROVEN'])
+  assert.equal(finished.cloudArchived, 0)
+  assert.equal(status, 'active')
+  assert.deepEqual(await readFile(row.record), record)
+  assert.deepEqual(await readFile(row.targetTranscript), original)
+  assert.deepEqual(await readFile(path.join(h.project, `${current}.jsonl`)), transcript)
+})
+
+test('recorded retained histories allow mirror cleanup without cloning task-owned rewinds', async () => {
+  for (const scenario of ['retained', 'changed', 'uncached-analysis', 'cached-analysis', 'missing', 'unrecorded', 'malformed']) {
+    const h = await home(), current = id(798), entries = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, entries)
+    await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_retained'] }))
+    const all = await accounts(h.paths), from = all.find(a => a.account === h.acct.T), to = all.find(a => a.account === h.acct.Z)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, writeCache: scenario === 'cached-analysis' }), to, h.paths)
+    const row = moved.receipt.sessions[0]
+    await h.write(current, branchEntries(1, current, 51))
+    await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), cliSessionId: current, bridgeSessionIds: [], priorCliSessionIds: scenario === 'unrecorded' ? [] : scenario === 'malformed' ? SOURCE : [SOURCE] }))
+    await writeFile(to.taskFile, JSON.stringify({ scheduledTasks: [{ id: 'retained-task', enabled: true, notifySessionId: row.targetRecordId }] }))
+    if (scenario === 'missing') await unlink(row.targetTranscript)
+    const record = await readFile(row.record), tasks = await readFile(to.taskFile)
+    let status = 'active', reads = 0
+    const cloud = cloudFixture(h, { account: from.account, org: from.org,
+      list: async () => [remoteSession({ id: 'cse_retained', title: 'Older remote title', status })],
+      eventRows: async () => { if (++reads === 3 && scenario === 'changed') await appendFile(row.targetTranscript, '{}\n'); return remoteRows(entries) },
+      session: async () => remoteState(status), archive: async () => { status = 'archived' }
+    })
+    const originalRead = fs.readFile, originalStat = fs.stat
+    let changedDuringAnalysis = false, transcriptReads = 0
+    fs.readFile = async (file, ...args) => {
+      const bytes = await originalRead(file, ...args)
+      if (file === row.targetTranscript && ++transcriptReads === 2 && scenario === 'uncached-analysis') {
+        await h.write(SOURCE, [entry('user', 777, null, SOURCE)])
+        changedDuringAnalysis = true
+      }
+      return bytes
+    }
+    fs.stat = async (file, ...args) => {
+      const detail = await originalStat(file, ...args)
+      if (file === row.targetTranscript && scenario === 'cached-analysis' && !changedDuringAnalysis) {
+        await h.write(SOURCE, [entry('user', 777, null, SOURCE)])
+        changedDuringAnalysis = true
+      }
+      return detail
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await finishPending(h.paths, { cloud }) }
+    finally { fs.readFile = originalRead; fs.stat = originalStat; syncBuiltinESMExports() }
+    assert.equal(changedDuringAnalysis, scenario.endsWith('-analysis'))
+    const final = ['retained', 'unrecorded', 'malformed'].includes(scenario)
+    assert.equal(result.ok, final, scenario)
+    assert.equal(result.complete, final, scenario)
+    assert.equal(status, scenario === 'retained' ? 'archived' : 'active')
+    if (['unrecorded', 'malformed'].includes(scenario)) assert.deepEqual(result.summary.kept.map(row => row.code), ['CLOUD_UNPROVEN'], scenario)
+    if (scenario === 'changed') assert.match(result.failed[0].error, /Retained local history changed/)
+    if (scenario === 'missing') assert.equal(result.failed[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    assert.deepEqual(await readFile(row.record), record)
+    assert.deepEqual(await readFile(to.taskFile), tasks)
+    assert.deepEqual((await readdir(h.dir('Z'))).sort(), [path.basename(row.record), 'scheduled-tasks.json'].sort())
+  }
+})
+
+test('a late move failure restores the source cloud check', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloudError: 'authentication unavailable' })
+  const result = await move(inv, to, h.paths, (stage, _text, progress) => {
+    if (stage === 'move' && progress?.completed === 0) appendFileSync(path.join(h.project, `${SOURCE}.jsonl`), `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
+  })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+  assert.equal(result.receipt.cloudError, 'authentication unavailable')
+  assert.deepEqual(result.receipt.verification, { ok: true, problems: [] })
+  assert.equal((await verifyPlaced(h.paths)).ok, false)
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+})
+
+test('a refused retirement restores the source cloud check', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ scheduledTaskId: 'task_fixture' }))
+  await h.record('Z', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true })
+  assert.equal(inv.cloudCheckAccounts.length, 1)
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(result.pendingCloud, 1)
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+})
+
+test('an unreadable source record prevents an empty-source assumption', async () => {
+  const h = await home()
+  await writeFile(path.join(h.dir('T'), `local_${SOURCE}.json`), '{')
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true })
+
+  assert.equal(inv.cloudCheckAccounts.length, 1)
+})
+
+test('Keep local retains a verified bridge rehome while its remote check is unavailable', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Keep local source', bridgeSessionIds: ['session_keep_local'] }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  const kept = await keepLocal(h.paths)
+
+  assert.equal(kept.cancelled, 1)
+  assert.equal(kept.receipt.cloudChecks[0].status, 'cancelled')
+  assert.deepEqual(await readdir(h.dir('T')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
+  assert.equal((await cli(h.root, ['--dry-run', '--from', 'z@example.com personal', '--to', 'p@example.com personal', '--json'])).code, 0)
+  assert.ok((await undo(h.paths)).dest)
+  assert.equal(moved.file, kept.file)
+})
+
+test('Keep local accepts a valid rehome record used after the move', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Original title', titleSource: 'auto' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const cloud = cloudFixture(h, { account: h.acct.T, org: h.org.T, list: async () => { throw new Error('offline') } })
+  await move(await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true }), to, h.paths)
+  const record = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), title: 'Continued title', titleSource: 'user', completedTurns: 2 }))
+  const kept = await keepLocal(h.paths)
+
+  assert.equal(kept.ok, true)
+  assert.equal(kept.cancelled, 1)
+})
+
+test('Keep local tolerates independent Desktop metadata and destination bridges', async () => {
+  for (const extra of [
+    { bridgeSessionIds: ['session_destination'] },
+    { toolSurfaceSnapshot: { familyHashes: { builtin: 'changed' }, recordedAt: 123 } },
+    { bridgeSessionIds: ['session_destination'], toolSurfaceSnapshot: { recordedAt: 456 } },
+    { lastActivityAt: 999, completedTurns: 8, futureMetadata: { display: true } }
+  ]) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('T', SOURCE, rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.T), to = all.find(row => row.account === h.acct.Z)
+    const moved = await moveWithPending(h, [from], to)
+    const row = moved.receipt.sessions[0]
+    await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), ...extra }))
+    const kept = await keepLocal(h.paths)
+    assert.equal(kept.ok, true)
+    assert.equal(kept.cancelled, 1)
+    assert.deepEqual(JSON.parse(await readFile(row.record)).bridgeSessionIds, extra.bridgeSessionIds ?? [])
+    if (extra.bridgeSessionIds) assert.match((await undo(h.paths)).changed[0], /desktop record/)
+  }
+})
+
+test('Keep local recognizes recorded rewinds without changing histories or relaxing Undo', async () => {
+  for (const scenario of ['rewind', 'repeated rewind', 'unrelated id', 'malformed lineage', 'invalid id', 'missing current history', 'missing old history', 'changed folder', 'changed record']) {
+    const h = await home(), current = id(796), earlier = id(795)
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('T', SOURCE, rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.T), to = all.find(row => row.account === h.acct.Z)
+    const moved = await moveWithPending(h, [from], to), row = moved.receipt.sessions[0]
+    await h.write(current, [entry('user', 2, null, current)])
+    const record = { ...JSON.parse(await readFile(row.record)), cliSessionId: current, priorCliSessionIds: [SOURCE] }
+    if (scenario === 'repeated rewind') {
+      await h.write(earlier, [entry('user', 3, null, earlier)])
+      record.priorCliSessionIds.push(earlier)
+    }
+    if (scenario === 'unrelated id') record.priorCliSessionIds = [earlier]
+    if (scenario === 'malformed lineage') record.priorCliSessionIds = SOURCE
+    if (scenario === 'invalid id') record.cliSessionId = '../invalid'
+    if (scenario === 'missing current history') await unlink(path.join(h.project, `${current}.jsonl`))
+    if (scenario === 'missing old history') await unlink(row.targetTranscript)
+    if (scenario === 'changed folder') record.cwd = '/tmp/different'
+    if (scenario === 'changed record') record.sessionId = `local_${current}`
+    await writeFile(row.record, JSON.stringify(record))
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), receiptBefore = await readFile(moved.file)
+    const kept = await keepLocal(h.paths)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before, scenario)
+    if (['rewind', 'repeated rewind'].includes(scenario)) {
+      assert.equal(kept.ok, true, scenario)
+      assert.equal(kept.cancelled, 1)
+      assert.equal(kept.receipt.cloudChecks[0].status, 'cancelled')
+      assert.equal(kept.receipt.sessions[0].targetId, SOURCE)
+      assert.ok((await undo(h.paths)).changed.some(value => /desktop record/.test(value)))
+      assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+    } else {
+      assert.ok(kept.refused?.length, scenario)
+      assert.deepEqual(await readFile(moved.file), receiptBefore, scenario)
+    }
+  }
+})
+
+test('Finish cloud success retains historical local refusals as information', async () => {
+  for (const failure of ['none', 'verification', 'verification without details', 'cloud']) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('T', SOURCE, rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.T), to = all.find(row => row.account === h.acct.Z)
+    const moved = await moveWithPending(h, [from], to)
+    const receipt = JSON.parse(await readFile(moved.file))
+    receipt.failed.push({ id: id(998), title: 'Unmoved task', error: 'scheduled task family missing' })
+    if (failure.startsWith('verification')) receipt.verification = { ok: false, problems: failure === 'verification' ? [{ id: SOURCE, check: 'transcript' }] : [] }
+    await writeFile(moved.file, JSON.stringify(receipt))
+    const cloud = cloudFixture(h, { account: from.account, org: from.org,
+      list: async () => { if (failure === 'cloud') throw new Error('fixture offline'); return [] } })
+    const result = await finishPending(h.paths, { cloud })
+    assert.equal(result.ok, failure === 'none')
+    assert.equal(result.complete, failure !== 'cloud')
+    assert.equal(result.receipt.failed.some(row => row.title === 'Unmoved task'), true)
+    assert.equal(result.failed.length, failure === 'cloud' ? 1 : 0)
+    if (failure !== 'cloud') assert.equal((await cli(h.root, ['finish', '--json'])).code, failure === 'none' ? 0 : 1)
+  }
+})
+
+test('Keep local refuses structural rehome record drift', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ cwd: '/tmp/original' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const cloud = cloudFixture(h, { account: h.acct.T, org: h.org.T, list: async () => { throw new Error('offline') } })
+  await move(await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true }), to, h.paths)
+  const record = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), cwd: '/tmp/changed' }))
+  const kept = await keepLocal(h.paths)
+
+  assert.match(kept.refused[0], /desktop record changed/)
+})
+
+test('Keep local keeps strict validation for older receipts', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ cwd: '/tmp/original' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  delete receipt.sessions[0].recordSnapshot
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const record = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), cwd: '/tmp/changed' }))
+
+  assert.match((await keepLocal(h.paths)).refused[0], /desktop record changed/)
+})
+
+test('Keep local refuses when a moved destination record disappeared', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Vanished local target' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  await moveWithPending(h, [from], to)
+  await unlink(path.join(h.dir('Z'), `local_${SOURCE}.json`))
+  const result = await keepLocal(h.paths)
+
+  assert.match(result.refused[0], /desktop record changed/)
+  assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+  assert.equal((await undo(h.paths)).changed.length > 0, true)
+})
+
+test('Keep local refuses when an existing carrier no longer contains the retired source', async () => {
+  const h = await home()
+  const target = id(711)
+  const sourceEntries = [entry('user', 42, null, SOURCE)]
+  await h.write(SOURCE, sourceEntries)
+  await h.write(target, fork(sourceEntries, SOURCE, target, 'Carrier'))
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Contained source' }))
+  await h.record('Z', target, rehomeRecord({ title: 'Carrier' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  assert.equal(moved.receipt.sessions.length, 0)
+  await h.write(target, [entry('user', 43, null, target, { message: { role: 'user', content: 'unrelated replacement' } })])
+  const kept = await keepLocal(h.paths)
+
+  assert.match(kept.refused[0], /no longer contains source history/)
+  assert.equal(kept.receipt.cloudChecks[0].status, 'pending')
+})
+
+test('Keep local rejects a quarantined source record changed after retirement', async () => {
+  const h = await home()
+  const target = id(712)
+  const sourceEntries = [entry('user', 44, null, SOURCE)]
+  await h.write(SOURCE, sourceEntries)
+  await h.write(target, fork(sourceEntries, SOURCE, target, 'Carrier'))
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Tamper source' }))
+  await h.record('Z', target, rehomeRecord({ title: 'Tamper carrier' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  await h.write(target, [entry('user', 45, null, target, { message: { role: 'user', content: 'replacement history' } })])
+  const sourcePlan = moved.receipt.superseded.find((row) => row.source)
+  const parkedRecord = sourcePlan.moved[0][1]
+  const changed = JSON.parse(await readFile(parkedRecord, 'utf8'))
+  await writeFile(parkedRecord, JSON.stringify({ ...changed, cliSessionId: target }))
+  const kept = await keepLocal(h.paths)
+
+  assert.match(kept.refused[0], /recovery artifact changed/)
+  assert.equal(kept.receipt.cloudChecks[0].status, 'pending')
+})
+
+test('Keep local validates quarantine for a source rehomed by this move', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 46, null, SOURCE)])
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Moved quarantine source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  const parked = moved.receipt.superseded.find((row) => row.source).moved[0][1]
+  await writeFile(parked, `${await readFile(parked, 'utf8')} `)
+  const kept = await keepLocal(h.paths)
+
+  assert.match(kept.refused[0], /recovery artifact changed/)
+  assert.equal(kept.receipt.cloudChecks[0].status, 'pending')
+})
+
+test('a source cloud outage never blocks its eligible local move', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Cloud outage source' }))
+  const cloud = cloudFixture(h, {
+    list: async () => { throw new Error('service unavailable') },
+  })
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true })
+  const result = await move(inv, to, h.paths)
+
+  assert.equal(result.ok, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.equal(result.receipt.cloudChecks[0].status, 'failed')
+  assert.match(result.receipt.failed[0].error, /service unavailable/)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(h.dir('Z')), [`local_${SOURCE}.json`])
+})
+
+test('Finish pending closes the same logical receipt under the matching source login', async () => {
+  const h = await home()
+  const first = id(703)
+  const second = id(704)
+  const firstEntries = [entry('user', 3, null, first)]
+  const secondEntries = [entry('user', 4, null, second), entry('assistant', 5, 4, second)]
+  await h.write(first, firstEntries)
+  await h.write(second, secondEntries)
+  await h.record('P', first, rehomeRecord({ title: 'First deferred source' }))
+  await h.record('T', second, rehomeRecord({ title: 'Second deferred source', isArchived: true }))
+  const emptyCloud = cloudFixture(h)
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, from, to, emptyCloud)
+  let status = 'active'
+  const deferredCloud = cloudFixture(h, {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [remoteSession({ id: 'cse_deferred', title: 'Second deferred source', status })],
+    eventRows: async () => remoteRows(secondEntries),
+    session: async () => remoteState(status, { id: 'cse_deferred' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  })
+  const finished = await finishPending(h.paths, { cloud: deferredCloud })
+
+  assert.equal(finished.file, moved.file)
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.pendingCloud, 0)
+  assert.equal(finished.receipt.cloudChecks.every((check) => check.status === 'complete'), true)
+  assert.equal(finished.receipt.remote.length, 1)
+  assert.equal(finished.restart, true)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${second}.json`), 'utf8')).isArchived, false)
+  assert.equal(status, 'archived')
+  assert.deepEqual((await readdir(h.paths.state)).filter((name) => /^\d.*\.json$/.test(name)), [path.basename(moved.file)])
+})
+
+test('automatic cloud follow-up waits for its named source login and completes the same receipt', async () => {
+  const h = await home(), f = await identityFixture(h)
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Automatic source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((row) => row.account === h.acct.T)
+  const to = all.find((row) => row.account === h.acct.Z)
+  const moved = await moveWithPending(h, [from], to)
+  let reads = 0, status = 'active'
+  const cloud = cloudFixture(h, {
+    account: h.acct.T, org: h.org.T,
+    list: async () => { reads++; return [remoteSession({ id: 'cse_auto', title: 'Automatic source', status })] },
+    eventRows: async () => remoteRows(entries), session: async () => remoteState(status),
+    archive: async () => { status = 'archived' }
+  })
+  await sweep(h.paths, { processes: f.processes, cloud })
+  assert.equal(reads, 0)
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: from.account }))
+  await f.write(f.init() + f.event(1, `[account] Login-state transition (loggedOut: false \u2192 false, uuid: ${h.acct.P} \u2192 ${from.account}), clearing oauth cache`))
+  await sweep(h.paths, { processes: f.processes, cloud })
+  assert.equal(reads, 0)
+  await appendFile(path.join(h.paths.logs, 'main.log'), f.init(2, from.account, from.org))
+  const finished = await sweep(h.paths, { processes: f.processes, cloud })
+  assert.equal(status, 'archived')
+  assert.equal(finished.result.file, moved.file)
+  assert.equal(finished.result.complete, true)
+  assert.equal(finished.result.receipt.remote.length, 1)
+  assert.equal(await readFile(path.join(h.paths.state, 'restart-plan.json')).catch(() => null), null)
+  assert.deepEqual((await verifyPlaced(h.paths)).changed, [])
+})
+
+test('automatic cloud retries bind their receipt and claim backoff under the mutation lock', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE)
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.T), to = all.find((row) => row.account === h.acct.Z)
+  const first = await moveWithPending(h, [from], to)
+  let calls = 0
+  const cloud = cloudFixture(h, { account: h.acct.T, org: h.org.T, list: async () => { calls++; throw new Error('fixture offline') } })
+  const stale = await finishPending(h.paths, { cloud, receiptFile: first.file + '.old', automatic: from })
+  assert.equal(stale.nothing, true)
+  assert.equal(calls, 0)
+  await sweep(h.paths, { active: from, cloud })
+  assert.equal(calls, 1)
+  await sweep(h.paths, { active: from, cloud })
+  assert.equal(calls, 1)
+  const receipt = JSON.parse(await readFile(first.file))
+  assert.equal(receipt.cloudChecks[0].status, 'failed')
+  assert.ok(receipt.cloudAttempts[`${from.account}/${from.org}`] > 0)
+})
+
+test('a successful cloud phase preserves an earlier local verification failure', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('T', SOURCE)
+  await h.record('T', id(997))
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.T), to = all.find((row) => row.account === h.acct.Z)
+  const restore = touchPlaced(path.join(h.dir('Z'), `local_${SOURCE}.json`))
+  const first = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true }), to, h.paths).finally(restore)
+  assert.ok(first.summary.notMoved.some(row => row.id === SOURCE))
+  const result = await finishPending(h.paths, { cloud: cloudFixture(h, { account: from.account, org: from.org }) })
+  assert.ok(result.summary.notMoved.some(row => row.id === SOURCE))
+  assert.equal(result.receipt.sessions.length, 0)
+})
+
+test('Finish pending preserves a record-only bridge identity after local rehome', async () => {
+  const h = await home()
+  const session = id(709)
+  const local = [entry('user', 31, null, session, { message: { role: 'user', content: 'local history' } })]
+  const remote = [entry('user', 32, null, 'cse_record_only', { message: { role: 'user', content: 'remote branch' } })]
+  await h.write(session, local)
+  await h.record('T', session, rehomeRecord({ title: 'Original local title', bridgeSessionIds: ['session_record_only'] }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  let status = 'active'
+  const cloud = cloudFixture(h, {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [remoteSession({ id: 'cse_record_only', title: 'Renamed remote title', status })],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status, { id: 'cse_record_only' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  })
+  const finished = await finishPending(h.paths, { cloud })
+
+  assert.equal(moved.receipt.cloudLinks[0].bridgeIds.includes('session_record_only'), true)
+  assert.equal(finished.ok, true)
+  assert.deepEqual(finished.failed, [])
+  assert.deepEqual(finished.summary.kept.map(row => row.code), ['CLOUD_UNPROVEN'])
+  assert.equal(status, 'active')
+})
+
+test('Finish pending preserves a record-only bridge identity when history was already there', async () => {
+  const h = await home()
+  const local = [entry('user', 33, null, SOURCE, { message: { role: 'user', content: 'local history' } })]
+  const remote = [entry('user', 34, null, 'cse_existing_record_only', { message: { role: 'user', content: 'remote branch' } })]
+  await h.write(SOURCE, local)
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Already there source', bridgeSessionIds: ['session_existing_record_only'] }))
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Already there target' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  assert.equal(moved.receipt.sessions.length, 0)
+  let status = 'active'
+  const cloud = cloudFixture(h, {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [remoteSession({ id: 'cse_existing_record_only', title: 'Renamed remote title', status })],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status, { id: 'cse_existing_record_only' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  })
+  const finished = await finishPending(h.paths, { cloud })
+
+  assert.equal(finished.ok, true)
+  assert.deepEqual(finished.failed, [])
+  assert.deepEqual(finished.summary.kept.map(row => row.code), ['CLOUD_UNPROVEN'])
+  assert.equal(status, 'active')
+})
+
+test('duplicate owners keep record-only bridge identities scoped to each source account', async () => {
+  const h = await home()
+  const local = [entry('user', 37, null, SOURCE, { message: { role: 'user', content: 'shared local history' } })]
+  const remote = [entry('user', 38, null, 'cse_second_owner', { message: { role: 'user', content: 'second owner remote branch' } })]
+  await h.write(SOURCE, local)
+  await h.record('P', SOURCE, rehomeRecord({ title: 'First owner', bridgeSessionIds: ['session_first_owner'] }))
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Second owner', bridgeSessionIds: ['session_second_owner'] }))
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, from, to)
+  assert.equal(moved.receipt.cloudLinks.some((row) => row.account === h.acct.T && row.bridgeIds.includes('session_second_owner')), true)
+  let status = 'active'
+  const cloud = cloudFixture(h, {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [remoteSession({ id: 'cse_second_owner', title: 'Renamed second owner', status })],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status, { id: 'cse_second_owner' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  })
+  const finished = await finishPending(h.paths, { cloud })
+
+  assert.equal(finished.ok, true)
+  assert.deepEqual(finished.failed, [])
+  assert.deepEqual(finished.summary.kept.map(row => row.code), ['CLOUD_UNPROVEN'])
+  assert.equal(status, 'active')
+})
+
+test('Finish pending never sweeps in a Remote Control session created after Move', async () => {
+  const h = await home()
+  const session = id(708)
+  const entries = [entry('user', 30, null, session)]
+  await h.write(session, entries)
+  await h.record('T', session, rehomeRecord({ title: 'Later remote source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  let archived = false
+  const cloud = cloudFixture(h, {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [remoteSession({ id: 'cse_created_later', title: 'Later remote source', created_at: new Date(Date.parse(moved.receipt.startedAt) + 60_000).toISOString() })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState('active', { id: 'cse_created_later' }),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  })
+  const finished = await finishPending(h.paths, { cloud })
+
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.pendingCloud, 0)
+  assert.equal(finished.receipt.remote.length, 0)
+  assert.equal(finished.newerCloud, 1)
+  assert.equal(finished.receipt.cloudChecks[0].later[0].title, 'Later remote source')
+  assert.equal(archived, false)
+})
+
+test('the first cloud attempt uses the same creation cutoff as its retry', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 39, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Cutoff source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  let archived = false
+  const requestedAt = new Date().toISOString()
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_after_click', title: 'Cutoff source', created_at: new Date(Date.parse(requestedAt) + 60_000).toISOString() })],
+    eventRows: async () => remoteRows([entry('user', 40, null, 'cse_after_click')]),
+    session: async () => remoteState('active'),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  })
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true, requestedAt }), to, h.paths)
+
+  assert.equal(result.ok, true)
+  assert.equal(result.pendingCloud, 0)
+  assert.equal(result.receipt.remote.length, 0)
+  assert.equal(result.newerCloud, 1)
+  assert.equal(archived, false)
+})
+
+test('Finish pending refuses an undated remote row instead of widening the move', async () => {
+  const h = await home()
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  await moveWithPending(h, [from], to)
+  let archived = false
+  const cloud = cloudFixture(h, {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [remoteSession({ id: 'cse_undated', title: 'Undated remote', created_at: undefined })],
+    eventRows: async () => [],
+    session: async () => remoteState('active'),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  })
+  const result = await finishPending(h.paths, { cloud })
+
+  assert.equal(result.ok, false)
+  assert.equal(result.pendingCloud, 1)
+  assert.match(result.receipt.failed[0].error, /creation time is missing/)
+  assert.equal(archived, false)
+})
+
+test('a failed deferred cloud session remains explicit and retryable', async () => {
+  const h = await home()
+  const session = id(705)
+  const shared = branchEntries(8, session, 10)
+  const local = [...shared, entry('assistant', 18, 17, session, { message: { role: 'assistant', content: 'local branch' } })]
+  await h.write(session, local)
+  await h.record('T', session, rehomeRecord({ title: 'Retryable cloud source' }))
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, [from], to)
+  let supported = false
+  let status = 'active'
+  const remote = local
+  const cloud = cloudFixture(h, {
+    account: h.acct.T,
+    org: h.org.T,
+    list: async () => [remoteSession({ id: 'cse_retryable', title: 'Retryable cloud source', status })],
+    eventRows: async () => {
+      if (!supported) throw new Error('Remote Control history contains an unsupported content block')
+      return remoteRows(remote)
+    },
+    session: async () => remoteState(status, { id: 'cse_retryable' }),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  })
+
+  const failed = await finishPending(h.paths, { cloud })
+  assert.equal(failed.file, moved.file)
+  assert.equal(failed.ok, false)
+  assert.equal(failed.pendingCloud, 1)
+  assert.equal(failed.receipt.cloudChecks[0].status, 'failed')
+  assert.match(failed.receipt.failed.at(-1).error, /unsupported content block/)
+  assert.equal(status, 'active')
+
+  supported = true
+  const retried = await finishPending(h.paths, { cloud })
+  assert.equal(retried.ok, true)
+  assert.equal(retried.complete, true)
+  assert.equal(retried.pendingCloud, 0)
+  assert.equal(retried.receipt.failed.length, 0)
+  assert.equal(status, 'archived')
+})
+
+test('Undo cancels unchecked cloud sources and completes across source logins', async () => {
+  const h = await home()
+  const first = id(706)
+  const second = id(707)
+  const firstEntries = [entry('user', 20, null, first), entry('assistant', 21, 20, first)]
+  const secondEntries = [entry('user', 22, null, second), entry('assistant', 23, 22, second)]
+  await h.write(first, firstEntries)
+  await h.write(second, secondEntries)
+  await h.record('P', first, rehomeRecord({ title: 'First undo source' }))
+  await h.record('T', second, rehomeRecord({ title: 'Second undo source' }))
+  const states = { first: 'active', second: 'active' }
+  const makeCloud = (account, org, key, remote, title, entries) => cloudFixture(h, {
+    account,
+    org,
+    list: async () => [remoteSession({ id: remote, title, status: states[key] })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(states[key], { id: remote }),
+    archive: async () => { states[key] = 'archived' },
+    unarchive: async () => { states[key] = 'active' }
+  })
+  const firstCloud = makeCloud(h.acct.P, h.org.P, 'first', 'cse_first_undo', 'First undo source', firstEntries)
+  const secondCloud = makeCloud(h.acct.T, h.org.T, 'second', 'cse_second_undo', 'Second undo source', secondEntries)
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  await moveWithPending(h, from, to, firstCloud)
+  await finishPending(h.paths, { cloud: secondCloud })
+  assert.deepEqual(states, { first: 'archived', second: 'archived' })
+
+  const staged = await undo(h.paths, { cloud: firstCloud })
+  assert.deepEqual(states, { first: 'active', second: 'archived' })
+  assert.deepEqual(staged.pendingUndo, [from[1].email])
+  assert.equal(staged.dest, undefined)
+  assert.equal(staged.receipt.cloudChecks.every((check) => check.status === 'cancelled' || check.status === 'complete'), true)
+  assert.deepEqual((await readdir(h.dir('Z'))).sort(), [`local_${first}.json`, `local_${second}.json`].sort())
+
+  const finished = await finishPending(h.paths, { cloud: secondCloud })
+  assert.deepEqual(states, { first: 'active', second: 'active' })
+  assert.ok(finished.dest)
+  assert.deepEqual((await readdir(h.dir('P'))), [`local_${first}.json`])
+  assert.deepEqual((await readdir(h.dir('T'))), [`local_${second}.json`])
+  assert.deepEqual(await readdir(h.dir('Z')), [])
+})
+
+test('a verified target archives its source Remote Control mirror and Undo restores it', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, [entry('user', 50, null, SOURCE), ...entries])
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  const calls = []
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_fixture', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries.map((row) => ({
+      type: row.type,
+      uuid: id(Number(row.uuid.slice(-12)) + 100),
+      session_id: 'cse_fixture',
+      message: row.type === 'assistant' ? { ...row.message, usage: { output_tokens: 999 }, stop_reason: null } : row.message
+    }))),
+    session: async () => remoteState(status, { id: 'cse_fixture' }),
+    archive: async () => { calls.push('archive'); status = 'archived' },
+    unarchive: async () => { calls.push('unarchive'); status = 'active' }
+  })
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.move.length, 0)
+  assert.equal(inv.cloud.matches.length, 1)
+  assert.equal(inv.cloud.blocked.length, 0)
+
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true, JSON.stringify(result.receipt.failed))
+  assert.deepEqual(calls, ['archive'])
+  assert.equal(result.receipt.remote.length, 1)
+  assert.equal(status, 'archived')
+  const targetFile = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const activated = JSON.parse(await readFile(targetFile, 'utf8'))
+  assert.equal(activated.isArchived, false)
+  activated.lastFocusedAt = Date.now()
+  activated.promptAppendSnapshot = { append: 'current Desktop prompt', cliVersion: 'fixture' }
+  await writeFile(targetFile, JSON.stringify(activated))
+
+  const undone = await undo(h.paths, { cloud })
+  assert.ok(undone.dest)
+  assert.deepEqual(calls, ['archive', 'unarchive'])
+  assert.equal(status, 'active')
+  const restored = JSON.parse(await readFile(targetFile, 'utf8'))
+  assert.equal(restored.isArchived, true)
+  assert.deepEqual(restored.promptAppendSnapshot, activated.promptAppendSnapshot)
+})
+
+test('a unique bridge link selects a fully verified Desktop fork and Undo restores its archive state', async () => {
+  for (const location of ['P', 'T']) {
+    const h = await home(), child = id(777), base = branchEntries(4, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('T', SOURCE, rehomeRecord({ title: 'Parent', isArchived: true }))
+    await h.write(child, [...fork(base, SOURCE, child, 'Fork'), { type: 'bridge-session', sessionId: child, bridgeSessionId: 'cse_linked_fork' }])
+    await h.record(location, child, rehomeRecord({ title: 'Fork', isArchived: true, forkedFromSessionId: `local_${SOURCE}`, bridgeSessionIds: ['session_linked_fork'] }))
+    const parentFile = path.join(h.dir('T'), `local_${SOURCE}.json`), targetFile = path.join(h.dir('T'), `local_${child}.json`)
+    const originalParent = await readFile(parentFile), originalFork = JSON.parse(await readFile(path.join(h.dir(location), `local_${child}.json`)))
+    let status = 'active'
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_linked_fork', title: 'Renamed remote fork', status })],
+      eventRows: async () => remoteRows(base),
+      session: async () => remoteState(status),
+      archive: async () => { assert.ok(await readFile(targetFile)); status = 'archived' },
+      unarchive: async () => { status = 'active' }
+    })
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+    assert.deepEqual(inv.cloud.blocked, [])
+    assert.deepEqual(inv.cloud.matches.map(row => [row.target.kind, row.target.id]), [[location === 'P' ? 'move' : 'existing', child]])
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(status, 'archived')
+    assert.deepEqual(moved.receipt.remote.map(row => row.targetId), [child])
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    const placed = JSON.parse(await readFile(targetFile))
+    assert.equal(placed.isArchived, false)
+    assert.equal(placed.forkedFromSessionId, `local_${SOURCE}`)
+    assert.deepEqual(placed.bridgeSessionIds, location === 'P' ? [] : ['session_linked_fork'])
+    assert.deepEqual(await readFile(parentFile), originalParent)
+    assert.ok((await undo(h.paths, { cloud })).dest)
+    assert.equal(status, 'active')
+    assert.deepEqual(await readFile(parentFile), originalParent)
+    assert.deepEqual(JSON.parse(await readFile(path.join(h.dir(location), `local_${child}.json`))), originalFork)
+  }
+})
+
+test('overlapping verified histories refuse absent, ambiguous, or unverified bridge links', async () => {
+  for (const links of ['none', 'multiple', 'unverified']) {
+    const h = await home(), child = id(777), base = branchEntries(4, SOURCE, 1)
+    const bridgeSessionIds = links === 'multiple' ? ['session_linked_fork'] : []
+    await h.write(SOURCE, base)
+    await h.record('T', SOURCE, rehomeRecord({ bridgeSessionIds }))
+    await h.write(child, fork(base, SOURCE, child, 'Fork'))
+    await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}`, bridgeSessionIds }))
+    if (links === 'unverified') {
+      const shorter = id(778)
+      await h.write(shorter, fork(base.slice(0, 3), SOURCE, shorter, 'Shorter fork'))
+      await h.record('T', shorter, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}`, bridgeSessionIds: ['session_linked_fork'] }))
+    }
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_linked_fork', title: 'Remote fork' })],
+      eventRows: async () => remoteRows(base)
+    })
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+    assert.deepEqual(inv.cloud.matches, [])
+    assert.equal(inv.cloud.blocked.length, 1)
+    assert.match(inv.cloud.blocked[0].error, /multiple .*local target/)
+  }
+})
+
+test('attachment prompts and tiny ordering drift prove semantic Remote Control containment', async () => {
+  const h = await home()
+  const remote = Array.from({ length: 100 }, (_, index) => entry(index % 2 ? 'assistant' : 'user', index + 100, index ? index + 99 : null, SOURCE))
+  const local = structuredClone(remote)
+  const prompt = local[80].message.content
+  local.splice(80, 1, { type: 'attachment', uuid: id(800), sessionId: SOURCE, attachment: { prompt } })
+  ;[local[20], local[21]] = [local[21], local[20]]
+  await h.write(SOURCE, local)
+  await h.record('Z', SOURCE, rehomeRecord())
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_equivalent', title: `Session ${SOURCE.slice(-3)}` })],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState('active'),
+    archive: async () => {},
+    unarchive: async () => {}
+  })
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 1)
+  assert.equal(inv.cloud.matches[0].target.kind, 'existing')
+  assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
+})
+
+async function artifactFixture({ large = false, wrappers = false } = {}) {
+  const h = await home(), main = branchEntries(365, SOURCE, 1000)
+  const agents = [35, 35, 34].map((amount, index) => branchEntries(amount, SOURCE, 3000 + index * 100).map(row => ({ ...row, agentId: `a${index}`, isSidechain: true })))
+  agents[0][0].message = structuredClone(main[0].message)
+  const prompt = [{ type: 'text', text: 'Synthetic queued image' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj'.repeat(large ? 300_000 : 4) } }]
+  const queued = { type: 'attachment', uuid: id(8100), sessionId: SOURCE, attachment: { type: 'queued_command', prompt, source_uuid: id(8000), delivery_id: 'fixture-delivery' } }
+  const removal = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', commandUuid: id(8000), deliveryId: 'fixture-delivery', sessionId: SOURCE }
+  const directory = path.join(h.project, SOURCE, 'subagents')
+  await mkdir(directory, { recursive: true })
+  const f = { h, main, agents, queued, removal, directory, status: 'active', calls: 0, reads: 0, extra: [] }
+  f.remote = [...main, ...agents.flat(), entry('user', 8000, null, SOURCE, { message: { role: 'user', content: prompt } })]
+  f.write = async () => {
+    await h.write(SOURCE, [...main, ...f.extra, queued, { ...queued, uuid: id(8101) }, removal])
+    for (const [index, rows] of agents.entries()) await writeFile(path.join(directory, `agent-a${index}.jsonl`), rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  }
+  await f.write()
+  await h.record('Z', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_artifacts'], scheduledTaskId: 'artifact_task' }))
+  f.taskFile = path.join(h.dir('Z'), 'scheduled-tasks.json')
+  await writeFile(f.taskFile, JSON.stringify({ scheduledTasks: [{ id: 'artifact_task', notifySessionId: `local_${SOURCE}`, enabled: false, prompt: 'Synthetic task' }], runRetries: { artifact_task: { attempts: 2 } } }))
+  f.cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_artifacts', title: 'Renamed synthetic mirror', status: f.status, updated_at: f.updated })],
+    eventRows: async () => {
+      f.reads++
+      return remoteRows(f.remote.map(row => {
+        const copy = structuredClone(row)
+        if (!wrappers) { delete copy.agentId; delete copy.isSidechain }
+        return copy
+      }))
+    },
+    session: async () => remoteState(f.status),
+    archive: async () => { f.calls++; f.status = 'archived' },
+    unarchive: async () => { f.status = 'active' }
+  })
+  const all = await accounts(h.paths, [])
+  f.from = all.find(row => row.account === h.acct.P)
+  f.to = all.find(row => row.account === h.acct.Z)
+  f.inventory = (options = {}) => inventory([f.from], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [], ...options })
+  return f
+}
+
+test('artifact coverage archives all 470 events through explicit links or task titles with optional wrappers', async () => {
+  for (const wrappers of [false, true]) for (const linked of [false, true]) {
+    const f = await artifactFixture({ large: true, wrappers }), { h } = f
+    if (!linked) {
+      await h.record('Z', SOURCE, rehomeRecord({ title: 'Renamed synthetic mirror', scheduledTaskId: 'artifact_task' }))
+      f.to = (await accounts(h.paths, [])).find(row => row.account === h.acct.Z)
+    }
+    f.extra.push({ type: 'progress', data: 'x'.repeat(1_200_000) })
+    await f.write()
+    assert.ok(Buffer.byteLength(JSON.stringify(f.queued)) > 1024 * 1024)
+    const files = [path.join(h.project, `${SOURCE}.jsonl`), f.taskFile, path.join(h.dir('Z'), `local_${SOURCE}.json`), ...[0, 1, 2].map(index => path.join(f.directory, `agent-a${index}.jsonl`))]
+    const before = await Promise.all(files.map(file => readFile(file)))
+    const inv = await f.inventory({ writeCache: true })
+    assert.deepEqual(inv.cloud.blocked, [])
+    assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+    assert.deepEqual(inv.cloud.matches[0].target.artifactCounts, { main: 365, subagent: 104, queued: 1 })
+    const used = inv.cloud.artifacts.used
+    const moved = await move(inv, f.to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    assert.equal(f.calls, 1)
+    assert.equal(moved.receipt.sessions.length, 0)
+    assert.equal(moved.receipt.remote[0].matchMode, 'artifacts')
+    assert.deepEqual(moved.receipt.remote[0].artifactCounts, { main: 365, subagent: 104, queued: 1 })
+    assert.equal(inv.cloud.artifacts.used, used)
+    assert.deepEqual(await Promise.all(files.map(file => readFile(file))), before)
+    assert.ok((await undo(h.paths, { cloud: f.cloud, processes: [] })).dest)
+    assert.equal(f.status, 'active')
+  }
+})
+
+test('artifact coverage refuses ownership, identity, order, multiplicity and delivery failures', async () => {
+  for (const change of ['parent', 'agent', 'collision', 'conflicting copy', 'main identity', 'order', 'changed', 'duplicate event', 'replay', 'delivery', 'undelivered', 'remove content', 'cancelled copy', 'empty']) {
+    const f = await artifactFixture()
+    if (change === 'parent') f.agents[0][0].sessionId = id(999)
+    if (change === 'agent') f.agents[0][0].agentId = 'another'
+    if (change === 'collision') f.agents[1].push({ ...f.agents[0][0], agentId: 'a1' })
+    if (change === 'conflicting copy') f.agents[0].push({ ...f.agents[0][0], message: { role: 'user', content: 'Conflicting copy' } })
+    if (change === 'main identity') f.remote[0] = { ...f.remote[0], message: f.agents[0][1].message }
+    if (change === 'order') f.agents[0].reverse()
+    if (change === 'changed') f.agents[0][0] = { ...f.agents[0][0], message: { role: 'user', content: 'Changed synthetic content' } }
+    if (change === 'duplicate event') f.remote.push(f.remote[365])
+    if (change === 'delivery') f.removal.deliveryId = 'another-delivery'
+    if (change === 'undelivered') f.removal.reason = 'cancelled'
+    if (change === 'remove content') f.removal.content = 'Conflicting consumed prompt'
+    if (change === 'cancelled copy') f.extra.push({ ...f.removal, reason: 'cancelled' })
+    if (change === 'empty') f.remote = []
+    await f.write()
+    if (change === 'replay') await appendFile(path.join(f.h.project, `${SOURCE}.jsonl`), JSON.stringify({ ...f.queued, attachment: { ...f.queued.attachment, prompt: 'Conflicting replay' } }) + '\n')
+    const inv = await f.inventory()
+    assert.deepEqual(inv.cloud.matches, [], change)
+    if (change === 'empty') assert.equal(inv.cloud.blocked[0].code, 'CLOUD_UNPROVEN')
+    else assert.equal(inv.cloud.blocked[0]?.code, 'CLOUD_ARTIFACT_UNCERTAIN', change)
+    assert.equal(f.calls, 0)
+  }
+})
+
+test('artifact time hints never prove absence and ordinary queue delivery consumes one event', async () => {
+  const f = await artifactFixture()
+  for (const [index, stream] of f.agents.entries()) for (const event of stream) {
+    if (index === 0) delete event.timestamp
+    else event.timestamp = '2099-01-01T00:00:00.000Z'
+  }
+  f.main.push(f.remote.at(-1))
+  await f.write()
+  const inv = await f.inventory()
+  assert.deepEqual(inv.cloud.blocked, [])
+  assert.deepEqual(inv.cloud.matches[0].target.artifactCounts, { main: 366, subagent: 104, queued: 0 })
+  f.remote = f.remote.slice(365, -1)
+  assert.deepEqual((await f.inventory()).cloud.matches[0].target.artifactCounts, { main: 0, subagent: 104, queued: 0 })
+  f.agents[0].push(f.agents[0][0])
+  f.remote.push(f.agents[0][0])
+  await f.write()
+  assert.deepEqual((await f.inventory()).cloud.matches[0].target.artifactCounts, { main: 0, subagent: 105, queued: 0 })
+})
+
+test('artifact queued string prompts retain delivery identity and stream order', async () => {
+  for (const reverse of [false, true]) {
+    const f = await artifactFixture()
+    f.queued.attachment.prompt = 'First queued string'
+    f.remote[f.remote.length - 1] = entry('user', 8000, null, SOURCE, { message: { role: 'user', content: 'First queued string' } })
+    await f.write()
+    await appendFile(path.join(f.h.project, `${SOURCE}.jsonl`), [
+      { ...f.queued, uuid: id(8200), attachment: { ...f.queued.attachment, source_uuid: id(8001), delivery_id: 'second-delivery', prompt: 'Second queued string' } },
+      { ...f.removal, commandUuid: id(8001), deliveryId: 'second-delivery' }
+    ].map(row => JSON.stringify(row)).join('\n') + '\n')
+    f.remote.push(entry('user', 8001, null, SOURCE, { message: { role: 'user', content: 'Second queued string' } }))
+    if (reverse) f.remote.splice(-2, 2, ...f.remote.slice(-2).reverse())
+    const inv = await f.inventory()
+    if (reverse) assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    else assert.deepEqual(inv.cloud.matches[0].target.artifactCounts, { main: 365, subagent: 104, queued: 2 })
+  }
+})
+
+test('artifact optional outer wrappers validate hints and reject contradictions', async () => {
+  for (const contradict of [false, true]) {
+    const f = await artifactFixture({ wrappers: true }), original = f.cloud.eventRows
+    f.cloud.eventRows = async id => (await original(id)).map(row => {
+      if (!row.payload.agentId) return row
+      const copy = { ...row, agentId: row.payload.agentId, isSidechain: row.payload.isSidechain }
+      if (contradict) copy.agentId = 'different'
+      else { delete copy.payload.agentId; delete copy.payload.isSidechain }
+      return copy
+    })
+    const inv = await f.inventory()
+    if (contradict) assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    else assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+  }
+})
+
+test('artifact legacy cache upgrades preserve warm history and manifest hits', async () => {
+  const f = await artifactFixture(), file = path.join(f.h.paths.state, 'cache.json'), unrelated = id(9000)
+  await f.h.write(unrelated, branchEntries(12, unrelated, 12000))
+  await f.h.record('Z', unrelated, rehomeRecord())
+  f.to = (await accounts(f.h.paths, [])).find(row => row.account === f.h.acct.Z)
+  await f.inventory({ writeCache: true })
+  const cache = JSON.parse(await readFile(file))
+  assert.equal(Object.keys(cache.histories).length, 2)
+  assert.ok(Object.values(cache.histories).every(item => !Object.hasOwn(item.value.result, 'mainIdentities')))
+  for (const item of Object.values(cache.remote)) delete item.value.events
+  await writeFile(file, JSON.stringify(cache))
+  const original = fs.open, indexed = []
+  fs.open = async (file, ...args) => {
+    if (String(file).endsWith('.jsonl')) indexed.push(String(file))
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  const prior = f.reads
+  let inv
+  try { inv = await f.inventory({ writeCache: true }) }
+  finally { fs.open = original; syncBuiltinESMExports() }
+  assert.equal(inv.cacheStats.historyMisses, 0)
+  assert.equal(inv.cacheStats.historyHits, 2)
+  assert.ok(inv.cacheStats.manifestHits > 0)
+  assert.equal(f.reads, prior + 1)
+  assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+  assert.ok(indexed.some(file => path.basename(file) === `${SOURCE}.jsonl`))
+  assert.ok(indexed.every(file => path.basename(file) === `${SOURCE}.jsonl` || path.basename(path.dirname(path.dirname(file))) === SOURCE))
+  const saved = JSON.parse(await readFile(file))
+  assert.deepEqual(saved.histories, cache.histories)
+  assert.equal(saved.version, 13)
+  assert.equal(saved.semanticVersion, 3)
+  f.remote = f.main
+  f.updated = '2026-09-02T00:00:00.000Z'
+  const mainOnly = await f.inventory({ writeCache: true })
+  assert.equal(mainOnly.cacheStats.historyHits, 2)
+  assert.equal(mainOnly.cacheStats.historyMisses, 0)
+  assert.equal(mainOnly.cloud.matches[0].target.matchMode, 'ordered')
+  assert.equal(mainOnly.cloud.artifacts.used, 0)
+  assert.deepEqual(JSON.parse(await readFile(file)).histories, cache.histories)
+})
+
+test('artifact engine hashing is lazy for local analysis and memoized for cloud checks', async () => {
+  const f = await artifactFixture(), original = fsSync.readFileSync
+  let reads = 0
+  fsSync.readFileSync = (file, ...args) => {
+    if (String(file) === path.join(here, 'engine.js')) reads++
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  try {
+    const engine = await import(`./engine.js?artifact-engine=${randomUUID()}`)
+    await engine.inventory([f.from], f.to, f.h.paths, () => {}, { processes: [] })
+    assert.equal(reads, 0)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const inv = await engine.inventory([f.from], f.to, f.h.paths, () => {}, { processes: [], cloud: f.cloud })
+      assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+      assert.equal(reads, 1)
+    }
+  } finally { fsSync.readFileSync = original; syncBuiltinESMExports() }
+})
+
+test('artifact limits count probes, skip unrelated large lines and suppress unchanged automatic failures', async () => {
+  const f = await artifactFixture()
+  const prefix = Buffer.byteLength(f.main.map(row => JSON.stringify(row)).join('\n') + '\n' + JSON.stringify({ type: 'progress', data: '' }) + '\n')
+  f.extra.push({ type: 'progress', data: 'x'.repeat((65534 - prefix % 65536 + 65536) % 65536) })
+  f.extra.push({ type: 'progress', data: 'x'.repeat(17 * 1024 * 1024) })
+  await f.write()
+  const complete = await f.inventory({ writeCache: true })
+  assert.equal(complete.cloud.matches[0].target.matchMode, 'artifacts')
+  const mainBytes = (await stat(path.join(f.h.project, `${SOURCE}.jsonl`))).size
+  assert.ok(complete.cloud.artifacts.used > mainBytes)
+  const options = { writeCache: true, artifactLimit: mainBytes + 100 }
+  const first = await f.inventory(options)
+  assert.equal(first.cloud.blocked[0].code, 'CLOUD_ARTIFACT_BUDGET')
+  assert.equal(first.cloud.artifacts.used, mainBytes)
+  const second = await f.inventory({ ...options, automatic: true })
+  assert.equal(second.cloud.blocked[0].code, 'CLOUD_ARTIFACT_BUDGET')
+  assert.equal(second.cloud.artifacts.used, 0)
+  assert.equal(second.cacheStats.historyMisses, 0)
+  f.updated = '2026-09-02T00:00:00.000Z'
+  const changed = await f.inventory({ ...options, automatic: true })
+  assert.ok(changed.cloud.artifacts.used > 0)
+  await appendFile(path.join(f.directory, 'agent-a0.jsonl'), '\n')
+  assert.ok((await f.inventory({ ...options, automatic: true })).cloud.artifacts.used > 0)
+})
+
+test('automatic pending cloud retries retain typed artifact limits without rescanning unchanged files', async () => {
+  const f = await artifactFixture(), artifactLimit = (await stat(path.join(f.h.project, `${SOURCE}.jsonl`))).size + 100
+  const moved = await move(await f.inventory({ writeCache: true, artifactLimit }), f.to, f.h.paths)
+  assert.equal(moved.receipt.failed[0].code, 'CLOUD_ARTIFACT_BUDGET')
+  const original = fs.open
+  let reads = 0
+  fs.open = async (file, ...args) => {
+    if (String(file).endsWith('.jsonl')) reads++
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const receipt = JSON.parse(await readFile(moved.file))
+      if (receipt.cloudAttempts) receipt.cloudAttempts[`${f.from.account}/${f.from.org}`] = 0
+      await writeFile(moved.file, JSON.stringify(receipt))
+      const result = await finishPending(f.h.paths, { cloud: f.cloud, automatic: f.from, artifactLimit })
+      assert.equal(result.failed[0].code, 'CLOUD_ARTIFACT_BUDGET')
+    }
+    assert.equal(reads, 0)
+    await appendFile(path.join(f.directory, 'agent-a0.jsonl'), '\n')
+    const receipt = JSON.parse(await readFile(moved.file))
+    receipt.cloudAttempts[`${f.from.account}/${f.from.org}`] = 0
+    await writeFile(moved.file, JSON.stringify(receipt))
+    await finishPending(f.h.paths, { cloud: f.cloud, automatic: f.from, artifactLimit })
+    assert.ok(reads > 0)
+  } finally { fs.open = original; syncBuiltinESMExports() }
+})
+
+test('artifact relevant lines over 16 MiB are typed uncertainty and cannot authorize an archive', async () => {
+  const f = await artifactFixture()
+  f.queued.padding = ''
+  const available = 16 * 1024 * 1024 - Buffer.byteLength(JSON.stringify(f.queued)) + f.queued.attachment.prompt[1].source.data.length
+  f.queued.attachment.prompt[1].source.data = 'YWJj'.repeat(Math.floor(available / 4))
+  f.queued.padding = 'x'.repeat(available % 4)
+  assert.equal(Buffer.byteLength(JSON.stringify(f.queued)), 16 * 1024 * 1024)
+  await f.write()
+  assert.equal((await f.inventory()).cloud.matches[0].target.matchMode, 'artifacts')
+  f.queued.padding += 'x'
+  await f.write()
+  const inv = await f.inventory()
+  assert.deepEqual(inv.cloud.matches, [])
+  assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_LINE_LIMIT')
+  assert.ok(inv.cloud.artifacts.used <= 16 * 1024 * 1024 + 256 * 1024)
+})
+
+test('artifact search stops after complete proof but still reads required files outside the time window', async () => {
+  const f = await artifactFixture(), file = path.join(f.directory, 'agent-unrelated.jsonl')
+  await writeFile(file, JSON.stringify(entry('user', 9999, null, SOURCE, { agentId: 'unrelated', isSidechain: true, timestamp: '2000-01-01T00:00:00.000Z', message: { role: 'user', content: 'x'.repeat(17 * 1024 * 1024) } })) + '\n')
+  await fs.utimes(file, new Date('2001-01-01'), new Date('2001-01-01'))
+  const inv = await f.inventory()
+  assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+  assert.ok(inv.cloud.artifacts.used < 1024 * 1024)
+  await unlink(file)
+  const required = path.join(f.directory, 'agent-a0.jsonl')
+  await writeFile(required, f.agents[0].map(row => JSON.stringify({ ...row, timestamp: '2000-01-01T00:00:00.000Z' })).join('\n') + '\n')
+  await fs.utimes(required, new Date('2001-01-01'), new Date('2001-01-01'))
+  assert.equal((await f.inventory()).cloud.matches[0].target.matchMode, 'artifacts')
+})
+
+test('artifact budget reservations remain shared across concurrent and throttled cloud analyses', async () => {
+  for (const scenario of ['together', 'throttled', 'alone', 'refused first']) {
+    const h = await home(), sources = Array.from({ length: 8 }, (_, index) => id(9000 + index)), histories = new Map(), costs = []
+    for (const [index, sid] of sources.entries()) {
+      const main = branchEntries(4, sid, 10000 + index * 10), agent = entry('assistant', 11000 + index, null, sid, { agentId: 'fixture', isSidechain: true })
+      histories.set(`cse_parallel${index}`, [...main, agent])
+      await h.write(sid, main)
+      await h.record('Z', sid, rehomeRecord({ bridgeSessionIds: [`session_parallel${index}`] }))
+      const directory = path.join(h.project, sid, 'subagents')
+      await mkdir(directory, { recursive: true })
+      const text = JSON.stringify({ ...agent, sessionId: scenario === 'refused first' && index === 0 ? id(9999) : sid }) + '\n'
+      await writeFile(path.join(directory, 'agent-fixture.jsonl'), text)
+      costs.push((await stat(path.join(h.project, `${sid}.jsonl`))).size + 2 * Buffer.byteLength(text))
+    }
+    let selected = [...histories.keys()], fetching = 0, peak = 0
+    const cloud = cloudFixture(h, {
+      memory: { check: () => {}, parallel: () => scenario === 'throttled' ? 1 : 8 },
+      list: async () => selected.map(id => remoteSession({ id, title: id })),
+      eventRows: async id => {
+        peak = Math.max(peak, ++fetching)
+        await new Promise(resolve => setImmediate(resolve))
+        fetching--
+        return remoteRows(histories.get(id))
+      }
+    })
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const artifactLimit = scenario === 'refused first' ? Math.max(...costs) : 4000
+    assert.ok(costs.every(cost => cost <= artifactLimit))
+    assert.ok(costs.reduce((sum, cost) => sum + cost, 0) > artifactLimit)
+    const run = automatic => inventory([from], to, h.paths, () => {}, { cloud, processes: [], artifactLimit, automatic, writeCache: true })
+    const before = await fixtureSnapshot(h, [h.paths.pool]), first = await run(false)
+    assert.equal(peak, scenario === 'throttled' ? 1 : 8)
+    assert.ok(first.cloud.artifacts.used <= artifactLimit)
+    assert.ok(first.cloud.artifacts.used > 0)
+    if (scenario === 'refused first') {
+      assert.equal(first.cloud.matches.length, 0)
+      assert.equal(first.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    } else assert.ok(first.cloud.matches.length > 0 && first.cloud.matches.length < 8)
+    const deferred = first.cloud.blocked.filter(row => row.code === 'CLOUD_ARTIFACT_BUDGET')
+    assert.ok(deferred.length)
+    const cache = JSON.parse(await readFile(path.join(h.paths.state, 'cache.json')))
+    for (const row of deferred) {
+      assert.equal(cache.remote[row.id].value.artifactFailure, undefined)
+      assert.ok(Number.isSafeInteger(cache.remote[row.id].value.artifactDeferred) && cache.remote[row.id].value.artifactDeferred > 0)
+    }
+    const completed = new Set(first.cloud.matches.map(row => row.session.id)), refused = scenario === 'refused first' ? 'cse_parallel0' : null
+    selected = scenario === 'alone' ? [deferred[0].id] : selected.filter(id => !completed.has(id))
+    for (let pass = 0; selected.some(id => id !== refused) && pass < 8; pass++) {
+      const next = await run(true)
+      assert.ok(next.cloud.artifacts.used <= artifactLimit)
+      assert.ok(next.cloud.matches.length > 0, `${scenario}: ${JSON.stringify(next.cloud.blocked)}`)
+      assert.ok(next.cloud.matches.every(row => row.target.matchMode === 'artifacts'))
+      for (const row of next.cloud.matches) completed.add(row.session.id)
+      selected = selected.filter(id => !completed.has(id))
+    }
+    assert.ok(selected.every(id => id === refused), scenario)
+    if (scenario !== 'alone') assert.equal(completed.size, refused ? 7 : 8)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.pool]), before)
+  }
+})
+
+test('artifact checks that establish missing history keep the mirror in its account', async () => {
+  const f = await artifactFixture(), { h } = f
+  await unlink(f.taskFile)
+  await h.record('Z', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_artifacts'] }))
+  f.to = (await accounts(h.paths, [])).find(row => row.account === h.acct.Z)
+  f.agents[0].shift()
+  await f.write()
+  const before = await fixtureSnapshot(h, [h.paths.pool]), inv = await f.inventory()
+  assert.deepEqual(inv.cloud.matches, [])
+  assert.equal(inv.cloud.blocked[0].code, 'CLOUD_UNPROVEN')
+  const result = await move(inv, f.to, h.paths)
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.summary.kept.map(row => row.code), ['CLOUD_UNPROVEN'])
+  assert.equal(f.calls, 0)
+  assert.deepEqual(result.receipt.sessions, [])
+  for (const [file, hash] of Object.entries(before)) assert.equal(createHash('sha256').update(await readFile(file)).digest('hex'), hash)
+})
+
+test('artifact final proof rejects changed UUIDs, roles and fresh file fingerprints', async () => {
+  for (const change of ['uuid', 'role', 'payload', 'sidecar']) {
+    const f = await artifactFixture(), inv = await f.inventory()
+    assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+    const original = f.cloud.eventRows
+    f.cloud.eventRows = async id => {
+      if (change === 'sidecar') {
+        f.agents[0][0].sessionId = id === 'cse_artifacts' ? SOURCE.slice(0, -1) + '2' : SOURCE
+        await f.write()
+      }
+      const rows = await original(id)
+      if (change === 'uuid') rows[365].payload.uuid = '00000000-0000-4000-8000-000000099999'
+      if (change === 'role') rows[365].payload.message.role = 'assistant'
+      if (change === 'payload') rows[365].payload.message.content = 'Changed after inventory'
+      return rows
+    }
+    const moved = await move(inv, f.to, f.h.paths)
+    assert.equal(f.calls, 0, change)
+    assert.equal(moved.ok, false, change)
+    assert.equal(moved.receipt.remote.length, 0, change)
+    assert.equal(moved.receipt.remotePending, undefined, change)
+  }
+})
+
+test('artifact indexes reparse identical bytes on a new inode before archival', async () => {
+  const f = await artifactFixture(), inv = await f.inventory(), before = inv.cloud.artifacts.used
+  const file = path.join(f.directory, 'agent-a0.jsonl'), raw = await readFile(file)
+  await unlink(file)
+  await writeFile(file, raw)
+  const result = await move(inv, f.to, f.h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(f.calls, 1)
+  assert.ok(inv.cloud.artifacts.used > before)
+})
+
+test('artifact ownership rejects symlink entries introduced after the ordinary sidecar scan', async () => {
+  for (const kind of ['file', 'root', 'subagents']) {
+    const f = await artifactFixture(), original = f.cloud.list, outside = path.join(f.h.root, 'unrelated-artifacts')
+    await mkdir(outside)
+    await writeFile(path.join(outside, 'agent-a0.jsonl'), f.agents[0].map(row => JSON.stringify(row)).join('\n') + '\n')
+    f.cloud.list = async () => {
+      if (kind === 'file') await symlink(path.join(outside, 'agent-a0.jsonl'), path.join(f.directory, 'agent-escape.jsonl'))
+      else {
+        const directory = kind === 'root' ? path.dirname(f.directory) : f.directory
+        await rename(directory, `${directory}.original`)
+        await symlink(outside, directory)
+      }
+      return original()
+    }
+    const inv = await f.inventory()
+    assert.deepEqual(inv.cloud.matches, [], kind)
+    assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN', kind)
+  }
+})
+
+test('artifact coverage also revalidates a rehomed target through normal archival', async () => {
+  const f = await artifactFixture(), { h } = f
+  await unlink(f.taskFile)
+  await unlink(path.join(h.dir('Z'), `local_${SOURCE}.json`))
+  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_artifacts'] }))
+  const all = await accounts(h.paths, [])
+  f.from = all.find(row => row.account === h.acct.P)
+  f.to = all.find(row => row.account === h.acct.Z)
+  const before = await fixtureSnapshot(h, [h.paths.pool])
+  const moved = await move(await f.inventory(), f.to, h.paths)
+  assert.equal(moved.ok, true)
+  assert.deepEqual(moved.receipt.sessions.map(row => row.strategy), ['rehome'])
+  assert.equal(moved.receipt.remote[0].matchMode, 'artifacts')
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.pool]), before)
+})
+
+test('uncertain owned artifacts never authorize a source archive', async () => {
+  for (const change of ['unreadable', 'ownership', 'budget']) {
+    const f = await artifactFixture(), { h } = f
+    f.remote.push(entry('assistant', 8900, null, SOURCE))
+    if (change === 'unreadable') await appendFile(path.join(f.directory, 'agent-a0.jsonl'), '{"type":"assistant",broken\n')
+    if (change === 'ownership') { f.agents[0][0].sessionId = id(9999); await f.write() }
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), inv = await f.inventory(change === 'budget' ? { artifactLimit: 100 } : {})
+    assert.deepEqual(inv.cloud.matches, [])
+    assert.equal(inv.cloud.blocked[0].code, change === 'budget' ? 'CLOUD_ARTIFACT_BUDGET' : 'CLOUD_ARTIFACT_UNCERTAIN')
+    assert.doesNotMatch(inv.cloud.blocked[0].error, /unsupported/)
+    const moved = await move(inv, f.to, h.paths)
+    assert.equal(moved.ok, false)
+    assert.equal(moved.receipt.sessions.length, 0)
+    assert.equal(moved.receipt.remote.length, 0)
+    assert.equal(f.calls, 0)
+    assert.equal(f.status, 'active')
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+  }
+})
+
+test('an unproven Remote Control mirror stays in its account, is named once and is never retried', async () => {
+  const h = await home()
+  const sharedLocal = branchEntries(8, SOURCE, 20)
+  await h.write(SOURCE, [...sharedLocal, entry('user', 28, 27, SOURCE, { message: { role: 'user', content: 'local branch' } })])
+  await h.record('Z', SOURCE, rehomeRecord())
+  const remote = [...branchEntries(8, 'cse_divergent', 20), entry('user', 28, 27, 'cse_divergent', { message: { role: 'user', content: 'remote branch' } })]
+  let status = 'active', listed = 0
+  const cloud = cloudFixture(h, {
+    list: async () => { listed++; return [remoteSession({ id: 'cse_divergent', title: `Session ${SOURCE.slice(-3)}`, status })] },
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' }
+  })
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.deepEqual(inv.cloud.matches, [])
+  assert.equal(inv.cloud.blocked[0].code, 'CLOUD_UNPROVEN')
+  const alone = await move(inv, to, h.paths)
+  assert.deepEqual([alone.ok, alone.file], [true, null])
+  assert.deepEqual(alone.summary.kept.map(row => [row.id, row.error]), [['cse_divergent', `not proven to be on this Mac, kept in ${from.label}`]])
+  assert.deepEqual(alone.summary.attention, [])
+  const selection = async () => {
+    const current = await accounts(h.paths)
+    return [current.find(a => a.account === h.acct.P && a.org === h.org.P), current.find(a => a.account === h.acct.Z && a.org === h.org.Z)]
+  }
+  const local = id(750)
+  await h.write(local, [entry('user', 750, null, local)])
+  await h.record('P', local, rehomeRecord())
+  const [source, target] = await selection()
+  const result = await move(await inventory([source], target, h.paths, () => {}, { cloud }), target, h.paths)
+  assert.deepEqual([result.ok, result.complete], [true, true])
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [local])
+  assert.equal(status, 'active')
+  assert.deepEqual(result.receipt.failed.filter(row => row.cloudAccount).map(row => row.id), ['cse_divergent'])
+  assert.deepEqual(result.summary.kept.map(row => row.id), ['cse_divergent'])
+  assert.equal(result.receipt.cloudChecks[0].status, 'complete')
+  const active = { account: h.acct.P, org: h.org.P, state: 'known' }
+  const before = listed
+  await appendFile(path.join(h.project, `${SOURCE}.jsonl`), `${JSON.stringify(entry('assistant', 29, 28, SOURCE))}\n`)
+  for (const automatic of [true, false]) assert.notEqual((await finishPending(h.paths, { cloud, automatic, active })).pending, true)
+  assert.equal(listed, before)
+  assert.equal(status, 'active')
+  const next = id(751)
+  await h.write(next, [entry('user', 751, null, next)])
+  await h.record('P', next, rehomeRecord())
+  const later = await move(await inventory(...(await selection()).map((row, index) => index ? row : [row]), h.paths), (await selection())[1], h.paths)
+  assert.deepEqual(later.receipt.sessions.map(row => row.id), [next])
+})
+
+test('an unrelated same-title local session cannot prove a remote copy', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('Z', SOURCE, rehomeRecord())
+  const remote = [
+    entry('user', 10, null, 'cse_unrelated', { message: { role: 'user', content: 'unrelated question' } }),
+    entry('assistant', 11, 10, 'cse_unrelated', { message: { role: 'assistant', content: 'unrelated answer' } })
+  ]
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_unrelated', title: `Session ${SOURCE.slice(-3)}` })],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState('active'),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.equal(inv.cloud.blocked[0].code, 'CLOUD_UNPROVEN')
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.summary.kept.map(row => row.id), ['cse_unrelated'])
+  assert.equal(archived, false)
+})
+
+test('an exact bridge id to a divergent remote session never archives it', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'session_exact' }])
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Renamed local session' }))
+  const remote = [
+    entry('user', 10, null, 'cse_exact', { message: { role: 'user', content: 'remote-only question' } }),
+    entry('assistant', 11, 10, 'cse_exact', { message: { role: 'assistant', content: 'remote-only answer' } })
+  ]
+  let status = 'active'
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_exact', title: 'Remote renamed session', status })],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.deepEqual(inv.cloud.matches, [])
+  assert.equal(inv.cloud.blocked[0].code, 'CLOUD_UNPROVEN')
+  await move(inv, to, h.paths)
+  assert.equal(status, 'active')
+})
+
+test('a short remote history is not matched to a differently titled local session', async () => {
+  const h = await home()
+  const remote = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, remote)
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Renamed local session' }))
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_short', title: 'Different remote title' })],
+    eventRows: async () => remoteRows(remote),
+    session: async () => remoteState('active'),
+    archive: async () => {},
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.equal(inv.cloud.blocked[0].code, 'CLOUD_UNPROVEN')
+})
+
+test('an unreadable assistant payload cannot disappear from remote containment checks', async () => {
+  const h = await home(), entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE)
+  let archived = false
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_unreadable_message', title: 'Session 001' })],
+    eventRows: async () => [...remoteRows(entries), { event_type: 'assistant', sequence_num: 2, payload: { type: 'assistant', unknown_body: 'new data' } }],
+    session: async () => remoteState('active'), archive: async () => { archived = true }
+  })
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(archived, false)
+  assert.equal(result.ok, false)
+  assert.ok(result.receipt.failed.some((row) => row.error.includes('payload is unreadable')))
+})
+
+test('pending remote actions are refused even when worker status says idle', async () => {
+  for (const extra of [{ requires_action_details_list: [{ request_id: 'queued' }] }, { external_metadata: { pending_action: { request_id: 'queued' } } }, { external_metadata: { pending_actions: '[{"request_id":"queued"}]' } }]) {
+    const h = await home(), entries = [entry('user', 1, null, SOURCE)]
+    await h.write(SOURCE, entries)
+    await h.record('P', SOURCE)
+    let archived = false
+    const cloud = cloudFixture(h, { list: async () => [remoteSession({ id: 'cse_queued', title: 'Session 001' })], eventRows: async () => remoteRows(entries), session: async () => remoteState('active', extra), archive: async () => { archived = true } })
+    const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
+    const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+    assert.equal(archived, false)
+    assert.equal(result.ok, false)
+    assert.ok(result.receipt.failed.some((row) => row.error.includes('pending actions')))
+  }
+})
+
+test('changed remote history or input is refused even when its event marker is unchanged', async () => {
+  for (const added of [{ event_type: 'assistant', sequence_num: 2, payload: entry('assistant', 2, 1, SOURCE) }, { event_type: 'control_request', sequence_num: 2, payload: { type: 'control_request', request_id: 'new', request: { subtype: 'interrupt' } } }]) {
+  const h = await home(), entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE)
+  let reads = 0, archived = false
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_input', title: 'Session 001' })],
+    eventRows: async () => [...remoteRows(entries), ...(++reads >= 3 ? [added] : [])],
+    session: async () => remoteState('active'), archive: async () => { archived = true }
+  })
+  const all = await accounts(h.paths), from = all.find((row) => row.account === h.acct.P), to = all.find((row) => row.account === h.acct.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(archived, false)
+  assert.equal(result.ok, false)
+  assert.ok(result.receipt.failed.some((row) => row.error.includes('history or input changed')))
+  }
+})
+
+test('missing Remote Control readiness fields fail closed', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord())
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_unknown', title: `Session ${SOURCE.slice(-3)}` })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => ({ status: 'active', last_event_at: '2026-09-01T00:01:00.000Z' }),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.match(inv.cloud.blocked[0].error, /not proven disconnected and idle/)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
+  assert.equal(archived, false)
+  assert.match(result.receipt.failed[0].error, /not proven disconnected and idle/)
+})
+
+test('a Remote Control mirror stays active when no local target shares its title', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('Z', SOURCE, rehomeRecord({ title: 'Different local session' }))
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_other', title: `Session ${SOURCE.slice(-3)}` })],
+    eventRows: async () => remoteRows([entry('user', 9, null, 'cse_other', { message: { role: 'user', content: 'different history' } })]),
+    session: async () => remoteState(archived ? 'archived' : 'active', { id: 'cse_other' }),
+    archive: async () => { archived = true },
+    unarchive: async () => { archived = false }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.cloud.matches.length, 0)
+  assert.equal(inv.cloud.blocked.length, 1)
+  assert.equal(inv.cloud.blocked[0].error, `not proven to be on this Mac, kept in ${from.label}`)
+  const result = await move(inv, to, h.paths)
+  assert.deepEqual([result.ok, result.file], [true, null])
+  assert.equal(result.receipt.cloudChecks[0].status, 'complete')
+  assert.equal(archived, false)
+})
+
+test('a local move lands before its matching Remote Control mirror archives', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  const targetRecord = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_move', title: `Session ${SOURCE.slice(-3)}`, tags: ['remote-control-repl'], status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status, { id: 'cse_move' }),
+    archive: async () => { assert.ok(await readFile(targetRecord)); status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  assert.equal(inv.move.length, 1)
+  assert.equal(inv.cloud.matches[0].target.kind, 'move')
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.remote.length, 1)
+  assert.equal(status, 'archived')
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.equal(JSON.parse(await readFile(targetRecord, 'utf8')).isArchived, false)
+  assert.ok((await undo(h.paths, { cloud })).dest)
+  assert.equal(status, 'active')
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
+})
+
+test('Keep local accepts a rehome target activated by cloud archival', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_keep_activation', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  })
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, from, to, cloud)
+
+  assert.equal(moved.pendingCloud, 1)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, false)
+  assert.equal((await keepLocal(h.paths)).ok, true)
+})
+
+test('activation rollback restores receipt hashes for Keep local and Undo', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord({ isArchived: true }))
+  let reads = 0
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_rollback', title: `Session ${SOURCE.slice(-3)}` })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState('active', { last_event_at: ++reads >= 6 ? 'changed' : 'stable' }),
+    archive: async () => { throw new Error('archive should not run') }
+  })
+  const all = await accounts(h.paths)
+  const from = [
+    all.find((account) => account.account === h.acct.P && account.org === h.org.P),
+    all.find((account) => account.account === h.acct.T && account.org === h.org.T)
+  ]
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const moved = await moveWithPending(h, from, to, cloud)
+  const target = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+
+  assert.equal(JSON.parse(await readFile(target, 'utf8')).isArchived, true)
+  assert.equal((await keepLocal(h.paths)).ok, true)
+  assert.ok((await undo(h.paths, { cloud })).dest)
+})
+
+test('a local verification failure keeps its Remote Control source active', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord())
+  let status = 'active'
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_verify', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status),
+    archive: async () => { archived = true; status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const restore = touchPlaced(path.join(h.dir('Z'), `local_${SOURCE}.json`))
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths).finally(restore)
+  assert.equal(result.ok, false)
+  assert.equal(archived, false)
+  assert.match(result.receipt.failed.findLast(row => !row.cloudAccount).error, /desktop changed during the move/)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.deepEqual(await readdir(h.dir('Z')), [])
+})
+
+test('Undo stages the matching cloud identity before changing local records', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord())
+  let status = 'active'
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_identity', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(result.ok, true)
+  const wrong = { ...cloud, account: h.acct.Q, org: h.org.Q }
+  const staged = await undo(h.paths, { cloud: wrong })
+  assert.deepEqual(staged.pendingUndo, [from.email])
+  assert.equal(status, 'archived')
+  assert.ok(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)))
+})
+
+test('Undo checks an activated target before restoring its cloud mirror', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  let unarchived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_changed', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { unarchived = true; status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  const targetFile = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const changed = JSON.parse(await readFile(targetFile, 'utf8'))
+  changed.permissionMode = 'changed after move'
+  await writeFile(targetFile, JSON.stringify(changed))
+
+  const refused = await undo(h.paths, { cloud })
+  assert.match(refused.restoreProblems[0], /activated target record changed/)
+  assert.equal(unarchived, false)
+  assert.equal(status, 'archived')
+})
+
+test('interrupted target activation restoration resumes when the prior state is already present', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_activation_resume', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  const targetFile = path.join(h.dir('Z'), `local_${SOURCE}.json`)
+  const target = JSON.parse(await readFile(targetFile, 'utf8'))
+  await writeFile(targetFile, JSON.stringify({ ...target, isArchived: true }))
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  receipt.undoing = []
+  delete receipt.remoteUndoing
+  status = 'active'
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const recovered = await undo(h.paths, { cloud })
+  assert.ok(recovered.dest)
+  assert.equal(JSON.parse(await readFile(targetFile, 'utf8')).isArchived, true)
+})
+
+test('a connected Remote Control session is never archived or locally activated', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let archived = false
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_busy', title: `Session ${SOURCE.slice(-3)}` })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState('active', { connection_status: 'connected' }),
+    archive: async () => { archived = true },
+    unarchive: async () => {}
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(result.pendingCloud, 1)
+  assert.equal(result.receipt.failed.length, 0)
+  assert.equal(result.receipt.cloudChecks[0].status, 'waiting')
+  assert.equal(archived, false)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
+})
+
+test('an interrupted Remote Control archive is recovered from server state', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  let first = true
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_interrupted', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived'; if (first) { first = false; throw new Error('connection lost after archive') } },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud })
+  const interrupted = await move(inv, to, h.paths)
+  assert.equal(interrupted.ok, false)
+  assert.ok(interrupted.receipt.remotePending)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, false)
+  const recovered = await move(inv, to, h.paths)
+  assert.equal(recovered.recoveryRequired, true)
+  const receipt = JSON.parse(await readFile(interrupted.file, 'utf8'))
+  assert.equal(receipt.remotePending, undefined)
+  assert.equal(receipt.remote.length, 1)
+  assert.ok((await undo(h.paths, { cloud })).dest)
+  assert.equal(status, 'active')
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8')).isArchived, true)
+})
+
+test('an interrupted unapplied archive leaves a tagged failure that retry clears', async () => {
+  const h = await home()
+  const entries = [entry('user', 41, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('Z', SOURCE, rehomeRecord({ isArchived: true }))
+  let status = 'active'
+  let interrupt = true
+  const cloud = {
+    account: h.acct.P,
+    org: h.org.P,
+    list: async () => [remoteSession({ id: 'cse_unapplied', title: `Session ${SOURCE.slice(-3)}`, status })],
+    eventRows: async () => remoteRows(entries),
+    session: async () => remoteState(status, { id: 'cse_unapplied' }),
+    archive: async () => {
+      if (interrupt) throw new Error('connection failed before archive')
+      status = 'archived'
+    },
+    unarchive: async () => { status = 'active' }
+  }
+  const all = await accounts(h.paths)
+  const from = all.find((account) => account.account === h.acct.P && account.org === h.org.P)
+  const to = all.find((account) => account.account === h.acct.Z && account.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud, cloudRequested: true })
+  const interrupted = await move(inv, to, h.paths)
+  assert.ok(interrupted.receipt.remotePending)
+
+  const recovered = await move(inv, to, h.paths)
+  assert.equal(recovered.recoveryRequired, true)
+  interrupt = false
+  const retried = await finishPending(h.paths, { cloud })
+  assert.equal(retried.ok, true)
+  assert.equal(retried.complete, true)
+  assert.equal(retried.receipt.failed.length, 0)
+  assert.equal(status, 'archived')
+})
+
+async function taskFamilyFixture(enabled = false, taskCount = 2, eventCount = 1, twins = false) {
+  const h = await home(), run = id(701), second = id(702), cold = id(703)
+  const runs = [run, second].slice(0, taskCount)
+  const tasks = runs.map((sid, index) => ({ id: `task_${index}`, notifySessionId: `local_${SOURCE}`,
+    enabled, fireAt: 123456 + index, filePath: path.join(h.root, '.claude', 'scheduled-tasks', `task_${index}`, 'SKILL.md'), createdAt: 123,
+    lastRunAt: '2026-09-01T00:00:00Z', lastScheduledFor: '2026-09-01T00:00:00Z' }))
+  for (const task of tasks) {
+    await mkdir(path.dirname(task.filePath), { recursive: true })
+    await writeFile(task.filePath, `---\nname: ${task.id}\n---\nSynthetic reminder prompt\n`)
+  }
+  for (const [index, sid] of [SOURCE, ...runs, cold].entries()) {
+    await h.write(sid, branchEntries(eventCount, sid, 80 + index * eventCount))
+    await h.record('P', sid, rehomeRecord(runs.includes(sid) ? { scheduledTaskId: tasks[index - 1].id, notifySessionId: `local_${SOURCE}` } : {}))
+  }
+  const skips = Object.fromEntries(tasks.map(task => [task.id, [{ at: '2026-09-02T00:00:00Z', reason: 'app_closed' }]]))
+  const retries = { task_0: { slot: '2026-09-02T00:00:00Z', attempts: 2, notBefore: '2026-09-02T00:05:00Z' } }
+  const unrelatedSkips = { unrelated_task: [{ at: '2026-09-01T01:00:00Z', reason: 'missed' }] }
+  const unrelatedRetries = { unrelated_task: { slot: '2026-09-01T01:00:00Z', attempts: 1, notBefore: '2026-09-01T01:05:00Z' } }
+  const sourceRegistry = { scheduledTasks: tasks, recordedSkips: { ...skips, ...unrelatedSkips }, runRetries: { ...retries, ...unrelatedRetries }, sundayAliasBoundaryStamped: true,
+    dayFieldsOrBoundaryStamped: false, future: { preserved: 'source' } }
+  const targetRegistry = { scheduledTasks: [{ id: 'unrelated_task', enabled: true, cronExpression: '0 0 * * *', filePath: '/tmp/fixture/other.md' }],
+    recordedSkips: { other_task: [{ at: '2026-09-03T00:00:00Z', reason: 'disabled' }] }, runRetries: { other_task: { slot: '2026-09-03T00:00:00Z', attempts: 3, notBefore: '2026-09-03T00:10:00Z' } }, future: { preserved: 'target' } }
+  const sourceAfter = { ...sourceRegistry, scheduledTasks: [], recordedSkips: unrelatedSkips, runRetries: unrelatedRetries }
+  const targetAfter = { ...targetRegistry, scheduledTasks: [...targetRegistry.scheduledTasks, ...tasks], recordedSkips: { ...targetRegistry.recordedSkips, ...skips }, runRetries: { ...targetRegistry.runRetries, ...retries } }
+  if (twins) targetRegistry.scheduledTasks.unshift(...tasks.map(task => ({ ...task, enabled: false, notifySessionId: `local_${id(799)}`, lastRunAt: '2026-08-24T00:00:00Z' })))
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  await writeFile(sourceFile, JSON.stringify(sourceRegistry))
+  await writeFile(targetFile, JSON.stringify(targetRegistry))
+  const selection = async () => {
+    const all = await accounts(h.paths, [])
+    return { from: all.find(row => row.account === h.acct.P), to: all.find(row => row.account === h.acct.T) }
+  }
+  return { ...h, run, second, cold, tasks, sourceRegistry, targetRegistry, sourceAfter, targetAfter, sourceFile, targetFile, selection }
+}
+
+async function taskHistoryFixture(count = 2) {
+  const h = await home(), sessions = Array.from({ length: count }, (_, index) => id(1000 + index)), taskId = 'deleted-task'
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  const registry = { scheduledTasks: [{ id: 'unrelated-task', enabled: true }], future: { preserved: true } }
+  for (const [index, sid] of sessions.entries()) {
+    await h.write(sid, [entry('user', 2000 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord({ scheduledTaskId: taskId, isArchived: true }))
+  }
+  for (const file of [sourceFile, targetFile]) await writeFile(file, JSON.stringify(registry))
+  const selection = async () => {
+    const all = await accounts(h.paths, [])
+    return { from: all.find(row => row.account === h.acct.P), to: all.find(row => row.account === h.acct.T) }
+  }
+  return { ...h, sessions, taskId, registry, sourceFile, targetFile, selection }
+}
+
+test('archived runs of a deleted routine move cold before any restart and undo without recreating it', async () => {
+  const h = await taskHistoryFixture(167), { from, to } = await h.selection(), mock = taskHarness()
+  const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  const registries = await Promise.all([h.sourceFile, h.targetFile].map(file => readFile(file)))
+  const result = await executeMove([from], to, h.paths, { io: mock.io })
+  assert.equal(result.plan, undefined)
+  assert.equal(result.ok, true, JSON.stringify(result.receipt.failed))
+  assert.equal(result.receipt.sessions.length, 167)
+  assert.equal(result.receipt.superseded.filter(row => row.source).length, 167)
+  assert.equal(result.receipt.taskTransfers, undefined)
+  assert.deepEqual(mock.calls, [])
+  assert.deepEqual(await Promise.all([h.sourceFile, h.targetFile].map(file => readFile(file))), registries)
+  assert.deepEqual((await readdir(h.dir('P'))).filter(name => name.startsWith('local_')), [])
+  for (const sid of h.sessions) {
+    const record = JSON.parse(await readFile(path.join(h.dir('T'), `local_${sid}.json`)))
+    assert.equal(record.scheduledTaskId, h.taskId)
+    assert.equal(record.isArchived, true)
+  }
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+})
+
+test('fork-linked runs of a deleted routine keep the historical family route', async () => {
+  const h = await taskHistoryFixture(), [first, second] = h.sessions, mock = taskHarness()
+  await h.record('P', second, rehomeRecord({ scheduledTaskId: h.taskId, isArchived: true, forkedFromSessionId: `local_${first}` }))
+  const { from, to } = await h.selection(), before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  const registries = await Promise.all([h.sourceFile, h.targetFile].map(file => readFile(file)))
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  assert.equal(planned.plan.held.length, 2)
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token })
+  assert.equal(result.ok, true, JSON.stringify(result.receipt.failed))
+  assert.deepEqual(result.receipt.sessions.map(row => row.id).sort(), [first, second].sort())
+  assert.deepEqual(result.receipt.taskTransfers[0].tasks, [])
+  assert.deepEqual(await Promise.all([h.sourceFile, h.targetFile].map(file => readFile(file))), registries)
+  assert.deepEqual((await readdir(h.dir('P'))).filter(name => name.startsWith('local_')), [])
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+})
+
+test('deleted task history retains missing-member, scheduler-state and ownership guards', async () => {
+  for (const scenario of ['unarchived', 'notification', 'missing history', 'unreadable source', 'unreadable target', 'source registry', 'target registry', 'target task', 'target notification', 'mixed registration', 'source skips', 'target retries', 'worker']) {
+    const h = await taskHistoryFixture(), first = h.sessions[0]
+    if (scenario === 'unarchived') await h.record('P', first, rehomeRecord({ scheduledTaskId: h.taskId }))
+    if (scenario === 'notification') await h.record('P', first, rehomeRecord({ scheduledTaskId: h.taskId, isArchived: true, notifySessionId: `local_${h.sessions[1]}` }))
+    if (scenario === 'missing history') await unlink(path.join(h.project, `${first}.jsonl`))
+    if (scenario.startsWith('unreadable')) await writeFile(path.join(h.dir(scenario === 'unreadable source' ? 'P' : 'T'), `local_${id(799)}.json`), '{broken')
+    if (scenario.endsWith('registry')) await writeFile(scenario === 'source registry' ? h.sourceFile : h.targetFile, '{broken')
+    if (scenario === 'target task') await writeFile(h.targetFile, JSON.stringify({ scheduledTasks: [{ id: h.taskId, enabled: false }] }))
+    if (scenario === 'target notification') await writeFile(h.targetFile, JSON.stringify({ scheduledTasks: [{ id: 'other-task', notifySessionId: `local_${first}` }] }))
+    if (scenario === 'mixed registration') {
+      await writeFile(h.sourceFile, JSON.stringify({ scheduledTasks: [{ id: 'active-task', enabled: true }] }))
+      await h.record('P', first, rehomeRecord({ scheduledTaskId: 'active-task', isArchived: true, forkedFromSessionId: `local_${h.sessions[1]}` }))
+    }
+    if (scenario === 'source skips') await writeFile(h.sourceFile, JSON.stringify({ ...h.registry, recordedSkips: { [h.taskId]: [] } }))
+    if (scenario === 'target retries') await writeFile(h.targetFile, JSON.stringify({ ...h.registry, runRetries: { [h.taskId]: {} } }))
+    const { from, to } = await h.selection(), before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: scenario === 'worker' ? [{ ...desktopFixture(first)[1], desktopPid: null }] : [] })
+    if (scenario.startsWith('unreadable')) {
+      const result = await move(inv, to, h.paths)
+      assert.equal(result.ok, false)
+      assert.equal(result.receipt.sessions.length, scenario === 'unreadable target' ? 2 : 0, scenario)
+      if (scenario === 'unreadable target') continue
+    } else if (['missing history', 'worker', 'unarchived', 'target notification'].includes(scenario)) {
+      assert.deepEqual(inv.move.map(row => row.id), [h.sessions[1]], scenario)
+      assert.ok([...inv.missing, ...inv.blocked].some(row => row.id === first), scenario)
+    } else {
+      assert.equal(inv.move.length, 0, scenario)
+      assert.ok(inv.blocked.length, scenario)
+    }
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+  }
+})
+
+test('deleted task history rechecks its registration and state before each run moves', async () => {
+  for (const scenario of ['source task', 'target task', 'new retry']) {
+    const h = await taskHistoryFixture(), { from, to } = await h.selection()
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    assert.equal(inv.move.length, 2)
+    if (scenario.endsWith('task')) await writeFile(scenario === 'source task' ? h.sourceFile : h.targetFile, JSON.stringify({ scheduledTasks: [{ id: h.taskId, enabled: true }] }))
+    if (scenario === 'new retry') await writeFile(h.sourceFile, JSON.stringify({ ...h.registry, runRetries: { [h.taskId]: {} } }))
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const result = await move(inv, to, h.paths)
+    if (scenario === 'source task') {
+      assert.equal(result.ok, true, scenario)
+      assert.equal(result.receipt.taskTransfers.length, 1, scenario)
+      continue
+    }
+    assert.equal(result.ok, false, scenario)
+    assert.equal(result.receipt.sessions.length, 0, scenario)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before, scenario)
+  }
+})
+
+test('deleted task history recovers interrupted retirement with one record per run and moves again cold', async () => {
+  const h = await taskHistoryFixture(), before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  await interruptTaskFamily(h, 'move', 'retiring')
+  assert.ok((await finishWorkflow(h.paths, { processes: [] })).reconciled)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+  const settled = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(settled.ok, true, JSON.stringify(settled.reason))
+  assert.equal(settled.summary.notMoved.length, 2)
+  const { from, to } = await h.selection(), moved = await executeMove([from], to, h.paths, { processes: [] })
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.sessions.length, 2)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+})
+
+function taskHarness(rows = [desktopFixture()[0]], reopened = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'reopened' }]) {
+  const mock = { rows, calls: [], time: 0 }
+  mock.io = { inspect: () => mock.rows, now: () => mock.time, command: async file => {
+    mock.calls.push(file)
+    mock.time += 100
+    if (file.endsWith('osascript')) await mock.beforeQuit?.()
+    mock.rows = file.endsWith('osascript') ? [] : reopened
+    return { status: 0 }
+  } }
+  return mock
+}
+
+async function fixtureSnapshot(h, directories = [h.paths.records, h.paths.pool, h.paths.state]) {
+  const files = {}
+  const visit = async dir => {
+    for (const entry of await readdir(dir, { withFileTypes: true }).catch(error => { if (error.code === 'ENOENT') return []; throw error })) {
+      const file = path.join(dir, entry.name)
+      if (entry.isDirectory()) await visit(file)
+      else if (dir !== h.paths.state || /^\d.*\.json(?:\.journal)?$/.test(entry.name)) files[file] = createHash('sha256').update(await readFile(file)).digest('hex')
+    }
+  }
+  for (const dir of directories) await visit(dir)
+  return files
+}
+
+async function taskCheckpointFixture() {
+  const h = await home(), sessions = [SOURCE, id(791)]
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  const tasks = sessions.map((sid, index) => ({ id: `task_${index + 1}`, notifySessionId: `local_${sid}`, enabled: true, fireAt: 123456 + index }))
+  const sourceRegistry = { scheduledTasks: tasks,
+    recordedSkips: Object.fromEntries(tasks.map(task => [task.id, [{ at: '2026-09-02T00:00:00Z', reason: 'app_closed' }]])),
+    runRetries: Object.fromEntries(tasks.map(task => [task.id, { slot: '2026-09-02T00:00:00Z', attempts: 2, notBefore: '2026-09-02T00:05:00Z' }])) }
+  for (const [index, sid] of sessions.entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const originalRecords = await Promise.all(sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`))))
+  await writeFile(sourceFile, JSON.stringify(sourceRegistry))
+  return { ...h, sessions, tasks, sourceFile, targetFile, sourceRegistry, originalRecords }
+}
+
+async function checkpointAccountsFixture() {
+  const h = await taskCheckpointFixture()
+  await interruptTaskFamily({ ...h, interruptAfter: 2 }, 'move', 'source')
+  const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+  const original = await readFile(file), receipt = JSON.parse(original)
+  assert.equal(receipt.taskTransfers.length, 2)
+  assert.deepEqual([receipt.appendCheckpoint.sessions, receipt.appendCheckpoint.superseded, receipt.appendCheckpoint.taskTransfers], [1, 1, 1])
+  receipt.appendCheckpoint.taskTransfers = 0
+  await writeFile(file, JSON.stringify(receipt))
+  const before = await fixtureSnapshot(h)
+  const discovered = (await accounts(h.paths, [])).map(row => [row.account, row.org, row.sessions.length, row.unreadable.length])
+  const corrupted = await cli(h.root, ['accounts', '--json'])
+  assert.equal(corrupted.code, 0, corrupted.stderr)
+  assert.equal(lines(corrupted.stdout).length, 1)
+  const listed = lines(corrupted.stdout)[0]
+  assert.equal(listed.length, 4)
+  assert.deepEqual(listed.map(row => [row.account, row.org, row.sessions, row.unreadable]), discovered)
+  for (const row of listed) {
+    assert.deepEqual(row.recoveryProblem, { receipt: file, error: 'invalid append checkpoint' })
+    assert.equal(row.pending, null)
+    assert.equal(row.pendingAction, null)
+  }
+  assert.deepEqual(await fixtureSnapshot(h), before)
+  await writeFile(file, original)
+  const repairedBefore = await fixtureSnapshot(h)
+  const repaired = await cli(h.root, ['accounts', '--json'])
+  assert.equal(repaired.code, 0, repaired.stderr)
+  const restored = lines(repaired.stdout)[0]
+  assert.ok(restored.every(row => row.recoveryProblem === null))
+  assert.deepEqual(restored.filter(row => row.pending).map(row => [row.account, row.pending, row.pendingAction, row.receipt]), [[h.acct.P, 'recovery', 'finish', file]])
+  assert.deepEqual(await fixtureSnapshot(h), repairedBefore)
+  return { corrupted: corrupted.stdout.trim(), repaired: repaired.stdout.trim() }
+}
+
+test('CLI accounts reports checkpoint corruption without changing recovery data', async () => {
+  await checkpointAccountsFixture()
+})
+
+test('Undo validates every supplied approval before changing records or receipts', async () => {
+  for (const scenario of ['stale receipt', 'invalid', 'empty', 'wrong operation', 'consumed', 'stopped scheduler', 'pending recovery']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    const moved = await executeMove([from], to, h.paths, { processes: [] })
+    const mock = taskHarness(), { calls, io } = mock
+    const planned = await (scenario === 'wrong operation' ? executeMove(null, null, h.paths, { io }) : undo(h.paths, { io }))
+    assert.ok(planned.plan, scenario)
+    assert.equal(planned.plan.receiptFile, scenario === 'wrong operation' ? null : moved.file)
+    if (scenario === 'consumed') assert.ok((await undo(h.paths, { io, approve: planned.plan.token })).dest)
+    if (['stale receipt', 'consumed'].includes(scenario)) {
+      const sid = id(798)
+      await h.write(sid, branchEntries(1, sid, 600))
+      await h.record('Q', sid, rehomeRecord())
+      const all = await accounts(h.paths, [])
+      assert.equal((await executeMove([all.find(row => row.account === h.acct.Q)], all.find(row => row.account === h.acct.T), h.paths, { processes: [] })).ok, true)
+    }
+    if (scenario === 'pending recovery') {
+      const receipt = JSON.parse(await readFile(moved.file))
+      receipt.finalizing = true
+      await writeFile(moved.file, JSON.stringify(receipt))
+    }
+    if (scenario === 'stopped scheduler') mock.rows = []
+    calls.length = 0
+    const before = await fixtureSnapshot(h)
+    const refused = await undo(h.paths, { io, approve: scenario === 'empty' ? '' : scenario === 'invalid' || scenario === 'pending recovery' ? '0'.repeat(64) : planned.plan.token })
+    assert.equal(refused.ok, false, scenario)
+    assert.match(refused.reason, /approval|receipt changed|Open Claude sessions changed/, scenario)
+    assert.deepEqual(await fixtureSnapshot(h), before, scenario)
+    assert.equal(calls.some(file => file.endsWith('osascript')), false, scenario)
+  }
+})
+
+test('task approval tokens reject empty and malformed values without file mutations through API and CLI', async () => {
+  for (const operation of ['move', 'finish', 'undo', 'restart', 'idle finish', 'held finish']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection(), { io, calls } = taskHarness([])
+    if (operation === 'finish') await interruptTaskFamily(h, 'move', 'target')
+    if (operation === 'undo' || operation === 'held finish') await executeMove([from], to, h.paths, { processes: operation === 'undo' ? [] : desktopFixture(), moveOnly: true })
+    const command = operation === 'move' ? ['--from', 'p@example.com', '--to', 't@example.com'] : [operation.endsWith('finish') ? 'finish' : operation]
+    const before = await fixtureSnapshot(h, [h.root])
+    for (const approve of ['', 'invalid']) {
+      const options = { io, processes: [], approve }
+      const result = await (operation.endsWith('finish') ? finishWorkflow(h.paths, options) : operation === 'undo' ? undo(h.paths, options) : executeMove(operation === 'move' ? [from] : null, operation === 'move' ? to : null, h.paths, options))
+      assert.deepEqual(result, { ok: false, code: 'RESTART_APPROVAL_CHANGED', reason: 'Restart approval is missing or does not match the saved plan' }, operation)
+      assert.deepEqual(await fixtureSnapshot(h, [h.root]), before, operation)
+      const rejected = await cli(h.root, [...command, '--restart-approved', approve, '--json'])
+      assert.equal(rejected.code, 1, operation)
+      assert.match(rejected.stderr, /restart approval token must be the one displayed by the engine/, operation)
+      assert.equal(lines(rejected.stdout).find(row => row.done)?.code, 'COMMAND_FAILED', operation)
+      assert.deepEqual(await fixtureSnapshot(h, [h.root]), before, operation)
+      assert.deepEqual(calls, [], operation)
+    }
+  }
+})
+
+test('Undo rechecks its receipt under the lock between preflight and restart planning', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), sid = id(798)
+  await executeMove([from], to, h.paths, { processes: [] })
+  await h.write(sid, branchEntries(1, sid, 600))
+  await h.record('Q', sid, rehomeRecord())
+  const all = await accounts(h.paths, []), original = fs.mkdir
+  let entries = 0, before, rows = [desktopFixture()[0]]
+  fs.mkdir = async (...args) => {
+    if (args[0] === h.paths.state && ++entries === 2) {
+      const next = await executeMove([all.find(row => row.account === h.acct.Q)], all.find(row => row.account === h.acct.T), h.paths, { processes: [] })
+      assert.equal(next.ok, true)
+      before = await fixtureSnapshot(h)
+      rows = []
+    }
+    return original(...args)
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await undo(h.paths, { io: { inspect: () => rows, command: async () => assert.fail('stale receipt must not restart') } }) }
+  finally { fs.mkdir = original; syncBuiltinESMExports() }
+  assert.ok(before)
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /receipt changed/)
+  assert.deepEqual(await fixtureSnapshot(h), before)
+})
+
+test('task recovery scopes validation, restart and accounts to the unfinished family', async () => {
+  for (const active of ['T', 'Q']) {
+    const h = await taskFamilyFixture()
+    h.tasks[1].notifySessionId = `local_${h.second}`
+    await h.record('P', h.second, rehomeRecord({ scheduledTaskId: h.tasks[1].id, notifySessionId: `local_${h.second}` }))
+    for (const sid of [SOURCE, h.run]) await rename(path.join(h.dir('P'), `local_${sid}.json`), path.join(h.dir('Q'), `local_${sid}.json`))
+    const firstRegistry = { scheduledTasks: [h.tasks[0]], recordedSkips: { task_0: h.sourceRegistry.recordedSkips.task_0 }, runRetries: { task_0: h.sourceRegistry.runRetries.task_0 } }
+    await writeFile(path.join(h.dir('Q'), 'scheduled-tasks.json'), JSON.stringify(firstRegistry))
+    h.sourceRegistry.scheduledTasks = [h.tasks[1]]
+    delete h.sourceRegistry.recordedSkips.task_0
+    delete h.sourceRegistry.runRetries.task_0
+    await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+    h.sourceAccounts = [h.acct.Q, h.acct.P]
+    await interruptTaskFamily(h, 'move', 'source')
+    const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+    const interrupted = JSON.parse(await readFile(file))
+    assert.equal(interrupted.taskTransfers.length, 2)
+    assert.equal(interrupted.appendCheckpoint.taskTransfers, 1)
+    const target = JSON.parse(await readFile(h.targetFile)), completed = target.scheduledTasks.find(task => task.id === 'task_0')
+    completed.enabled = true
+    completed.lastRunAt = '2026-09-10T00:00:00Z'
+    await writeFile(h.targetFile, JSON.stringify(target))
+    const originals = await Promise.all([SOURCE, h.run].map(sid => readFile(path.join(h.dir('T'), `local_${sid}.json`))))
+    const badge = lines((await cli(h.root, ['accounts', '--json'])).stdout).at(-1)
+    assert.deepEqual(badge.filter(row => row.pending).map(row => row.account), [h.acct.P])
+    const f = await identityFixture(h)
+    await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct[active] }))
+    await f.write(f.init(1, h.acct[active], h.org[active]))
+    const { calls, io } = taskHarness(f.processes, f.processes)
+    let result = await finishWorkflow(h.paths, { io })
+    if (active === 'T') {
+      assert.ok(result.plan)
+      assert.equal(result.plan.kind, 'recover')
+      result = await finishWorkflow(h.paths, { io, approve: result.plan.token })
+      assert.equal(result.restarted, true)
+    } else {
+      assert.equal(result.plan, undefined)
+      assert.deepEqual(calls, [])
+    }
+    assert.equal(result.recoveryRequired, true)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), target)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(await Promise.all([SOURCE, h.run].map(sid => readFile(path.join(h.dir('T'), `local_${sid}.json`)))), originals)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${h.second}.json`)))
+    const receipt = JSON.parse(await readFile(file))
+    assert.equal(receipt.taskTransfers.length, 1)
+    assert.equal(receipt.finalizing, false)
+    const before = await fixtureSnapshot(h)
+    const refused = await undo(h.paths, { processes: [] })
+    assert.match(refused.restoreProblems.join(' '), /registrations changed/)
+    assert.deepEqual(await fixtureSnapshot(h), before)
+  }
+})
+
+test('mutation spies distinguish read-only and mutating open flags', () => {
+  for (const flags of [undefined, 'r', 'rs', 'sr', fsSync.constants.O_RDONLY, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW]) assert.equal(mutatingOpen(flags), false, String(flags))
+  for (const flags of ['r+', 'rs+', 'sr+', 'w', 'wx', 'w+', 'wx+', 'a', 'ax', 'a+', 'ax+', 'as', 'as+',
+    fsSync.constants.O_WRONLY, fsSync.constants.O_RDWR, fsSync.constants.O_CREAT, fsSync.constants.O_TRUNC, fsSync.constants.O_APPEND,
+    fsSync.constants.O_RDWR | fsSync.constants.O_NOFOLLOW, fsSync.constants.O_CREAT | fsSync.constants.O_EXCL]) assert.equal(mutatingOpen(flags), true, String(flags))
+})
+
+test('task checkpoint integrity refuses corruption before recovery writes or restart', async t => {
+  const checkpoints = [
+    ['inconsistent zero', { taskTransfers: 0 }],
+    ['missing offset', { taskTransfers: undefined }],
+    ['null offset', { taskTransfers: null }],
+    ['negative offset', { taskTransfers: -1 }],
+    ['fractional offset', { taskTransfers: 0.5 }],
+    ['out-of-range offset', { taskTransfers: 3 }],
+    ['uncommitted family offset', { taskTransfers: 2 }],
+    ['missing committed records', { sessions: 0 }],
+    ['missing committed retirement', { superseded: 0 }],
+    ['valid checkpoint', {}]
+  ]
+  for (const mode of ['stopped Desktop', 'approved restart']) for (const [scenario, patch] of checkpoints) await t.test(`${scenario}, ${mode}`, async () => {
+    const h = await taskCheckpointFixture(), { sessions, tasks, sourceFile, targetFile, sourceRegistry, originalRecords } = h
+    await interruptTaskFamily({ ...h, interruptAfter: 2 }, 'move', 'source')
+    const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+    const interrupted = JSON.parse(await readFile(file)), checkpoint = interrupted.appendCheckpoint
+    assert.equal(interrupted.finalizing, true)
+    assert.deepEqual([checkpoint.sessions, checkpoint.superseded, checkpoint.taskTransfers], [1, 1, 1])
+    assert.equal(interrupted.taskTransfers.length, 2)
+    const targetBefore = await readFile(targetFile), firstRecord = await readFile(path.join(h.dir('T'), `local_${sessions[0]}.json`))
+    assert.deepEqual(JSON.parse(targetBefore).scheduledTasks, [tasks[0]])
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)).scheduledTasks, [])
+    const { calls, io } = taskHarness(mode === 'approved restart' ? [desktopFixture()[0]] : [])
+    const planned = mode === 'approved restart' ? await finishWorkflow(h.paths, { io }) : null
+    if (planned) assert.equal(planned.plan.kind, 'recover')
+    const options = { io, processes: [], ...(planned ? { approve: planned.plan.token } : {}) }
+    const planFile = path.join(h.paths.state, 'restart-plan.json'), planBefore = await readFile(planFile).catch(() => null)
+    if (scenario !== 'valid checkpoint') {
+      await writeFile(file, JSON.stringify({ ...interrupted, appendCheckpoint: { ...checkpoint, ...patch } }))
+      const before = await fixtureSnapshot(h), writes = []
+      const originals = new Map(['writeFile', 'appendFile', 'open', 'rename', 'link', 'unlink', 'rm'].map(key => [key, fs[key]]))
+      for (const [key, original] of originals) fs[key] = async (...args) => { if (key !== 'open' || mutatingOpen(args[1])) writes.push(key); return original(...args) }
+      syncBuiltinESMExports()
+      try {
+        await assert.rejects(finishWorkflow(h.paths, options), /invalid append checkpoint/)
+        await assert.rejects(planned
+          ? executeMove(null, null, h.paths, { ...options, recover: true, receiptFile: file })
+          : finishPending(h.paths, options), /invalid append checkpoint/)
+      } finally {
+        for (const [key, original] of originals) fs[key] = original
+        syncBuiltinESMExports()
+      }
+      assert.deepEqual(writes, [])
+      assert.deepEqual(calls, [])
+      assert.deepEqual(await fixtureSnapshot(h), before)
+      assert.deepEqual(await readFile(planFile).catch(() => null), planBefore)
+      const retained = JSON.parse(await readFile(file))
+      assert.equal(retained.finalizing, true)
+      assert.equal(retained.taskTransfers.length, 2)
+      retained.appendCheckpoint = checkpoint
+      await writeFile(file, JSON.stringify(retained))
+    }
+    const recovered = await finishWorkflow(h.paths, options)
+    assert.equal(recovered.recoveryRequired, true)
+    assert.deepEqual(calls, planned ? ['/usr/bin/osascript', '/usr/bin/open'] : [])
+    if (planned) assert.equal(recovered.restarted, true)
+    const receipt = JSON.parse(await readFile(file))
+    assert.equal(receipt.finalizing, false)
+    assert.equal(receipt.appendCheckpoint, undefined)
+    assert.deepEqual(receipt.sessions.map(row => row.id), [sessions[0]])
+    assert.equal(receipt.superseded.length, 1)
+    assert.equal(receipt.taskTransfers.length, 1)
+    assert.deepEqual(await readFile(targetFile), targetBefore)
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)), { scheduledTasks: [tasks[1]],
+      recordedSkips: { task_2: sourceRegistry.recordedSkips.task_2 }, runRetries: { task_2: sourceRegistry.runRetries.task_2 } })
+    assert.deepEqual(await readFile(path.join(h.dir('T'), `local_${sessions[0]}.json`)), firstRecord)
+    assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${sessions[1]}.json`)), originalRecords[1])
+    assert.equal(await stat(path.join(h.dir('P'), `local_${sessions[0]}.json`)).catch(() => null), null)
+    assert.equal(await stat(path.join(h.dir('T'), `local_${sessions[1]}.json`)).catch(() => null), null)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(sourceFile)), sourceRegistry)
+    assert.deepEqual(await Promise.all(sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), originalRecords)
+    assert.equal(await stat(targetFile).catch(() => null), null)
+  })
+})
+
+test('task checkpoint integrity keeps interrupted Undo scoped to the whole receipt', async () => {
+  const h = await taskCheckpointFixture(), all = await accounts(h.paths, [])
+  const moved = await executeMove([all.find(row => row.account === h.acct.P)], all.find(row => row.account === h.acct.T), h.paths, { processes: [] })
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.taskTransfers.length, 2)
+  await interruptTaskFamily(h, 'undo', 'target')
+  const receipt = JSON.parse(await readFile(moved.file))
+  assert.ok(receipt.undoing)
+  receipt.appendCheckpoint = { sessions: 1, superseded: 1, taskTransfers: 1, held: [] }
+  await writeFile(moved.file, JSON.stringify(receipt))
+  assert.ok((await finishWorkflow(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(await Promise.all(h.sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), h.originalRecords)
+  assert.equal(await stat(h.targetFile).catch(() => null), null)
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('task preflight refuses absent sources and unreadable destination data', async () => {
+  for (const scenario of ['missing source', 'unreadable source', 'unreadable target', 'denied target']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    const inv = await inventory([{ ...from, sessions: from.sessions.filter(row => row.id !== h.cold) }], to, h.paths, () => {}, { processes: [] })
+    if (scenario === 'missing source') await fs.rm(h.dir('P'), { recursive: true })
+    if (scenario.startsWith('unreadable')) await writeFile(path.join(h.dir(scenario === 'unreadable source' ? 'P' : 'T'), `local_${id(796)}.json`), '{broken')
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), original = fs.readdir
+    if (scenario === 'denied target') {
+      fs.readdir = async (...args) => {
+        if (args[0] === h.dir('T')) throw Object.assign(new Error('fixture target access denied'), { code: 'EACCES' })
+        return original(...args)
+      }
+      syncBuiltinESMExports()
+    }
+    let result
+    try { result = await move(inv, to, h.paths) }
+    finally { fs.readdir = original; syncBuiltinESMExports() }
+    assert.equal(result.ok, false, scenario)
+    assert.equal(result.receipt.sessions.length, 0, scenario)
+    assert.ok(result.receipt.failed.length, scenario)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before, scenario)
+  }
+})
+
+test('task families preserve registration state, generated records and registry fields through Undo', async () => {
+  for (const enabled of [false, true]) {
+    const h = await taskFamilyFixture(enabled), { from, to } = await h.selection()
+    const prompts = await Promise.all(h.tasks.map(task => readFile(task.filePath)))
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    assert.equal(inv.move.length, 4)
+    const moved = await executeMove([from], to, h.paths, { processes: [] })
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions.length, 4)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceAfter)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+    assert.deepEqual(await Promise.all(h.tasks.map(task => readFile(task.filePath))), prompts)
+    assert.deepEqual(moved.receipt.taskTransfers[0].state, { recordedSkips: { task_0: h.sourceRegistry.recordedSkips.task_0, task_1: h.sourceRegistry.recordedSkips.task_1 }, runRetries: { task_0: h.sourceRegistry.runRetries.task_0 } })
+    for (const sid of [SOURCE, h.run, h.second]) {
+      const record = JSON.parse(await readFile(path.join(h.dir('T'), `local_${sid}.json`)))
+      assert.equal(record.cliSessionId, sid)
+      assert.equal(record.sessionId, `local_${sid}`)
+      if (sid !== SOURCE) assert.equal(record.notifySessionId, `local_${SOURCE}`)
+    }
+    if (!enabled) {
+      const legacy = structuredClone(moved.receipt)
+      for (const family of legacy.taskTransfers) delete family.replaced
+      await writeFile(moved.file, JSON.stringify(legacy))
+    }
+    const undone = await undo(h.paths, { processes: [] })
+    assert.ok(undone.dest)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+    assert.deepEqual(await Promise.all(h.tasks.map(task => readFile(task.filePath))), prompts)
+    for (const sid of [SOURCE, h.run, h.second, h.cold]) assert.ok(await readFile(path.join(h.dir('P'), `local_${sid}.json`)))
+  }
+})
+
+test('stale task twins replace once and restore their positions and state without losing later edits', async () => {
+  for (const identical of [false, true]) {
+    const h = await taskFamilyFixture(!identical, 2, 1, true)
+    if (identical) h.targetRegistry.scheduledTasks.splice(0, 2, ...h.tasks)
+    h.targetRegistry.recordedSkips.task_0 = h.sourceRegistry.recordedSkips.task_0
+    await writeFile(h.targetFile, JSON.stringify(h.targetRegistry))
+    const { from, to } = await h.selection(), result = await executeMove([from], to, h.paths, { processes: [] })
+    assert.equal(result.ok, true, JSON.stringify({ failed: result.receipt.failed, recovery: result.reconciled, verification: result.receipt.verification }))
+    assert.equal(result.receipt.taskTransfers[0].replaced.length, 2)
+    assert.deepEqual(result.receipt.taskTransfers[0].replaced[0], { task: h.targetRegistry.scheduledTasks[0], index: 0,
+      state: { recordedSkips: { task_0: h.sourceRegistry.recordedSkips.task_0 }, runRetries: {} }, stateFields: ['recordedSkips', 'runRetries'] })
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+    const before = await readFile(h.targetFile)
+    await finishWorkflow(h.paths, { processes: [] })
+    assert.deepEqual(await readFile(h.targetFile), before)
+    const target = JSON.parse(before)
+    target.future.later = 'kept'
+    target.scheduledTasks.push({ id: 'later_task', enabled: false })
+    await writeFile(h.targetFile, JSON.stringify(target))
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), { ...h.targetRegistry, future: target.future, scheduledTasks: [...h.targetRegistry.scheduledTasks, target.scheduledTasks.at(-1)] })
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('stale task twins refuse each unsafe condition and recheck changes before publication', async () => {
+  for (const reason of ['enabled', 'cronExpression', 'notification record exists', 'record dependency', 'records unreadable', 'recordedSkips', 'runRetries']) {
+    const h = await taskFamilyFixture(true, 1, 1, true), twin = h.targetRegistry.scheduledTasks[0]
+    if (reason === 'enabled') twin.enabled = true
+    if (reason === 'cronExpression') twin.cronExpression = 'changed'
+    if (reason === 'notification record exists') await h.record('T', id(799))
+    if (reason === 'record dependency') await h.record('T', id(798), { notifySessionId: twin.notifySessionId })
+    if (reason === 'records unreadable') await writeFile(path.join(h.dir('T'), `local_${id(798)}.json`), '{broken')
+    if (['recordedSkips', 'runRetries'].includes(reason)) h.targetRegistry[reason].task_0 = { different: true }
+    await writeFile(h.targetFile, JSON.stringify(h.targetRegistry))
+    const { from, to } = await h.selection(), inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    assert.deepEqual(inv.move.map(row => row.id), [h.cold])
+    assert.ok(inv.blocked.every(row => row.error.includes(reason)), reason)
+  }
+  for (const late of ['enabled', 'record']) {
+    const h = await taskFamilyFixture(true, 1, 1, true), { from, to } = await h.selection()
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    if (late === 'enabled') h.targetRegistry.scheduledTasks[0].enabled = true
+    else await h.record('T', h.run, rehomeRecord({ scheduledTaskId: h.tasks[0].id, notifySessionId: h.tasks[0].notifySessionId }))
+    await writeFile(h.targetFile, JSON.stringify(h.targetRegistry))
+    const result = await move(inv, to, h.paths)
+    assert.equal(result.ok, false)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+  }
+})
+
+async function refusalFixture(mixed = false) {
+  const h = await taskFamilyFixture(true, 2, 1, true), investor = id(750), recordId = `local_${id(751)}`
+  h.targetRegistry.scheduledTasks[0].enabled = true
+  await writeFile(h.targetFile, JSON.stringify(h.targetRegistry))
+  const rich = entry('user', 750, null, investor, { toolUseResult: { invented: 'first' } })
+  await h.write(investor, [rich, { ...rich, toolUseResult: { invented: 'different' } }])
+  await h.record('P', investor, rehomeRecord({ sessionId: recordId, title: 'Same title', bridgeSessionIds: ['session_investor'] }))
+  const record = path.join(h.dir('P'), `${recordId}.json`)
+  await rename(path.join(h.dir('P'), `local_${investor}.json`), record)
+  for (let at = 0; at < 6; at++) {
+    const sid = id(760 + at)
+    await h.write(sid, [entry('user', 760 + at, null, sid)])
+    await h.record('P', sid, rehomeRecord({ forkedFromSessionId: recordId }))
+  }
+  const cloud = cloudFixture(h, { list: async () => ['cse_investor', ...(mixed ? ['cse_unrelated'] : [])].map(id => remoteSession({ id, title: 'Same title' })), eventRows: async () => remoteRows([rich]) })
+  const { from, to } = await h.selection()
+  const result = await executeMove([from], to, h.paths, { processes: [], cloud, cloudRequested: true })
+  return { ...h, investor, recordId, investorFile: record, cloud, result }
+}
+
+test('receipt summaries count source records by cause and cloud links only by bridge identity', async () => {
+  for (const mixed of [false, true]) {
+    const h = await refusalFixture(mixed), { result } = h
+    assert.equal(result.summary.moved, 1)
+    assert.equal(result.summary.notMoved.length, 10)
+    assert.deepEqual(Object.fromEntries(result.summary.groups.map(group => [group.cause, group.records.length])), { 'history check': 1, 'waiting on parent': 6, 'task collision': 3 })
+    const investor = result.summary.notMoved.find(row => row.id === h.investor)
+    assert.equal(investor.sessionId, h.recordId)
+    assert.deepEqual(investor.remoteIds, ['session_investor'])
+    assert.equal(result.receipt.failed.find(row => row.id === 'cse_investor').blockedByLocal[0], `${h.acct.P}/${h.org.P}/${h.recordId}`)
+    assert.equal(result.receipt.failed.find(row => row.id === 'cse_unrelated')?.blockedByLocal, undefined)
+    assert.equal(result.pendingCloud, 0)
+    assert.deepEqual(result.summary.kept.map(row => row.id), mixed ? ['cse_unrelated'] : [])
+    const listed = lines((await cli(h.root, ['accounts', '--json'])).stdout)[0]
+    assert.equal(new Set(listed.map(row => row.receipt)).size, 1)
+    assert.deepEqual(listed[0].receiptSummary, result.summary)
+    assert.equal(listed.filter(row => row.pending).length, 0)
+    const refreshed = await verifyPlaced(h.paths)
+    assert.deepEqual(refreshed.summary, result.summary)
+    const finished = await finishPending(h.paths, { cloud: { ...h.cloud, list: async () => assert.fail('blocked mirror must wait for Move') } })
+    assert.equal(finished.nothing, true)
+    assert.equal(finished.receipt.failed.filter(row => row.cloudAccount).length, mixed ? 2 : 1)
+  }
+})
+
+test('mixed cloud checks keep unproven mirrors final while blocked mirrors survive Finish, Keep and Undo', async () => {
+  for (const action of ['finish', 'keep', 'undo']) {
+    const h = await refusalFixture(true), calls = []
+    assert.equal(h.result.receipt.cloudChecks[0].status, 'blocked-local')
+    if (action === 'finish') {
+      const cloud = { ...h.cloud, list: async () => [remoteSession({ id: 'cse_investor', title: 'Same title' })], eventRows: async id => { calls.push(id); return [] } }
+      const result = await finishPending(h.paths, { cloud })
+      assert.equal(result.nothing, true)
+      assert.deepEqual(calls, [])
+      assert.deepEqual(result.receipt.failed.filter(row => row.cloudAccount).map(row => row.id).sort(), ['cse_investor', 'cse_unrelated'])
+      assert.equal(result.receipt.cloudChecks[0].status, 'blocked-local')
+    } else if (action === 'keep') {
+      const result = await keepLocal(h.paths)
+      assert.equal(result.nothing, true)
+      assert.equal(result.receipt.failed.filter(row => row.cloudAccount).length, 2)
+      assert.ok(!result.receipt.cloudChecks[0].failures.some(row => row.id === 'cse_unrelated'))
+      await writeFile(h.investorFile, JSON.stringify({ ...JSON.parse(await readFile(h.investorFile)), bridgeSessionIds: [] }))
+      const next = await verifyPlaced(h.paths)
+      assert.equal(next.ok, false)
+      assert.equal(next.failed[0].id, 'cse_investor')
+    } else {
+      const result = await undo(h.paths, { processes: [] })
+      assert.ok(result.dest)
+      const saved = JSON.parse(await readFile(path.join(result.dest, 'receipt.json')))
+      assert.equal(saved.failed.filter(row => row.cloudAccount).length, 2)
+    }
+  }
+})
+
+test('Finish preserves locally blocked legacy busy mirrors while retrying independent work', async () => {
+  for (const mixed of [false, true]) {
+    const h = await refusalFixture(mixed), receipt = JSON.parse(await readFile(h.result.file))
+    const mirror = receipt.failed.find(row => row.id === 'cse_investor')
+    mirror.error = 'Remote Control history unreadable: Remote Control session is not proven disconnected and idle'
+    receipt.cloudChecks[0].failures.find(row => row.id === mirror.id).error = mirror.error
+    await writeFile(h.result.file, JSON.stringify(receipt))
+    let listed = 0, queried = 0, archived = 0
+    const cloud = { ...h.cloud,
+      list: async () => { listed++; return [remoteSession({ id: mirror.id, title: 'Same title' })] },
+      eventRows: async () => { queried++; return [] },
+      session: async () => { queried++; return remoteState('active') },
+      archive: async () => { archived++ }
+    }
+    const result = await finishWorkflow(h.paths, { processes: [], cloud })
+    assert.equal(result.complete, true)
+    assert.equal(listed, 0)
+    assert.equal(queried, 0)
+    assert.equal(archived, 0)
+    assert.deepEqual(result.receipt.failed.filter(row => row.cloudAccount && row.id === mirror.id), [mirror])
+    assert.equal(result.receipt.cloudChecks[0].status, 'blocked-local')
+    assert.equal(result.summary.notMoved.length, 10)
+  }
+})
+
+test('malformed history keeps its verified record bridge dependency and remains refused', async () => {
+  const h = await refusalFixture(), transcript = path.join(h.project, `${h.investor}.jsonl`)
+  await appendFile(transcript, '{broken\n')
+  const before = await readFile(transcript), source = await readFile(h.investorFile)
+  const result = await verifyPlaced(h.paths)
+  assert.equal(result.ok, true)
+  const receipt = JSON.parse(await readFile(h.result.file))
+  assert.deepEqual(receipt.failed.find(row => row.id === 'cse_investor').blockedByLocal, [`${h.acct.P}/${h.org.P}/${h.recordId}`])
+  assert.equal(receipt.cloudChecks[0].status, 'blocked-local')
+  assert.ok(result.summary.notMoved.some(row => row.sessionId === h.recordId))
+  const { from, to } = await h.selection()
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  assert.ok(inv.blocked.some(row => row.id === h.investor && /unparseable lines/.test(row.error)))
+  assert.ok(!inv.move.some(row => row.id === h.investor))
+  assert.deepEqual(await readFile(transcript), before)
+  assert.deepEqual(await readFile(h.investorFile), source)
+  assert.equal(await stat(path.join(h.dir('T'), `${h.recordId}.json`)).catch(() => null), null)
+})
+
+test('4.1.0 refusal projection requires unique current identity and bridge ownership with a fresh consistency check', async () => {
+  for (const scenario of ['unchanged', 'missing directory', 'ambiguous', 'unreadable', 'unreadable directory', 'vanished record', 'foreign bridge', 'malformed foreign bridge', 'malformed transcript bridge', 'changed while reading']) {
+    const h = await refusalFixture(), receipt = JSON.parse(await readFile(h.result.file))
+    for (const failure of receipt.failed) {
+      delete failure.sources
+      delete failure.blockedByLocal
+      if (failure.code === 'CLOUD_UNPROVEN') delete failure.code
+    }
+    receipt.cloudChecks[0].status = 'failed'
+    receipt.fromAccounts.push({ account: h.acct.Q, org: h.org.Q, label: 'Other source' })
+    if (scenario === 'missing directory') await fs.rm(h.dir('Q'), { recursive: true })
+    if (scenario === 'ambiguous') await h.record('Q', h.investor, rehomeRecord({ bridgeSessionIds: ['session_investor'] }))
+    if (scenario === 'unreadable') await writeFile(path.join(h.dir('P'), `local_${id(799)}.json`), '{broken')
+    if (scenario === 'vanished record') await h.record('Q', id(799))
+    if (scenario.includes('foreign bridge')) await appendFile(path.join(h.project, `${h.investor}.jsonl`), JSON.stringify({ type: 'bridge-session', bridgeSessionId: 'session_investor', ownerAccountUuid: h.acct.Q, ownerOrganizationUuid: h.org.Q }) + '\n')
+    if (scenario === 'malformed transcript bridge') {
+      await writeFile(h.investorFile, JSON.stringify({ ...JSON.parse(await readFile(h.investorFile)), bridgeSessionIds: [] }))
+      await appendFile(path.join(h.project, `${h.investor}.jsonl`), JSON.stringify({ type: 'bridge-session', bridgeSessionId: 'session_investor', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }) + '\n')
+    }
+    if (scenario.startsWith('malformed')) await appendFile(path.join(h.project, `${h.investor}.jsonl`), '{broken\n')
+    await writeFile(h.result.file, JSON.stringify(receipt))
+    const original = fs.readFile, originalReaddir = fs.readdir
+    let reads = 0
+    fs.readFile = async (...args) => {
+      if (scenario === 'vanished record' && args[0] === path.join(h.dir('Q'), `local_${id(799)}.json`)) throw Object.assign(new Error('fixture record vanished'), { code: 'ENOENT' })
+      if (scenario === 'changed while reading' && args[0] === h.investorFile && ++reads === 2) await writeFile(h.investorFile, JSON.stringify({ ...JSON.parse(await original(h.investorFile)), title: 'Changed during projection' }))
+      return original(...args)
+    }
+    fs.readdir = async (...args) => {
+      if (scenario === 'unreadable directory' && args[0] === h.dir('Q')) throw Object.assign(new Error('fixture directory unreadable'), { code: 'EACCES' })
+      return originalReaddir(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await verifyPlaced(h.paths) } finally { fs.readFile = original; fs.readdir = originalReaddir; syncBuiltinESMExports() }
+    const projected = ['unchanged', 'missing directory'].includes(scenario)
+    assert.equal(result.ok, projected, scenario)
+    const saved = JSON.parse(await readFile(h.result.file)), failure = saved.failed.find(row => row.id === h.investor)
+    assert.equal(failure.sources?.[0]?.recordSha, undefined)
+    if (projected) {
+      assert.ok(failure.sources[0].observedRecordSha)
+      assert.equal(failure.sources[0].sessionId, h.recordId)
+      assert.equal(saved.cloudChecks[0].status, 'blocked-local')
+      assert.equal(result.summary.notMoved.length, 10)
+    } else assert.equal(saved.failed.find(row => row.id === 'cse_investor').blockedByLocal, undefined)
+  }
+})
+
+test('one refusal preserves multiple source record identities without guessing missing evidence', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  for (const account of ['P', 'Q']) await h.record(account, SOURCE, rehomeRecord({ title: 'Same title' }))
+  const otherOrg = path.join(h.paths.records, h.acct.P, h.org.Q)
+  await mkdir(otherOrg, { recursive: true })
+  await writeFile(path.join(otherOrg, `local_${SOURCE}.json`), await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  await h.record('T', SOURCE, rehomeRecord({ sessionId: `local_${id(888)}` }))
+  const all = await accounts(h.paths), to = all.find(row => row.account === h.acct.T)
+  const inv = await inventory(all.filter(row => [h.acct.P, h.acct.Q].includes(row.account)), to, h.paths, () => {}, { processes: [] })
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.summary.notMoved.length, 3)
+  assert.equal(new Set(result.summary.notMoved.map(row => `${row.account}/${row.org}/${row.sessionId}`)).size, 3)
+  assert.equal(result.receipt.failed.find(row => row.sources?.length === 3).sources.length, 3)
+  const summary = receiptSummary({ failed: [{ id: SOURCE, title: 'Same title', error: 'unreadable' }] })
+  assert.equal(summary.notMoved.length, 0)
+  assert.equal(summary.attention.length, 1)
+})
+
+test('task family cloud work follows all local placements and reports the entire operation', async () => {
+  for (const scenario of ['match', 'remote changed', 'family refused']) {
+    const h = await taskFamilyFixture(false, 1, 8), { from, to } = await h.selection(), anchor = SOURCE
+    const remote = lines(await readFile(path.join(h.project, `${anchor}.jsonl`), 'utf8'))
+    let status = 'active', archived = 0, changed = false
+    const reports = []
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_task_family', title: `Session ${anchor.slice(-3)}`, status })],
+      eventRows: async () => remoteRows(changed ? [...remote, entry('user', 301, 87, 'cse_task_family')] : remote),
+      session: async () => remoteState(status),
+      archive: async () => {
+        assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+        for (const sid of [SOURCE, h.run, h.cold]) {
+          assert.ok(await readFile(path.join(h.dir('T'), `local_${sid}.json`)))
+          assert.equal(await stat(path.join(h.dir('P'), `local_${sid}.json`)).catch(() => null), null)
+        }
+        archived++
+        status = 'archived'
+      }
+    })
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [], cloud })
+    assert.equal(inv.move.length, 3)
+    assert.equal(inv.cloud.matches.length, 1)
+    assert.deepEqual(inv.cloud.blocked, [])
+    if (scenario === 'remote changed') changed = true
+    if (scenario === 'family refused') await writeFile(h.sourceFile, JSON.stringify({ ...h.sourceRegistry, scheduledTasks: [{ ...h.tasks[0], notifySessionId: `local_${id(799)}` }] }))
+    const moved = await move(inv, to, h.paths, (stage, text, extra) => reports.push({ stage, text, ...extra }))
+    assert.equal((await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name)).length, 1)
+    const succeeds = scenario === 'match'
+    assert.equal(moved.ok, succeeds, scenario)
+    assert.equal(archived, succeeds ? 1 : 0, scenario)
+    assert.equal(moved.pendingCloud, succeeds ? 0 : 1, scenario)
+    assert.equal(moved.receipt.sessions.length, scenario === 'family refused' ? 1 : 3, scenario)
+    if (succeeds) {
+      const moves = reports.filter(row => row.stage === 'move' && !row.live)
+      assert.equal(moves.length, 1)
+      assert.match(moves[0].text, /3 ✓ \| 24 events/)
+      for (const stage of ['move', 'verify', 'retire']) {
+        const progress = reports.filter(row => row.stage === stage && row.completed !== undefined)
+        const total = stage === 'retire' ? 3 : moved.receipt.sessions.length
+        assert.ok(progress.length, stage)
+        assert.ok(progress.every((row, index) => row.total === total && row.completed >= (progress[index - 1]?.completed ?? 0)), stage)
+        assert.equal(progress.at(-1).completed, total, stage)
+      }
+    } else {
+      assert.ok(moved.receipt.failed.some(row => row.cloudAccount === h.acct.P))
+      assert.match(moved.receipt.failed.map(row => row.error).join(' '), scenario === 'family refused' ? /changed since inventory|family member missing/ : /Remote Control history changed/)
+      if (scenario === 'family refused') assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    }
+  }
+})
+
+test('task family preflight errors cannot modify an earlier completed receipt', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const ordinary = { ...from, sessions: from.sessions.filter(row => row.id === h.cold) }
+  const first = await executeMove([ordinary], to, h.paths, { processes: [] })
+  const before = await readFile(first.file)
+  const fresh = await h.selection()
+  const inv = await inventory([fresh.from], fresh.to, h.paths, () => {}, { processes: [] })
+  h.sourceRegistry.scheduledTasks[0].notifySessionId = `local_${h.cold}`
+  await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+  const result = await move(inv, fresh.to, h.paths)
+  assert.equal(result.ok, false)
+  assert.notEqual(result.file, first.file)
+  assert.deepEqual(await readFile(first.file), before)
+  assert.equal(result.receipt.sessions.length, 0)
+  assert.equal(result.added ?? 0, 0)
+  assert.equal(result.targetChanged ?? false, false)
+  assert.match(result.receipt.failed.map(row => row.error).join(' '), /changed since inventory|family member missing/)
+})
+
+test('task state conflicts preserve pre-existing destination entries before and after planning', async () => {
+  for (const key of ['recordedSkips', 'runRetries']) for (const late of [false, true]) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    const planned = late ? await inventory([from], to, h.paths, () => {}, { processes: [] }) : null
+    const conflict = { ...h.targetRegistry, [key]: { ...h.targetRegistry[key], task_0: { conflict: true } } }
+    await writeFile(h.targetFile, JSON.stringify(conflict))
+    const fresh = await h.selection()
+    const result = await move(planned ?? await inventory([fresh.from], fresh.to, h.paths, () => {}, { processes: [] }), fresh.to, h.paths)
+    assert.equal(result.ok, false)
+    assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+    assert.match(result.receipt.failed.map(row => row.error).join(' '), /task state collision/)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), conflict)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('task Undo preserves identical pre-existing selected destination state', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const target = { ...h.targetRegistry, recordedSkips: { ...h.targetRegistry.recordedSkips, task_0: h.sourceRegistry.recordedSkips.task_0 } }
+  await writeFile(h.targetFile, JSON.stringify(target))
+  const moved = await executeMove([from], to, h.paths, { processes: [] })
+  assert.equal(moved.ok, true)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), target)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+})
+
+test('replay metadata moves a notification family and genuine conflicts identify dependent runs', async () => {
+  for (const conflict of [null, 'message', 'producer']) {
+    const h = await taskFamilyFixture(), child = id(705)
+    const original = entry('assistant', 1, null, SOURCE, { origin: { producer: 'desktop' }, message: { role: 'assistant', content: 'same answer', usage: { output_tokens: 42 } } })
+    const replay = { ...original, origin: {}, message: { ...original.message, usage: { output_tokens: 0 } } }
+    if (conflict === 'message') replay.message.content = 'different answer'
+    if (conflict === 'producer') replay.origin.producer = 'other'
+    await h.write(SOURCE, [original, replay])
+    await h.record('P', SOURCE, rehomeRecord({ title: 'Notification conversation' }))
+    await h.write(child, fork([original, replay], SOURCE, child, 'Notification fork'))
+    await h.record('P', child, rehomeRecord({ title: 'Notification fork', forkedFromSessionId: `local_${SOURCE}`, isArchived: true }))
+    const { from, to } = await h.selection(), before = await fixtureSnapshot(h, [h.paths.pool]), processes = conflict ? desktopFixture(SOURCE) : []
+    const inv = await inventory([from], to, h.paths, () => {}, { processes })
+    if (conflict) {
+      assert.deepEqual(inv.move.map(row => row.id), [h.cold])
+      for (const row of inv.blocked) assert.match(row.error, [SOURCE, child].includes(row.id) ? /^1 conflicting duplicate uuids$/ : /^scheduled task family blocked by /)
+      assert.ok(inv.blocked.filter(row => [h.run, h.second].includes(row.id)).every(row => row.conflicts === 0))
+    } else assert.equal(inv.move.filter(row => row.taskFamily).length, 4)
+    const result = await executeMove([from], to, h.paths, { processes, moveOnly: true })
+    assert.equal(result.receipt.sessions.length, conflict ? 1 : 5)
+    assert.equal(result.receipt.held.length, 0)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.pool]), before)
+    if (conflict) {
+      assert.deepEqual(Object.fromEntries(result.summary.groups.map(group => [group.cause, group.records.length])), { 'history check': 2, 'waiting on task family': 2 })
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    } else {
+      assert.equal(result.ok, true)
+      assert.equal(result.receipt.superseded.filter(row => row.source).length, 5)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+      assert.equal(JSON.parse(await readFile(path.join(h.dir('T'), `local_${child}.json`))).forkedFromSessionId, `local_${SOURCE}`)
+      assert.ok((await undo(h.paths, { processes: [] })).dest)
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    }
+  }
+})
+
+test('unsafe task families leave ordinary records movable', async () => {
+  for (const reason of ['missing record', 'missing history', 'task collision', 'source collision', 'record collision', 'omitted member']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    if (reason === 'missing record') await unlink(path.join(h.dir('P'), `local_${SOURCE}.json`))
+    if (reason === 'missing history') await unlink(path.join(h.project, `${h.run}.jsonl`))
+    if (reason === 'task collision') await writeFile(h.targetFile, JSON.stringify({ ...h.targetRegistry, scheduledTasks: [...h.targetRegistry.scheduledTasks, { ...h.tasks[0], enabled: true }] }))
+    if (reason === 'source collision') {
+      await h.record('Q', h.run, rehomeRecord({ scheduledTaskId: h.tasks[0].id }))
+      await writeFile(path.join(h.dir('Q'), 'scheduled-tasks.json'), JSON.stringify({ scheduledTasks: [h.tasks[0]] }))
+    }
+    if (reason === 'record collision') await h.record('T', h.run, rehomeRecord({ scheduledTaskId: h.tasks[0].id }))
+    const fresh = await h.selection()
+    if (reason === 'omitted member') fresh.from.sessions = fresh.from.sessions.filter(row => row.id !== h.run)
+    const sources = [fresh.from]
+    if (reason === 'source collision') sources.push((await accounts(h.paths)).find(row => row.account === h.acct.Q))
+    const inv = await inventory(sources, fresh.to, h.paths, () => {}, { processes: [] })
+    assert.deepEqual(inv.move.map(row => row.id), [h.cold], reason)
+    const moved = await move(inv, fresh.to, h.paths)
+    assert.equal(moved.receipt.sessions.length, 1, reason)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('task schedulers require an explicit restart for active or unknown namespaces', async () => {
+  for (const identity of ['active', 'unknown', 'inactive']) {
+    const h = await taskFamilyFixture(), f = await identityFixture(h)
+    if (identity === 'unknown') await f.write(f.event(1, '[LocalSessionManager] Org changed'))
+    if (identity === 'inactive') {
+      await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Z }))
+      await f.write(f.init(1, h.acct.Z, h.org.Z))
+    }
+    const { from, to } = await h.selection()
+    const result = await executeMove([from], to, h.paths, { processes: f.processes })
+    if (identity === 'inactive') assert.equal(result.receipt.sessions.length, 4)
+    else {
+      assert.ok(result.plan)
+      assert.equal(new Set(result.plan.held.flatMap(row => row.sources.map(source => source.id))).size, 3)
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+      const partial = await executeMove([from], to, h.paths, { processes: f.processes, moveOnly: true })
+      assert.equal(partial.receipt.sessions.length, 1)
+      assert.equal(partial.complete, false)
+      const background = await sweep(h.paths, { processes: f.processes })
+      assert.equal(background.result.pendingLocal, true)
+      const completed = await finishHeld(h.paths, { processes: [] })
+      assert.equal(completed.receipt.sessions.length, 4)
+      assert.equal(completed.complete, true)
+    }
+  }
+})
+
+test('a Desktop worker holds the entire task family in the exact source namespace', async () => {
+  for (const sameLogin of [false, true]) {
+    const h = await taskFamilyFixture(false, 1), f = await identityFixture(h), other = id(704)
+    if (sameLogin) { h.acct.Q = h.acct.P; await mkdir(h.dir('Q'), { recursive: true }) }
+    await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Z }))
+    await f.write(f.init(1, h.acct.Z, h.org.Z))
+    await h.write(other, branchEntries(1, other, 400))
+    await h.record('Q', other, rehomeRecord({ notifySessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths, f.processes)
+    const from = all.filter(row => [h.org.P, h.org.Q].includes(row.org)), to = all.find(row => row.account === h.acct.T)
+    const rows = [{ ...f.processes[0], desktopPid: 500 }, desktopFixture()[1]]
+    const inv = await inventory(from, to, h.paths, () => {}, { processes: rows })
+    assert.ok(inv.sources.filter(row => row.account.org === h.org.P).every(row => !row.schedulerBusy))
+    const plan = await restartPlan(inv, h.paths, rows)
+    assert.deepEqual(new Set(plan.held.flatMap(row => row.sources.map(source => source.id))), new Set([SOURCE, h.run]))
+    assert.ok(plan.held.every(row => row.sources.every(source => source.account === h.acct.P && source.org === h.org.P)))
+    const partial = await executeMove(from, to, h.paths, { processes: rows, moveOnly: true })
+    assert.deepEqual(partial.receipt.sessions.map(row => row.id), [h.cold])
+    assert.equal(partial.receipt.failed.length, 1)
+    assert.equal(partial.receipt.failed[0].id, other)
+    assert.ok(!partial.receipt.failed.some(row => [SOURCE, h.run].includes(row.id)))
+    assert.equal(new Set(partial.receipt.failed.map(row => JSON.stringify(row))).size, partial.receipt.failed.length)
+    const finished = await finishHeld(h.paths, { processes: f.processes })
+    assert.equal(finished.ok, true)
+    assert.equal(finished.complete, true)
+    assert.equal(finished.receipt.sessions.length, 3)
+    assert.equal(finished.added, 2)
+    assert.equal(finished.targetChanged, true)
+    assert.equal(finished.file, partial.file)
+    assert.equal(finished.notMoved.length, 1)
+    assert.deepEqual(finished.failed, [])
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+    assert.ok(await readFile(path.join(h.dir('Q'), `local_${other}.json`)))
+  }
+})
+
+test('resumed mixed ordinary and task work counts every newly placed record', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), firstId = id(705)
+  await h.write(firstId, branchEntries(1, firstId, 405))
+  await h.record('P', firstId, rehomeRecord())
+  const fresh = await h.selection()
+  const rows = [...desktopFixture(h.cold), { ...desktopFixture(SOURCE)[1], pid: 502, started: 'family worker' }]
+  const first = await executeMove([fresh.from], to, h.paths, { processes: rows, moveOnly: true })
+  assert.deepEqual(first.receipt.sessions.map(row => row.id), [firstId])
+  const finished = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finished.file, first.file)
+  assert.equal(finished.ok, true)
+  assert.equal(finished.added, 4)
+  assert.equal(finished.receipt.sessions.length, 5)
+  assert.equal(finished.targetChanged, true)
+  assert.equal(finished.complete, true)
+})
+
+async function interruptTaskFamily(h, operation, stage) {
+  const hook = stage === 'record' ? 'link' : 'rename'
+  const destination = stage === 'record' ? path.join(h.dir('T'), `local_${h.notificationId ?? SOURCE}.json`) : stage === 'source' ? h.sourceFile : h.targetFile
+  const matches = ['receipt', 'retiring'].includes(stage) ? `args[1].startsWith(paths.state + '/') && JSON.parse(await fs.readFile(args[1], 'utf8')).${stage === 'retiring' ? 'retiring' : 'taskTransfers?.length'}` : `args[1] === ${JSON.stringify(destination)}`
+  const script = `
+    import childProcess from 'node:child_process'
+    import fs from 'node:fs/promises'
+    import { syncBuiltinESMExports } from 'node:module'
+    import { accounts, executeMove, layout, undo } from './engine.js'
+    childProcess.spawnSync = (${fixtureCommand.toString()})(childProcess.spawnSync)
+    childProcess.spawn = (${fixtureCommand.toString()})(childProcess.spawn)
+    const original = fs.${hook}
+    let mutations = 0
+    fs.${hook} = async (...args) => {
+      const result = await original(...args)
+      if (${matches} && ++mutations === ${JSON.stringify(h.interruptAfter ?? 1)}) process.exit(23)
+      return result
+    }
+    syncBuiltinESMExports()
+    const paths = layout(${JSON.stringify(h.root)})
+    const all = await accounts(paths, [])
+    if (${JSON.stringify(operation)} === 'undo') await undo(paths, { processes: [] })
+    else {
+      const from = ${JSON.stringify(h.sourceAccounts ?? [h.acct.P])}.map(account => all.find(row => row.account === account)), to = all.find(row => row.account === ${JSON.stringify(h.acct.T)})
+      if (${Boolean(h.restart)}) {
+        let rows = ${JSON.stringify([desktopFixture()[0]])}
+        const io = { inspect: () => rows, command: async file => { rows = file.endsWith('osascript') ? [] : ${JSON.stringify([desktopFixture()[0]])}; return { status: 0 } } }
+        const planned = await executeMove(from, to, paths, { io })
+        await executeMove(from, to, paths, { io, approve: planned.plan.token })
+      } else await executeMove(from, to, paths, { processes: [] })
+    }
+  `
+  const result = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: here, env: { ...process.env, HOME: h.root } })
+    .then(() => ({ code: 0 }), error => error)
+  assert.equal(result.code, 23, result.stderr)
+}
+
+test('task registry and record interruptions recover moves and Undo in the existing receipt', async () => {
+  for (const twins of [false, true]) for (const [operation, stage] of [['move', 'source'], ['move', 'record'], ['move', 'target'], ['move', 'receipt'], ['undo', 'target'], ['undo', 'source']]) {
+    const h = await taskFamilyFixture(true, 2, 1, twins), { from, to } = await h.selection()
+    if (operation === 'undo') await executeMove([from], to, h.paths, { processes: [] })
+    if (stage === 'receipt' && !twins) await unlink(h.targetFile)
+    await interruptTaskFamily(h, operation, stage)
+    if (operation === 'undo') {
+      const pending = lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].filter(row => row.pending)
+      assert.deepEqual(pending.map(row => [row.pending, row.pendingAction]), [['undo', 'finish']])
+    }
+    const files = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
+    assert.equal(files.length, 1)
+    const file = path.join(h.paths.state, files[0]), interrupted = JSON.parse(await readFile(file))
+    if (stage === 'receipt' && !twins) {
+      assert.equal(interrupted.finalizing, true)
+      assert.equal(interrupted.taskTransfers.length, 1)
+      assert.equal(interrupted.taskTransfers[0].targetExisted, false)
+      await assert.rejects(readFile(h.targetFile), { code: 'ENOENT' })
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    }
+    const result = await finishWorkflow(h.paths, { processes: [] })
+    if (operation === 'undo') assert.ok(result.dest)
+    else {
+      assert.equal(result.recoveryRequired, true)
+      assert.deepEqual((await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name)), files)
+      const receipt = JSON.parse(await readFile(file))
+      assert.equal(receipt.finalizing, false)
+      assert.deepEqual(receipt.sessions.map(row => row.id), [h.cold])
+      assert.deepEqual(receipt.taskTransfers, [])
+    }
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(await readFile(h.targetFile).then(JSON.parse, error => { if (error.code === 'ENOENT') return null; throw error }), stage === 'receipt' && !twins ? null : h.targetRegistry)
+    for (const sid of [SOURCE, h.run, h.second]) {
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${sid}.json`)))
+      assert.equal(await stat(path.join(h.dir('T'), `local_${sid}.json`)).catch(() => null), null)
+    }
+    if (operation === 'move') assert.ok((await undo(h.paths, { processes: [] })).dest)
+  }
+})
+
+test('CLI accounts exposes task recovery through Finish without selecting historical refusals', async () => {
+  const h = await taskFamilyFixture(true, 1)
+  const desktop = { ...desktopFixture()[0], started: 'Fri Sep 4 18:00:00 2026' }
+  const running = processSetup({ list: `${desktop.pid} 1 ${desktop.started} ${desktop.executable}`, commands: `${desktop.pid} 1 ${desktop.started} Claude` })
+  const stopped = processSetup({ list: '', commands: '' })
+  await interruptTaskFamily(h, 'move', 'target')
+  const name = (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)), file = path.join(h.paths.state, name)
+  const receipt = JSON.parse(await readFile(file))
+  assert.equal(receipt.finalizing, true)
+  assert.deepEqual(receipt.held, [])
+  assert.equal(receipt.taskTransfers.length, 1)
+  receipt.fromAccounts.push({ account: h.acct.Q, org: h.org.Q, label: 'Unrelated source' })
+  receipt.failed.push({ id: id(799), title: 'Historical refusal', error: 'scheduled task family member missing' })
+  await writeFile(file, JSON.stringify(receipt))
+  const before = await readFile(file)
+  const listed = await cli(h.root, ['accounts', '--json'], running)
+  assert.equal(listed.code, 0, listed.stderr)
+  const pending = lines(listed.stdout)[0].filter(row => row.pending)
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0].account, h.acct.P)
+  assert.equal(pending[0].org, h.org.P)
+  assert.equal(pending[0].pending, 'recovery')
+  assert.equal(pending[0].pendingAction, 'finish')
+  assert.equal(pending[0].receipt, file)
+  assert.deepEqual(pending[0].pendingFailures, [])
+  assert.deepEqual(await readFile(file), before)
+  const { calls, io } = taskHarness()
+  const plan = await finishWorkflow(h.paths, { io })
+  assert.ok(plan.plan)
+  assert.equal(plan.plan.kind, 'recover')
+  assert.equal(plan.plan.receiptFile, file)
+  assert.deepEqual(calls, [])
+  const recovered = await finishWorkflow(h.paths, { io, approve: plan.plan.token })
+  assert.equal(recovered.restarted, true)
+  assert.equal(recovered.recoveryRequired, true)
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+  const recoveredBytes = await readFile(file)
+  for (const [setup, action] of [[stopped, 'finish'], [running, 'restart']]) {
+    const result = await cli(h.root, ['accounts', '--json'], setup)
+    assert.equal(result.code, 0, result.stderr)
+    const again = lines(result.stdout)[0].filter(row => row.pending)
+    assert.deepEqual(again.map(row => [row.account, row.pending, row.pendingAction]), [[h.acct.P, 'local', action]])
+    assert.deepEqual(await readFile(file), recoveredBytes)
+  }
+  const finished = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(finished.file, file)
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.receipt.sessions.length, 3)
+  assert.ok(finished.notMoved.some(row => row.title === 'Historical refusal'))
+  assert.ok(lines((await cli(h.root, ['accounts', '--json'], stopped)).stdout)[0].every(row => row.pending === null))
+})
+
+test('task edits and dependencies block Undo and interrupted recovery without overwriting registries', async () => {
+  for (const recovery of [false, true]) for (const change of ['task', 'dependency', 'skip', 'retry', 'skip removed', 'retry removed', 'retry added', 'source skip', 'source retry']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    if (recovery) await interruptTaskFamily(h, 'move', 'target')
+    else await executeMove([from], to, h.paths, { processes: [] })
+    const source = change.startsWith('source'), file = source ? h.sourceFile : h.targetFile
+    const before = await readFile(file), target = await readFile(h.targetFile), changed = JSON.parse(before)
+    if (change === 'task') changed.scheduledTasks.find(task => task.id === h.tasks[0].id).enabled = true
+    else if (change === 'dependency') changed.scheduledTasks.push({ id: 'new_task', notifySessionId: `local_${SOURCE}`, enabled: false })
+    else if (change === 'skip') changed.recordedSkips.task_0[0].reason = 'edited'
+    else if (change === 'retry') changed.runRetries.task_0.attempts++
+    else if (change === 'skip removed') delete changed.recordedSkips.task_0
+    else if (change === 'retry removed') delete changed.runRetries.task_0
+    else if (change === 'retry added') changed.runRetries.task_1 = { slot: '2026-09-05T00:00:00Z', attempts: 1, notBefore: '2026-09-05T00:00:00Z' }
+    else if (change === 'source skip') changed.recordedSkips.task_0 = [{ at: '2026-09-09T00:00:00Z', reason: 'missed' }]
+    else changed.runRetries.task_0 = { slot: '2026-09-09T00:00:00Z', attempts: 1, notBefore: '2026-09-09T00:05:00Z' }
+    await writeFile(file, JSON.stringify(changed))
+    const result = await (recovery ? finishWorkflow : undo)(h.paths, { processes: [] })
+    assert.match((result.reconciled?.problems ?? result.restoreProblems ?? result.changed).join(' '), source ? /scheduled task state changed/ : /scheduled task/)
+    assert.deepEqual(JSON.parse(await readFile(file)), changed)
+    if (source) assert.deepEqual(await readFile(h.targetFile), target)
+    assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+    await writeFile(file, before)
+    const retried = await (recovery ? finishWorkflow : undo)(h.paths, { processes: [] })
+    assert.ok(recovery ? retried.recoveryRequired : retried.dest)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('task transfer uses final registration state and preserves later unrelated registry edits', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  h.sourceRegistry.scheduledTasks[0].lastRunAt = '2026-09-02T00:00:00Z'
+  h.sourceRegistry.scheduledTasks[0].enabled = true
+  h.sourceRegistry.recordedSkips.task_0[0].reason = 'missed before transfer'
+  h.sourceRegistry.runRetries.task_0.attempts = 4
+  await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+  let changed = false
+  const result = await move(inv, to, h.paths, (stage, text, extra) => {
+    if (stage !== 'move' || extra?.completed !== 1 || changed) return
+    const source = JSON.parse(readFileSync(h.sourceFile))
+    if (source.scheduledTasks.length) return
+    changed = true
+    for (const file of [h.sourceFile, h.targetFile]) writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file)), futureDuringMove: { intact: true } }))
+  })
+  assert.equal(result.ok, true)
+  assert.equal(changed, true)
+  assert.equal(JSON.parse(await readFile(h.targetFile)).scheduledTasks.find(task => task.id === h.tasks[0].id).enabled, true)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)).recordedSkips.task_0, h.sourceRegistry.recordedSkips.task_0)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)).runRetries.task_0, h.sourceRegistry.runRetries.task_0)
+  for (const file of [h.sourceFile, h.targetFile]) await writeFile(file, JSON.stringify({ ...JSON.parse(await readFile(file)), futureDuringUndo: [1, 2] }))
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), { ...h.sourceRegistry, futureDuringMove: { intact: true }, futureDuringUndo: [1, 2] })
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), { ...h.targetRegistry, futureDuringMove: { intact: true }, futureDuringUndo: [1, 2] })
+})
+
+test('task families include parent and fork closure without merging matching history', async () => {
+  const h = await taskFamilyFixture(), parent = id(704), child = id(705)
+  await h.write(parent, [entry('user', 90, null, parent)])
+  await h.record('P', parent, rehomeRecord())
+  await h.record('P', SOURCE, rehomeRecord({ forkedFromSessionId: `local_${parent}` }))
+  await h.write(child, [entry('user', 91, null, child)])
+  await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}`, isArchived: true }))
+  await h.record('Q', SOURCE, rehomeRecord())
+  const { from, to } = await h.selection()
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  assert.equal(inv.move.filter(row => row.taskFamily).length, 5)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, 6)
+  assert.ok(await readFile(path.join(h.dir('Q'), `local_${SOURCE}.json`)))
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+})
+
+test('task moves, Undo and recovery use the approved restart and preserve final scheduler state', async () => {
+  for (const operation of ['move', 'undo', 'recovery']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    if (operation === 'undo') await executeMove([from], to, h.paths, { processes: [] })
+    if (operation === 'recovery') await interruptTaskFamily(h, 'move', 'target')
+    const mock = taskHarness(), { calls, io } = mock
+    if (operation === 'move') mock.beforeQuit = async () => {
+      h.sourceRegistry.scheduledTasks[0].lastScheduledFor = '2026-09-03T00:00:00Z'
+      h.sourceRegistry.scheduledTasks[0].enabled = true
+      await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+    }
+    const run = options => operation === 'move' ? executeMove([from], to, h.paths, options) : operation === 'undo' ? undo(h.paths, options) : finishWorkflow(h.paths, options)
+    const plan = await run({ io })
+    assert.ok(plan.plan, operation)
+    assert.deepEqual(calls, [])
+    const result = await run({ io, approve: plan.plan.token })
+    assert.equal(result.restarted, true, JSON.stringify({ operation, reason: result.reason, outcome: result.restartOutcome?.outcome }))
+    assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.ok(mock.time < 30000)
+    if (operation === 'move') {
+      assert.equal(result.ok, true)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)).scheduledTasks.slice(1), h.sourceRegistry.scheduledTasks)
+    } else {
+      assert.ok(operation === 'undo' ? result.dest : result.recoveryRequired)
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    }
+  }
+})
+
+test('task workers and changed restart inventories never authorize an external stop', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  const table = [...desktopFixture(), { pid: 600, worker: true, ids: [h.run], desktopPid: null }]
+  const result = await executeMove([from], to, h.paths, { processes: table })
+  assert.equal(result.plan, undefined)
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  const calls = [], io = { inspect: () => [desktopFixture()[0]], command: async file => { calls.push(file); return { status: 0 } } }
+  assert.equal((await finishWorkflow(h.paths, { io })).plan, undefined)
+  assert.deepEqual(calls, [])
+})
+
+test('productive preparation and cold moving do not spend shutdown or moving time', async () => {
+  for (const phase of ['scan', 'move', 'verify', 'retire']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+    const planned = await executeMove([from], to, h.paths, { io: mock.io })
+    let delayed = false
+    const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: (stage, text, extra) => {
+      if (stage === phase && extra?.preparatory && !delayed) { delayed = true; mock.time += 180_000 }
+    } })
+    assert.equal(delayed, true, phase)
+    assert.equal(result.ok, true, result.reason)
+    assert.equal(result.receipt.sessions.length, 4)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.equal(result.restartOutcome.deadline, undefined)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+  }
+})
+
+test('productive reads and awaited mutations can exceed both old restart windows', async () => {
+  for (const phase of ['history', 'publication', 'retirement', 'durability']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+    if (phase === 'durability') await appendFile(path.join(h.project, `${SOURCE}.jsonl`), JSON.stringify({ type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'session_fixture', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }) + '\n')
+    const planned = await executeMove([from], to, h.paths, { io: mock.io })
+    const native = { readFile: fs.readFile, link: fs.link, rename: fs.rename, open: fs.open }, timings = []
+    let writing = false, delayed = 0
+    const run = mock.io.command
+    mock.io.command = async (...args) => { assert.equal(writing, false); timings.push(args[2]); return run(...args) }
+    fs.readFile = async (...args) => {
+      const result = await native.readFile(...args)
+      if (phase === 'history' && !mock.rows.length && String(args[0]).endsWith('.jsonl')) { mock.time += 90_000; delayed++ }
+      return result
+    }
+    fs.open = async (...args) => {
+      const handle = await native.open(...args)
+      if (phase === 'durability' && String(args[0]).endsWith('.journal')) {
+        const sync = handle.sync.bind(handle)
+        handle.sync = async () => { writing = true; mock.time += 90_000; delayed++; await sync(); writing = false }
+      }
+      if (phase === 'history' && String(args[0]).endsWith('.jsonl')) {
+        const read = handle.read.bind(handle)
+        handle.read = async (...args) => { const result = await read(...args); if (!mock.rows.length && result.bytesRead) { mock.time += 90_000; delayed++ }; return result }
+      }
+      return handle
+    }
+    for (const name of ['link', 'rename']) fs[name] = async (...args) => {
+      const selected = !mock.rows.length && (phase === 'publication' && name === 'link' && path.dirname(args[1]) === h.dir('T') || phase === 'retirement' && name === 'rename' && path.dirname(args[0]) === h.dir('P'))
+      if (selected) { writing = true; mock.time += 90_000; delayed++ }
+      const result = await native[name](...args)
+      writing = false
+      return result
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+    finally { Object.assign(fs, native); syncBuiltinESMExports() }
+    assert.ok(delayed > 0, phase)
+    assert.equal(result.ok, true, result.reason)
+    assert.equal(result.receipt.sessions.length, 4)
+    assert.deepEqual(timings, [30_000, 8_000])
+    assert.equal(result.restartOutcome.deadline, undefined)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+  }
+})
+
+test('a saved 4.1.6 capacity-blocked receipt and bound plan remain finishable', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const partial = await executeMove([from], to, h.paths, { io: mock.io, moveOnly: true })
+  assert.equal(partial.receipt.sessions.length, 1)
+  const planned = await finishWorkflow(h.paths, { io: mock.io })
+  const saved = { ...planned.plan, capacity: { records: 226, recordBytes: 20798433, availableMs: 22000, estimatedMs: 90000, fits: false, code: 'RESTART_CAPACITY' } }
+  delete saved.token
+  const sorted = value => Array.isArray(value) ? value.map(sorted) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sorted(value[key])])) : value
+  saved.token = createHash('sha256').update(JSON.stringify(sorted(saved))).digest('hex')
+  await writeFile(path.join(h.paths.state, 'restart-plan.json'), JSON.stringify(saved))
+  const finished = await finishWorkflow(h.paths, { io: mock.io, approve: saved.token })
+  assert.equal(finished.ok, true, finished.reason)
+  assert.equal(finished.file, partial.file)
+  assert.equal(finished.receipt.sessions.length, 4)
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+})
+
+test('publication recovery retries once and cleans failed ordinary or task units before continuing', async () => {
+  for (const family of [false, true]) for (const transient of [true, false]) for (const resume of [false, true]) {
+    const h = family ? await taskFamilyFixture() : await home(), other = id(710), healthy = id(711)
+    const ids = family ? [SOURCE, h.run, h.second, h.cold, other, healthy] : [SOURCE, other, healthy]
+    for (const [index, sid] of (family ? [other, healthy] : ids).entries()) {
+      await h.write(sid, [entry('user', 810 + index, null, sid)])
+      await h.record('P', sid, rehomeRecord(family ? { scheduledTaskId: `independent_${index}` } : {}))
+    }
+    if (family) {
+      h.sourceRegistry.scheduledTasks = [...h.tasks, { id: 'independent_0', enabled: true }, { id: 'independent_1', enabled: true }]
+      await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+    }
+    await h.record('P', id(799), rehomeRecord())
+    const mock = taskHarness(family ? [desktopFixture()[0]] : desktopFixture())
+    if (!family) mock.rows[1].ids = ids
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const first = resume ? await executeMove([from], to, h.paths, { io: mock.io, moveOnly: true }) : null
+    const run = options => resume ? finishWorkflow(h.paths, options) : executeMove([from], to, h.paths, options)
+    const planned = await run({ io: mock.io }), native = fs.link, reports = [], attempts = new Map()
+    const failedIds = [family ? h.run : SOURCE, other]
+    fs.link = async (...args) => {
+      if (path.dirname(args[1]) === h.dir('T')) {
+        const sid = path.basename(args[1]).slice(6, -5), count = (attempts.get(sid) ?? 0) + 1
+        attempts.set(sid, count)
+        if (sid === failedIds[0] && (!transient || count === 1) || !transient && sid === other) throw new Error(`Synthetic publication failure ${sid}`)
+      }
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await run({ io: mock.io, approve: planned.plan.token, report: (stage, text, extra) => reports.push({ stage, ...extra }) }) }
+    finally { fs.link = native; syncBuiltinESMExports() }
+    assert.equal(result.recoveryRequired, undefined, result.reason)
+    assert.equal(result.ok, transient, JSON.stringify(result.summary))
+    assert.equal(result.complete, transient)
+    assert.equal(attempts.get(failedIds[0]), 2)
+    assert.equal(attempts.get(other), transient && !family ? 1 : 2)
+    assert.equal(reports.filter(row => row.stage === 'recovery').length, 1)
+    assert.equal(result.receipt.finalizing, false)
+    assert.equal(result.receipt.pending, null)
+    assert.equal(result.receipt.held.length, 0)
+    assert.equal(await stat(`${result.file}.journal`).catch(() => null), null)
+    const unmoved = transient ? [] : family ? [SOURCE, h.run, h.second, other] : [SOURCE, other]
+    assert.deepEqual(result.receipt.sessions.map(row => row.id).sort(), ids.filter(sid => !unmoved.includes(sid)).sort())
+    assert.deepEqual(result.summary.notMoved.map(row => row.id).sort(), unmoved.sort())
+    if (transient) { assert.deepEqual(result.receipt.failed, []); assert.ok(!result.receipt.localStopped) }
+    const counts = reports.filter(row => row.stage === 'sessions')
+    const total = ids.length - (resume && family ? 1 : 0)
+    assert.equal(planned.plan.remainingCount, total)
+    assert.ok(counts.length && counts.every(row => row.sessionTotal === total), JSON.stringify(counts))
+    assert.equal(counts.at(-1).remainingCount, result.summary.notMoved.length)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    if (resume) assert.equal(result.file, first.file)
+    if (!transient) {
+      const snapshot = await fixtureSnapshot(h), published = [...attempts]
+      for (let i = 0; i < 2; i++) {
+        const output = await cli(h.root, ['accounts', '--json'], processSetup({ list: '', commands: '' }))
+        const rows = lines(output.stdout)[0].filter(row => row.pending)
+        assert.deepEqual(rows.map(row => [row.account, row.pending, row.pendingCount, row.pendingAction]), [[h.acct.P, 'partial', unmoved.length, 'blocked']])
+        const pending = await finishWorkflow(h.paths, { processes: [] })
+        assert.equal(pending.summary.notMoved.length, unmoved.length)
+        assert.deepEqual(await fixtureSnapshot(h), snapshot)
+      }
+      assert.deepEqual([...attempts], published)
+      const kept = await keepLocal(h.paths)
+      assert.equal(kept.ok, true)
+      assert.equal(kept.complete, true)
+      assert.equal(kept.summary.notMoved.length, unmoved.length)
+    }
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    const after = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    if (family) {
+      for (const file of [h.sourceFile, h.targetFile]) { delete before[file]; delete after[file] }
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+    }
+    assert.deepEqual(after, before)
+  }
+})
+
+test('retirement recovery unwinds unfinished copies and isolates the exact dependency unit', async () => {
+  for (const shape of ['ordinary', 'parent', 'task', 'boundary']) for (const resume of [false, true]) for (const transient of shape === 'boundary' ? [true] : [true, false]) {
+    const family = shape === 'task' || shape === 'boundary'
+    const h = family ? await taskFamilyFixture() : await home(), other = id(710), child = id(711), cold = id(720)
+    const failed = shape === 'task' ? h.run : shape === 'boundary' ? null : other
+    let ids
+    if (family) {
+      await h.write(other, [entry('user', 810, null, other)])
+      await h.record('P', other, rehomeRecord(shape === 'task' ? { scheduledTaskId: 'independent' } : {}))
+      if (shape === 'task') {
+        h.sourceRegistry.scheduledTasks = [...h.tasks, { id: 'independent', enabled: true }]
+        await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+      }
+      ids = [SOURCE, h.run, h.second, h.cold, other]
+    } else {
+      ids = [SOURCE, other, ...shape === 'parent' ? [child] : [], ...resume ? [cold] : []]
+      for (const [index, sid] of ids.entries()) {
+        await h.write(sid, [entry('user', 810 + index, null, sid)])
+        await h.record('P', sid, rehomeRecord(sid === child ? { forkedFromSessionId: `local_${other}` } : {}))
+      }
+    }
+    const mock = taskHarness(shape === 'task' ? [desktopFixture()[0]] : desktopFixture(other))
+    if (!family) mock.rows[1].ids = ids.filter(sid => sid !== cold)
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const seed = resume ? await executeMove([from], to, h.paths, { io: mock.io, moveOnly: true }) : null
+    const run = options => resume ? finishWorkflow(h.paths, options) : executeMove([from], to, h.paths, options)
+    const planned = await run({ io: mock.io }), native = fs.rename, reports = [], inspect = mock.io.inspect
+    let refusals = 0, stalled = false
+    mock.io.inspect = () => {
+      if (shape === 'boundary' && !stalled && reports.at(-1)?.stage === 'sessions' && reports.some(row => row.stage === 'move' && row.completed && !row.preparatory)) { stalled = true; mock.time += 61_000 }
+      return inspect()
+    }
+    fs.rename = async (...args) => {
+      if (args[0] === path.join(h.dir('P'), `local_${failed}.json`) && (++refusals === 1 || !transient)) throw new Error(`Synthetic retirement refusal ${failed}`)
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await run({ io: mock.io, approve: planned.plan.token, report: (stage, text, extra) => reports.push({ stage, ...extra }) }) }
+    finally { fs.rename = native; syncBuiltinESMExports() }
+    assert.equal(result.recoveryRequired, undefined, result.reason)
+    assert.equal(result.ok, transient, JSON.stringify(result.summary))
+    assert.equal(result.complete, transient)
+    assert.deepEqual([refusals, stalled], shape === 'boundary' ? [0, true] : [2, false])
+    assert.equal(reports.filter(row => row.stage === 'recovery').length, 1)
+    const notMoved = transient ? [] : shape === 'task' ? [SOURCE, h.run, h.second] : shape === 'parent' ? [other, child] : [other]
+    assert.equal(result.summary.moved, ids.length - notMoved.length)
+    assert.deepEqual(result.summary.notMoved.map(row => row.id).sort(), notMoved.sort())
+    assert.deepEqual(result.receipt.sessions.map(row => row.id).sort(), ids.filter(sid => !notMoved.includes(sid)).sort())
+    assert.equal(result.receipt.finalizing, false)
+    assert.equal(result.receipt.retiring, null)
+    assert.equal(result.receipt.held.length, 0)
+    if (seed) assert.equal(result.file, seed.file)
+    for (const sid of ids) {
+      const source = await stat(path.join(h.dir('P'), `local_${sid}.json`)).catch(() => null)
+      const target = await stat(path.join(h.dir('T'), `local_${sid}.json`)).catch(() => null)
+      assert.equal(Boolean(source), notMoved.includes(sid), `${shape}/${resume}/${transient}/${sid}`)
+      assert.equal(Boolean(target), !notMoved.includes(sid))
+    }
+    assert.equal(reports.filter(row => row.stage === 'sessions').at(-1).remainingCount, notMoved.length)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    if (!transient) assert.equal((await keepLocal(h.paths)).complete, true)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    const after = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    if (family) {
+      for (const file of [h.sourceFile, h.targetFile]) { delete before[file]; delete after[file] }
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+    }
+    assert.deepEqual(after, before)
+  }
+})
+
+test('failed retirement restoration retains its journal and cannot continue independent writes', async () => {
+  const h = await home(), other = id(710), mock = taskHarness(desktopFixture())
+  mock.rows[1].ids = [SOURCE, other]
+  for (const [index, sid] of [SOURCE, other].entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const planned = await executeMove([from], to, h.paths, { io: mock.io }), native = fs.rename, source = path.join(h.dir('P'), `local_${other}.json`)
+  let attempts = 0
+  fs.rename = async (...args) => {
+    if (args[0] === source) { attempts++; await native(...args); throw new Error('Synthetic retirement failure') }
+    if (args[1] === source) throw new Error('Synthetic restore failure')
+    return native(...args)
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+  finally { fs.rename = native; syncBuiltinESMExports() }
+  assert.equal(attempts, 1)
+  assert.equal(result.code, 'LOCAL_RECOVERY_BLOCKED')
+  assert.match(result.reason, /restore failure/)
+  const receipt = await readReceipt(result.file)
+  assert.ok(receipt.retiring && receipt.finalizing && receipt.localRecovery.blocked)
+  assert.equal(result.summary.moved, 0)
+  assert.equal((await keepLocal(h.paths)).recoveryRequired, true)
+  assert.equal((await sweep(h.paths, { processes: [] })).ok, false)
+  await finishWorkflow(h.paths, { processes: [] })
+  const recovered = await readReceipt(result.file)
+  assert.equal(recovered.sessions.length, 0)
+  assert.equal(recovered.finalizing, false)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+  assert.equal((await readdir(h.dir('P'))).length, 2)
+})
+
+test('preflight refusals stay informational on cold, restarted and successfully retried moves', async () => {
+  for (const mode of ['cold', 'restart', 'retry', 'retry refusal']) {
+    const h = await home(), other = id(710), mock = taskHarness(desktopFixture())
+    const good = [entry('user', 810, null, SOURCE)], bad = entry('user', 811, null, other)
+    await h.write(SOURCE, good)
+    await h.write(other, mode === 'retry refusal' ? [bad] : [bad, { ...bad, message: { role: 'user', content: 'Conflicting history' } }])
+    for (const key of ['P', 'Q']) for (const session of [SOURCE, other]) await h.record(key, session, rehomeRecord())
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const options = mode === 'cold' ? { processes: [] } : { io: mock.io }, planned = mode === 'cold' ? null : await executeMove([from], to, h.paths, options)
+    const native = fs.link
+    let attempts = 0
+    fs.link = async (...args) => {
+      if (mode.startsWith('retry') && args[1] === path.join(h.dir('T'), `local_${SOURCE}.json`) && ++attempts === 1) throw new Error('Synthetic temporary failure')
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { ...options, approve: planned?.plan.token, report: stage => {
+      if (mode === 'retry refusal' && stage === 'recovery') appendFileSync(path.join(h.project, `${SOURCE}.jsonl`), JSON.stringify({ ...good[0], message: { role: 'user', content: 'New conflicting history' } }) + '\n')
+    } }) }
+    finally { fs.link = native; syncBuiltinESMExports() }
+    assert.equal(result.summary.moved, 1)
+    assert.equal(result.summary.notMoved.length, 1)
+    assert.equal(Boolean(result.receipt.localStopped), mode === 'retry refusal')
+    assert.equal(result.complete, mode !== 'retry refusal')
+    const finished = await cli(h.root, ['finish', '--json'], processSetup({ list: '', commands: '' }))
+    assert.equal(finished.code, mode === 'retry refusal' ? 1 : 0, finished.stdout)
+    const event = lines(finished.stdout).at(-1)
+    assert.equal(event.nothing === true, mode !== 'retry refusal')
+    const listed = await cli(h.root, ['accounts', '--json'], processSetup({ list: '', commands: '' }))
+    const pending = lines(listed.stdout)[0].filter(row => row.pending)
+    assert.equal(pending.length, mode === 'retry refusal' ? 1 : 0)
+    if (pending.length) assert.equal(pending[0].pendingAction, 'blocked')
+  }
+})
+
+test('one real stall retries the unfinished family and completes without another shutdown', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness(), reports = []
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  let stalled = false
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: (stage, text, extra) => {
+    reports.push(stage)
+    if (stage === 'move' && extra?.completed === 1 && !extra.preparatory && !stalled) { stalled = true; mock.time += 61_000 }
+  } })
+  assert.equal(stalled, true)
+  assert.equal(result.ok, true, result.reason)
+  assert.equal(result.complete, true)
+  assert.equal(reports.filter(stage => stage === 'recovery').length, 1)
+  assert.equal(result.receipt.sessions.length, 4)
+  assert.deepEqual(result.receipt.failed, [])
+  assert.ok(!result.receipt.localStopped)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+})
+
+test('progress excludes no-history placeholders and retains meaningful grouped refusals', async () => {
+  for (const shape of ['ordinary', 'grouped', 'partial']) {
+    const h = shape === 'grouped' ? await taskFamilyFixture() : await home(), empty = id(799), reports = []
+    if (shape !== 'grouped') { await h.write(SOURCE, [entry('user', 801, null, SOURCE)]); await h.record('P', SOURCE, rehomeRecord()) }
+    await h.record('P', empty, rehomeRecord())
+    if (shape === 'partial') {
+      const refused = id(790)
+      await h.write(refused, [entry('user', 802, null, refused), entry('user', 802, null, refused, { message: { role: 'user', content: 'Conflicting history' } })])
+      await h.record('P', refused, rehomeRecord())
+      await h.record('Q', refused, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const result = await executeMove([from], to, h.paths, { processes: [], report: (stage, text, extra) => { if (stage === 'sessions') reports.push(extra) } })
+    const expected = shape === 'grouped' ? 4 : shape === 'partial' ? 2 : 1
+    assert.ok(reports.length && reports.every(row => row.sessionTotal === expected), JSON.stringify(reports))
+    assert.equal(reports.at(-1).remainingCount, result.summary.notMoved.length)
+    assert.equal(result.summary.notMoved.length, shape === 'partial' ? 1 : 0)
+    assert.equal(result.summary.moved, shape === 'grouped' ? 4 : 1)
+    assert.equal(result.complete, true)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${empty}.json`)))
+    assert.equal(await stat(path.join(h.dir('T'), `local_${empty}.json`)).catch(() => null), null)
+  }
+})
+
+test('restart retry and cleanup preserve pending cloud checks until verification finishes', async () => {
+  for (const transient of [true, false]) {
+    const h = await home(), other = id(710), mock = taskHarness(desktopFixture())
+    mock.rows[1].ids = [SOURCE, other]
+    for (const [index, sid] of [SOURCE, other].entries()) {
+      await h.write(sid, [entry('user', 810 + index, null, sid)])
+      await h.record('P', sid, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const options = { io: mock.io, cloudRequested: true }, planned = await executeMove([from], to, h.paths, options), native = fs.link
+    let attempts = 0
+    fs.link = async (...args) => {
+      if (args[1] === path.join(h.dir('T'), `local_${SOURCE}.json`) && (++attempts === 1 || !transient)) throw new Error('Synthetic publication failure')
+      return native(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { ...options, approve: planned.plan.token }) }
+    finally { fs.link = native; syncBuiltinESMExports() }
+    assert.equal(attempts, 2)
+    assert.equal(result.receipt.cloudChecks.length, 1)
+    assert.equal(result.receipt.cloudChecks[0].status, 'pending')
+    assert.equal(result.receipt.held.length, 0)
+    assert.equal(result.summary.notMoved.length, transient ? 0 : 1)
+    const cloud = cloudFixture(h), checked = await finishPending(h.paths, { processes: [], cloud, active: cloud })
+    assert.equal(checked.complete, transient)
+    assert.equal(checked.receipt.cloudChecks[0].status, 'complete')
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  }
+})
+
+test('terminal local failures stay stable across account refresh with cloud and held work', async () => {
+  for (const mode of ['partial', 'held', 'cloud', 'both']) {
+    const h = await home(), failed = [id(710), id(711)], held = id(712)
+    await h.write(SOURCE, [entry('user', 800, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    let all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const moved = await executeMove([from], to, h.paths, { processes: [] }), receipt = moved.receipt
+    for (const [index, sid] of failed.entries()) {
+      await h.write(sid, [entry('user', 810 + index, null, sid)])
+      await h.record(index ? 'Q' : 'P', sid, rehomeRecord())
+    }
+    const hasHeld = ['held', 'both'].includes(mode), hasCloud = ['cloud', 'both'].includes(mode)
+    if (hasHeld) { await h.write(held, [entry('user', 812, null, held)]); await h.record('Z', held, rehomeRecord()) }
+    all = await accounts(h.paths, [])
+    receipt.fromAccounts = all.filter(row => row.account !== h.acct.T).map(({ account, org, label }) => ({ account, org, label }))
+    receipt.failed = failed.map(sid => {
+      const account = all.find(row => row.sessions.some(session => session.id === sid)), session = account.sessions.find(row => row.id === sid)
+      return { id: sid, title: session.title, error: 'Synthetic permanent failure', sources: [{ account: account.account, org: account.org, label: account.label,
+        id: sid, sessionId: session.record.sessionId, file: session.file, title: session.title }] }
+    })
+    receipt.localStopped = true
+    receipt.localRecovery = { attempted: true }
+    receipt.held = hasHeld ? [{ id: held, recordId: `local_${held}`, title: 'Healthy held session', release: 'worker', workers: [],
+      sources: [{ id: held, account: h.acct.Z, org: h.org.Z, file: path.join(h.dir('Z'), `local_${held}.json`) }] }] : []
+    const cloud = cloudFixture(h, { account: h.acct.Q, org: h.org.Q })
+    receipt.cloudChecks = hasCloud ? [{ account: h.acct.Q, org: h.org.Q, label: 'Cloud source', status: 'pending', sessionIds: ['session_missing'] }] : []
+    await writeFile(moved.file, JSON.stringify(receipt))
+    const refresh = async () => {
+      const output = await cli(h.root, ['accounts', '--json'], processSetup({ list: '', commands: '' }))
+      assert.equal(output.code, 0, output.stderr)
+      const rows = lines(output.stdout)[0]
+      assert.ok(rows.filter(row => row.pending).every(row => row.pendingCount !== 0))
+      assert.equal(rows[0].receiptSummary.notMoved.length, 2)
+      return rows
+    }
+    for (let i = 0; i < 2; i++) {
+      const rows = await refresh()
+      const partial = rows.filter(row => row.pending === 'partial')
+      assert.deepEqual(partial.map(row => [row.account, row.pendingCount, row.pendingAction]).sort(), mode === 'partial' ? [[h.acct.P, 1, 'blocked'], [h.acct.Q, 1, 'blocked']].sort() : [])
+    }
+    const native = fs.link, published = []
+    fs.link = async (...args) => { published.push(args[1]); return native(...args) }
+    syncBuiltinESMExports()
+    try {
+      const result = await finishWorkflow(h.paths, { processes: [], ...hasCloud ? { cloud, active: cloud } : {} })
+      assert.equal(result.complete, false, mode)
+      for (const check of (await readReceipt(moved.file)).cloudChecks.filter(row => ['pending', 'failed'].includes(row.status))) {
+        const finished = await finishPending(h.paths, { processes: [], cloud: cloudFixture(h, check), active: check })
+        assert.equal(finished.complete, false, mode)
+      }
+      for (let i = 0; i < 2; i++) {
+        const rows = await refresh()
+        assert.deepEqual(rows.filter(row => row.pending).map(row => [row.account, row.pending, row.pendingCount]).sort(), [[h.acct.P, 'partial', 1], [h.acct.Q, 'partial', 1]].sort())
+        assert.equal((await sweep(h.paths, { processes: [], cloud, active: cloud })).complete, false)
+      }
+    } finally { fs.link = native; syncBuiltinESMExports() }
+    assert.deepEqual(published, hasHeld ? [path.join(h.dir('T'), `local_${held}.json`)] : [])
+    const after = await readReceipt(moved.file)
+    assert.deepEqual(after.failed, receipt.failed)
+    assert.equal(after.sessions.length, hasHeld ? 2 : 1)
+    assert.equal((await keepLocal(h.paths)).complete, true)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+  }
+})
+
+test('recovery blockers preserve unfinished journals and never repeat automatic recovery on refresh', async () => {
+  for (const scenario of ['changed target', 'ordinary rollback', 'task rollback', 'ordinary rollback after retry', 'task rollback after retry']) {
+    const ordinary = scenario.startsWith('ordinary'), h = ordinary ? { ...await home(), cold: id(703) } : await taskFamilyFixture(), healthy = id(710)
+    if (ordinary) for (const [index, sid] of [SOURCE, h.cold, healthy].entries()) {
+      await h.write(sid, [entry('user', 800 + index, null, sid)])
+      await h.record('P', sid, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const mock = taskHarness(ordinary ? desktopFixture() : [desktopFixture()[0]])
+    if (ordinary) mock.rows[1].ids = [SOURCE, healthy]
+    const planned = await executeMove([from], to, h.paths, { io: mock.io })
+    const native = { link: fs.link, rename: fs.rename }, published = []
+    let attempts = 0, rollbacks = 0, publications = 0
+    fs.link = async (...args) => {
+      const result = await native.link(...args)
+      if (path.dirname(args[1]) === h.dir('T')) published.push(path.basename(args[1]))
+      if (args[1] === path.join(h.dir('T'), `local_${SOURCE}.json`)) {
+        publications++
+        if (scenario === 'changed target') {
+          const record = JSON.parse(await readFile(args[1]))
+          await writeFile(args[1], JSON.stringify({ ...record, title: 'Changed by another owner' }))
+        }
+        throw new Error('Synthetic interrupted publication')
+      }
+      return result
+    }
+    fs.rename = async (...args) => {
+      if (scenario.includes('rollback') && args[0] === path.join(h.dir('T'), `local_${SOURCE}.json`)) {
+        rollbacks++
+        if (!scenario.endsWith('after retry') || publications === 2) throw new Error('Synthetic rollback failure')
+      }
+      return native.rename(...args)
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: stage => { if (stage === 'recovery') attempts++ } }) }
+    finally { Object.assign(fs, native); syncBuiltinESMExports() }
+    const retried = scenario.endsWith('after retry')
+    assert.equal(attempts, retried ? 1 : 0)
+    assert.equal(publications, retried ? 2 : 1)
+    assert.equal(rollbacks, retried ? 3 : scenario.includes('rollback') ? 2 : 0)
+    assert.equal(result.recoveryRequired, true)
+    assert.equal(result.summary.moved, ordinary && retried ? 2 : 1)
+    assert.equal(result.summary.notMoved.length, ordinary ? retried ? 1 : 2 : 3)
+    assert.match(result.reason, scenario.includes('rollback') ? /Synthetic rollback failure/ : /changed.*pending/)
+    const receipt = await readReceipt(result.file)
+    assert.equal(receipt.finalizing, true)
+    assert.ok(receipt.pending)
+    assert.ok(await readFile(`${result.file}.journal`))
+    assert.equal(published.includes(`local_${healthy}.json`), ordinary && retried)
+    const before = await fixtureSnapshot(h)
+    for (let i = 0; i < 2; i++) {
+      const refreshed = await sweep(h.paths, { processes: [] })
+      assert.equal(refreshed.ok, false)
+      assert.equal(refreshed.recovered.error, result.reason)
+      assert.deepEqual(await fixtureSnapshot(h), before)
+    }
+    assert.equal((await keepLocal(h.paths)).recoveryRequired, true)
+    assert.equal(receipt.sessions.find(row => row.id === h.cold)?.id, h.cold)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  }
+})
+
+test('restart diagnostics never recreate a refused receipt or displace the previous move for Undo', async () => {
+  const h = await home(), refused = id(710)
+  await h.write(SOURCE, branchEntries(4, SOURCE, 1))
+  await h.record('P', SOURCE, rehomeRecord())
+  let all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [] }), to, h.paths)
+  assert.equal(moved.ok, true)
+  await h.write(refused, branchEntries(4, refused, 20))
+  await h.record('P', refused, rehomeRecord())
+  await h.record('Q', refused, rehomeRecord())
+  all = await accounts(h.paths, [])
+  from = all.find(row => row.account === h.acct.P)
+  to = all.find(row => row.account === h.acct.T)
+  const mock = taskHarness(desktopFixture(refused)), planned = await executeMove([from], to, h.paths, { io: mock.io })
+  const prior = await readFile(moved.file)
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, summary: () => {
+    assert.equal(mock.rows.length, 0)
+    appendFileSync(path.join(h.project, `${refused}.jsonl`), JSON.stringify(entry('user', 20, null, refused, { message: { role: 'user', content: 'Conflicting source edit' } })) + '\n')
+  } })
+  assert.equal(result.validationOnly, true)
+  assert.equal(result.file, null)
+  assert.equal(result.restarted, true)
+  assert.deepEqual((await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name)), [path.basename(moved.file)])
+  assert.deepEqual(await readFile(moved.file), prior)
+  const outcome = lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8')).at(-1)
+  assert.equal(outcome.stopCode, 'WORK_REFUSED')
+  assert.notEqual(outcome.receiptId, path.basename(moved.file))
+  assert.equal(await stat(path.join(h.paths.state, outcome.receiptId)).catch(() => null), null)
+  const undone = await undo(h.paths, { processes: [] })
+  assert.ok(undone.dest)
+  assert.equal(undone.receipt.at, moved.receipt.at)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.equal(await stat(path.join(h.dir('T'), `local_${SOURCE}.json`)).catch(() => null), null)
+})
+
+test('restart diagnostic updates read existing receipts and journals instead of detached results', async () => {
+  for (const scenario of ['missing', 'pending journal', 'complete journal', 'invalid name']) {
+    const h = await home(), mock = taskHarness(), plan = await restartPlan(null, h.paths, mock.rows)
+    await mkdir(h.paths.state, { recursive: true })
+    const file = path.join(h.paths.state, scenario === 'invalid name' ? '2026-10-10T12-00.json' : '2026-10-10T12-00-00-000.json')
+    const original = { sessions: [], failed: [], remote: [], finalizing: false }
+    if (scenario !== 'missing') await writeFile(file, JSON.stringify(original))
+    if (scenario.endsWith('journal')) await writeFile(`${file}.journal`, JSON.stringify({ sequence: 1,
+      pending: scenario === 'pending journal' ? { id: SOURCE } : null, sessions: [{ id: SOURCE }], failed: [], retained: [] }) + '\n')
+    const before = await readFile(file).catch(() => null), journal = await readFile(`${file}.journal`).catch(() => null)
+    const detached = { ...original, detached: true }
+    const result = await withDesktopRestart({ ...plan, receiptFile: file }, h.paths, async () => ({ file, receipt: detached, ok: true }), () => {}, mock.io)
+    assert.equal(result.ok, true)
+    assert.deepEqual(await readFile(`${file}.journal`).catch(() => null), journal)
+    if (scenario === 'complete journal') {
+      const saved = JSON.parse(await readFile(file))
+      assert.deepEqual(saved.sessions, [{ id: SOURCE }])
+      assert.equal(saved.journalSequence, 1)
+      assert.equal(saved.detached, undefined)
+      assert.equal(saved.restartHistory.length, 1)
+      assert.deepEqual(result.result.receipt.restartHistory, saved.restartHistory)
+      assert.deepEqual(result.result.receipt.sessions, saved.sessions)
+    } else {
+      assert.deepEqual(await readFile(file).catch(() => null), before)
+      assert.equal(detached.restartHistory, undefined)
+    }
+  }
+})
+
+test('restart diagnostics never rewrite a failed family receipt or journal and fold outcomes once after recovery', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  let snapshot, file
+  const failed = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: (stage, text, progress) => {
+    if (stage !== 'move' || progress?.completed !== 2 || snapshot) return
+    file = path.join(h.paths.state, readdirSync(h.paths.state).find(name => /^\d.*\.json$/.test(name)))
+    snapshot = [readFileSync(file), readFileSync(`${file}.journal`)]
+    mock.time += 200
+    mock.rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'unexpected' }]
+  } })
+  assert.ok(snapshot)
+  assert.equal(failed.ok, false)
+  assert.match(failed.reason, /reopened before/)
+  assert.deepEqual([await readFile(file), await readFile(`${file}.journal`)], snapshot)
+  const log = path.join(h.paths.state, 'restart-events.jsonl'), first = lines(await readFile(log, 'utf8'))
+  assert.deepEqual(first.map(row => row.event), ['start', 'exited', 'outcome'])
+  assert.equal(first.at(-1).stopCode, 'RESTART_REOPENED')
+  assert.equal(first.at(-1).receiptCounts, null)
+  assert.ok(['moved', 'failed', 'archived'].every(key => !Object.hasOwn(first.at(-1), key)))
+  assert.ok(first.every(row => row.kind === 'move'))
+  assert.equal(first.at(-1).receiptId, path.basename(file))
+  assert.equal(first[0].planNonce, planned.plan.nonce)
+  assert.ok(first.every(row => row.selectionId === first[0].selectionId))
+  assert.ok(!JSON.stringify(first).includes(planned.plan.token))
+  mock.time = 0
+  const recovery = await finishWorkflow(h.paths, { io: mock.io })
+  assert.equal(recovery.plan.receiptFile, file)
+  await finishWorkflow(h.paths, { io: mock.io, approve: recovery.plan.token })
+  const recovered = JSON.parse(await readFile(file))
+  assert.equal(recovered.finalizing, false)
+  assert.equal(recovered.restartHistory.length, 2)
+  assert.equal(recovered.restartHistory[0].stopCode, 'RESTART_REOPENED')
+  assert.equal(recovered.restartHistory[0].receiptCounts, null)
+  assert.equal(recovered.restartHistory[1].kind, 'finish')
+  const continuation = await finishWorkflow(h.paths, { io: mock.io })
+  const completed = await finishWorkflow(h.paths, { io: mock.io, approve: continuation.plan.token })
+  assert.equal(completed.ok, true)
+  assert.equal(completed.receipt.restartHistory.length, 3)
+  assert.equal(completed.receipt.restartHistory.at(-1).stopCode, 'COMPLETE')
+  assert.equal(completed.receipt.restartHistory.at(-1).kind, 'finish')
+  assert.equal(completed.added, 3)
+  assert.deepEqual(completed.receipt.restartHistory.at(-1).receiptCounts, { sessions: 4, failed: completed.receipt.failed.length, remote: 0 })
+  assert.equal(completed.receipt.restart.outcome, 'reopened')
+  await finishWorkflow(h.paths, { processes: [] })
+  const final = JSON.parse(await readFile(file))
+  assert.equal(new Set(final.restartHistory.map(row => row.attemptId)).size, 3)
+  assert.equal(final.restartHistory.length, 3)
+  assert.equal((await stat(log)).mode & 0o777, 0o600)
+})
+
+test('restart diagnostics preserve an unconfirmed quit after Desktop exits and reopens', async () => {
+  const h = await home(), mock = taskHarness(), plan = await restartPlan(null, h.paths, mock.rows)
+  const command = mock.io.command
+  mock.io.command = async (...args) => {
+    const result = await command(...args)
+    return args[0].endsWith('osascript') ? { status: 1 } : result
+  }
+  let worked = false
+  const result = await withDesktopRestart(plan, h.paths, async () => { worked = true }, () => {}, mock.io)
+  assert.equal(worked, false)
+  assert.equal(result.ok, false)
+  assert.equal(result.result, undefined)
+  assert.equal(result.restart.outcomeBeforeReopen, 'quit-not-confirmed')
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  const events = lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8'))
+  assert.deepEqual(events.map(row => row.event), ['start', 'outcome'])
+  assert.equal(events.at(-1).outcome, 'reopened')
+  assert.equal(events.at(-1).stopCode, 'QUIT_UNCONFIRMED')
+  assert.equal(events.at(-1).receiptCounts, null)
+})
+
+test('restart diagnostic retention, no-op outcomes and failures expose no content or raw errors', async () => {
+  const h = await home(), mock = taskHarness(), plan = await restartPlan(null, h.paths, mock.rows)
+  await mkdir(h.paths.state, { recursive: true })
+  const file = path.join(h.paths.state, 'restart-events.jsonl')
+  await writeFile(file, '{}\n'.repeat(Math.floor(1024 * 1024 / 3)), { mode: 0o600 })
+  for (let attempt = 0; attempt < 3; attempt++) {
+    mock.rows = [desktopFixture()[0]]
+    await withDesktopRestart({ ...plan, kind: attempt === 1 ? 'user@example.com' : attempt === 2 ? 'undo' : 'refresh' }, h.paths, async () => {
+      if (attempt === 1) throw new Error('Synthetic private title user@example.com prompt approval-token server-response')
+      return null
+    }, () => {}, mock.io)
+  }
+  for (const name of [file, `${file}.1`]) assert.ok((await stat(name)).size <= 1024 * 1024)
+  const text = await readFile(file, 'utf8'), outcomes = lines(text).filter(row => row.event === 'outcome')
+  assert.deepEqual(outcomes.map(row => row.stopCode), ['NO_WORK', 'WORK_FAILED', 'NO_WORK'])
+  assert.deepEqual(outcomes.map(row => row.kind), ['restart', 'restart', 'undo'])
+  assert.ok(outcomes.every(row => row.receiptCounts === null))
+  assert.ok(!/private|user@|prompt|approval-token|server-response/.test(text))
+})
+
+test('restart diagnostic write failures leave successful moves and task recovery outcomes intact', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  const original = fs.open
+  fs.open = async (file, ...args) => {
+    if (String(file).includes('restart-events.jsonl')) throw new Error('fixture diagnostic storage unavailable')
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  let completed
+  try { completed = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+  finally { fs.open = original; syncBuiltinESMExports() }
+  assert.equal(completed.ok, true)
+  assert.equal(completed.receipt.sessions.length, 4)
+  assert.equal(completed.receipt.restartHistory, undefined)
+  assert.equal(completed.receipt.restart.outcome, 'reopened')
+  assert.equal(await readFile(path.join(h.paths.state, 'restart-events.jsonl')).catch(() => null), null)
+  const broken = await taskFamilyFixture(true, 1)
+  await interruptTaskFamily(broken, 'move', 'target')
+  const recoveryMock = taskHarness(), recovery = await finishWorkflow(broken.paths, { io: recoveryMock.io })
+  fs.open = async (file, ...args) => {
+    if (String(file).includes('restart-events.jsonl')) throw new Error('fixture diagnostic storage unavailable')
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  try { await finishWorkflow(broken.paths, { io: recoveryMock.io, approve: recovery.plan.token }) }
+  finally { fs.open = original; syncBuiltinESMExports() }
+  assert.deepEqual(JSON.parse(await readFile(broken.sourceFile)), broken.sourceRegistry)
+  assert.deepEqual(JSON.parse(await readFile(broken.targetFile)), broken.targetRegistry)
+  assert.equal(JSON.parse(await readFile(recovery.plan.receiptFile)).finalizing, false)
+})
+
+test('restart diagnostic folding preserves corrupt receipts and readable log outcomes', async () => {
+  const h = await home(), mock = taskHarness(), plan = await restartPlan(null, h.paths, mock.rows)
+  await mkdir(h.paths.state, { recursive: true })
+  const file = path.join(h.paths.state, '2026-10-10T12-00-00-000.json'), log = path.join(h.paths.state, 'restart-events.jsonl')
+  await writeFile(file, 'unreadable fixture receipt\n')
+  const raw = await readFile(file)
+  await withDesktopRestart({ ...plan, receiptFile: file }, h.paths, async () => null, () => {}, mock.io)
+  assert.deepEqual(await readFile(file), raw)
+  await appendFile(log, 'null\n{broken\n')
+  mock.rows = [desktopFixture()[0]]
+  const receipt = { sessions: [], failed: [], remote: [], restartHistory: [] }
+  const result = await withDesktopRestart({ ...plan, receiptFile: file }, h.paths, async () => {
+    await writeFile(file, JSON.stringify(receipt))
+    return { file, receipt, ok: true }
+  }, () => {}, mock.io)
+  assert.equal(result.ok, true)
+  assert.equal(receipt.restartHistory.length, 2)
+  assert.equal(receipt.restartHistory.at(-1).stopCode, 'COMPLETE')
+})
+
+test('a failed task-family placement rolls back the family and keeps ordinary moves', async () => {
+  const h = await taskFamilyFixture(true), { from, to } = await h.selection()
+  const original = fs.link
+  fs.link = async (...args) => {
+    if (args[1] === path.join(h.dir('T'), `local_${SOURCE}.json`)) throw new Error('fixture publication failure')
+    return original(...args)
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { processes: [] }) }
+  finally { fs.link = original; syncBuiltinESMExports() }
+  assert.equal(result.ok, false)
+  assert.equal(result.receipt.localStopped, true)
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+  assert.equal((await keepLocal(h.paths)).ok, true)
+  const fresh = await h.selection()
+  assert.equal((await executeMove([fresh.from], fresh.to, h.paths, { processes: [] })).receipt.sessions.length, 3)
+})
+
+test('registry changes during a task move remain recoverable without lost edits', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection()
+  let edited = false
+  const result = await executeMove([from], to, h.paths, { processes: [], report: (stage, text, extra) => {
+    if (stage !== 'move' || extra?.completed !== 1 || edited) return
+    const source = JSON.parse(readFileSync(h.sourceFile))
+    if (source.scheduledTasks.length) return
+    edited = true
+    source.scheduledTasks = [{ ...h.tasks[0], enabled: true }]
+    source.unrelatedEdit = 9
+    writeFileSync(h.sourceFile, JSON.stringify(source))
+  } })
+  assert.equal(edited, true)
+  assert.equal(result.recoveryRequired, true)
+  const changed = JSON.parse(await readFile(h.sourceFile))
+  assert.equal(changed.scheduledTasks[0].enabled, true)
+  assert.equal(changed.unrelatedEdit, 9)
+  changed.scheduledTasks = []
+  await writeFile(h.sourceFile, JSON.stringify(changed))
+  await finishWorkflow(h.paths, { processes: [] })
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), { ...h.sourceRegistry, unrelatedEdit: 9 })
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${h.cold}.json`)))
+})
+
+test('task transaction boundaries retain late dependencies, worker and record edits for recovery', async () => {
+  for (const phase of ['placement', 'retirement', 'publication']) for (const change of ['registration', 'route', 'external worker', 'source edit', 'target edit', 'account switch']) {
+    const h = await taskFamilyFixture(false, 1), f = await identityFixture(h)
+    await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Z }))
+    await f.write(f.init(1, h.acct.Z, h.org.Z))
+    const { from, to } = await h.selection()
+    let rows = f.processes, injected = 0, editedFile, editedBefore, editedAfter
+    const hook = phase === 'placement' ? 'link' : phase === 'retirement' ? 'rename' : 'writeFile', original = fs[hook]
+    const write = fs.writeFile
+    const source = path.join(h.dir('P'), `local_${h.run}.json`), target = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    fs[hook] = async (...args) => {
+      const result = await original(...args)
+      const matches = phase === 'placement' ? args[1] === target : phase === 'retirement' ? args[0] === path.join(h.dir('P'), `local_${SOURCE}.json`) : String(args[0]).startsWith(h.targetFile + '.')
+      if (!matches) return result
+      if (change === 'external worker') { if (!injected++) rows = [...rows, { pid: 600, worker: true, ids: [h.run], desktopPid: null }] }
+      else if (change === 'account switch') {
+        editedFile = path.join(h.paths.logs, 'main.log')
+        if (!injected++) editedBefore = await readFile(editedFile)
+        editedAfter = f.event(2, '[LocalSessionManager] Org changed')
+      } else {
+        editedFile = change === 'registration' ? h.sourceFile : change === 'source edit' ? phase === 'publication' ? path.join(h.dir('P'), `local_${id(797)}.json`) : source : target
+        if (!injected++) editedBefore = await readFile(editedFile).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+        const value = editedBefore ? JSON.parse(editedBefore) : { sessionId: `local_${id(797)}`, cliSessionId: id(797), scheduledTaskId: h.tasks[0].id }
+        if (change === 'registration') value.scheduledTasks.push({ id: 'new_dependency', notifySessionId: `local_${SOURCE}`, enabled: false })
+        else if (change === 'route') value.notifySessionId = `local_${id(797)}`
+        else value.title = `Edited during transfer ${injected}`
+        editedAfter = JSON.stringify(value)
+      }
+      if (editedFile) await write(editedFile, editedAfter)
+      return result
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { io: { inspect: () => rows }, processes: f.processes }) }
+    finally { fs[hook] = original; syncBuiltinESMExports() }
+    assert.ok(injected, `${phase}: ${change}`)
+    assert.equal(result.ok, false, `${phase}: ${change}`)
+    if (editedFile) assert.equal(await readFile(editedFile, 'utf8'), editedAfter, `${phase}: ${change}`)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry, `${phase}: ${change}`)
+    if (editedFile) {
+      if (editedBefore) await writeFile(editedFile, editedBefore)
+      else await unlink(editedFile)
+    }
+    rows = []
+    if (result.recoveryRequired) await finishWorkflow(h.paths, { processes: [] })
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry, `${phase}: ${change}`)
+    await keepLocal(h.paths)
+    const fresh = await h.selection(), finished = await executeMove([fresh.from], fresh.to, h.paths, { processes: [] })
+    assert.equal(finished.ok, true, `${phase}: ${change}`)
+    assert.equal(finished.receipt.sessions.length, 2, `${phase}: ${change}`)
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  }
+})
+
+test('Keep local validates target identity and recovery even when only held work remains', async () => {
+  for (const change of ['sessionId', 'cliSessionId', 'cwd', 'missing transcript', 'missing record']) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(id(710), [entry('user', 2, null, id(710))])
+    await h.record('P', id(710), rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const moved = await executeMove([from], to, h.paths, { processes: desktopFixture(id(710)), moveOnly: true })
+    const row = moved.receipt.sessions[0]
+    if (change === 'missing transcript') await unlink(row.targetTranscript)
+    else if (change === 'missing record') await unlink(row.record)
+    else await writeFile(row.record, JSON.stringify({ ...JSON.parse(await readFile(row.record)), [change]: change === 'sessionId' ? `local_${id(711)}` : change === 'cliSessionId' ? id(711) : '/tmp/changed' }))
+    const kept = await keepLocal(h.paths)
+    assert.ok(kept.refused.length, change)
+    assert.equal(kept.receipt.held.length, 1)
+  }
+})
+
+test('Finish of held local work treats an earlier refusal as information', async () => {
+  const h = await home(), cold = id(712)
+  for (const [index, sid] of [SOURCE, cold].entries()) {
+    await h.write(sid, [entry('user', index + 1, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const first = await executeMove([from], to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  first.receipt.failed.push({ id: id(713), title: 'Earlier refusal', error: 'scheduled task family member missing' })
+  await writeFile(first.file, JSON.stringify(first.receipt))
+  const finished = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(finished.ok, true)
+  assert.equal(finished.complete, true)
+  assert.deepEqual(finished.failed, [])
+  assert.equal(finished.notMoved.length, 1)
+})
+
+test('task scheduler safety uses the exact organization and rechecks account switches', async () => {
+  for (const switching of [false, true]) {
+    const h = await taskFamilyFixture(), f = await identityFixture(h)
+    await f.write(f.init(1, h.acct.P, h.org.Q))
+    const { from, to } = await h.selection()
+    let switched = false
+    const result = await executeMove([from], to, h.paths, { processes: f.processes, report: (stage, text, extra) => {
+      if (!switching || switched || stage !== 'move' || extra?.completed !== 1 || JSON.parse(readFileSync(h.sourceFile)).scheduledTasks.length) return
+      switched = true
+      writeFileSync(path.join(h.paths.logs, 'main.log'), f.event(2, '[LocalSessionManager] Org changed'))
+    } })
+    if (!switching) assert.equal(result.receipt.sessions.length, 4)
+    else {
+      assert.equal(switched, true)
+      assert.equal(result.recoveryRequired, true)
+      assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+      const swept = await sweep(h.paths, { processes: f.processes })
+      assert.equal(swept.ok, false)
+      assert.match(swept.error, /scheduler requires/)
+      await finishWorkflow(h.paths, { processes: [] })
+      assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    }
+  }
+})
+
+test('task Undo preserves absent directories and registries and only tolerates ENOENT on removal', async () => {
+  for (const scenario of ['directory', 'registry', 'fields', 'ENOENT', 'EACCES']) {
+    const h = await taskFamilyFixture(), registry = scenario === 'fields' ? { future: { intact: true } } : null
+    if (registry) await writeFile(h.targetFile, JSON.stringify(registry))
+    else if (scenario === 'directory') await fs.rm(h.dir('T'), { recursive: true })
+    else await unlink(h.targetFile)
+    const { from, to } = await h.selection()
+    assert.deepEqual(to.sessions, [])
+    const moved = await executeMove([from], to, h.paths, { processes: [] })
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions.length, 4)
+    const target = await readFile(h.targetFile), original = fs.unlink
+    assert.deepEqual(JSON.parse(target), { ...registry, scheduledTasks: h.tasks,
+      recordedSkips: { task_0: h.sourceRegistry.recordedSkips.task_0, task_1: h.sourceRegistry.recordedSkips.task_1 }, runRetries: { task_0: h.sourceRegistry.runRetries.task_0 } })
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceAfter)
+    let removals = 0, undone
+    fs.unlink = async (...args) => {
+      if (args[0] !== h.targetFile || !scenario.startsWith('E')) return original(...args)
+      removals++
+      if (scenario === 'ENOENT') await original(...args)
+      throw Object.assign(new Error('fixture registry removal failure'), { code: scenario })
+    }
+    syncBuiltinESMExports()
+    try {
+      if (scenario === 'EACCES') await assert.rejects(undo(h.paths, { processes: [] }), { code: scenario, message: 'fixture registry removal failure' })
+      else undone = await undo(h.paths, { processes: [] })
+    } finally { fs.unlink = original; syncBuiltinESMExports() }
+    if (scenario.startsWith('E')) assert.equal(removals, 1)
+    if (scenario === 'EACCES') {
+      assert.deepEqual(await readFile(h.targetFile), target)
+      undone = await finishWorkflow(h.paths, { processes: [] })
+    }
+    assert.ok(undone.dest)
+    assert.deepEqual(await readdir(h.dir('T')), registry ? ['scheduled-tasks.json'] : [])
+    assert.deepEqual(await readFile(h.targetFile).then(JSON.parse, error => { if (error.code === 'ENOENT') return null; throw error }), registry)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    for (const sid of [SOURCE, h.run, h.second, h.cold]) assert.ok(await readFile(path.join(h.dir('P'), `local_${sid}.json`)))
+  }
+})
+
+test('task notification identities may differ from CLI ids and remain protected during recovery', async () => {
+  const h = await taskFamilyFixture()
+  h.notificationId = id(714)
+  await h.record('P', SOURCE, rehomeRecord({ sessionId: `local_${h.notificationId}` }))
+  await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('P'), `local_${h.notificationId}.json`))
+  for (const task of h.tasks) task.notifySessionId = `local_${h.notificationId}`
+  for (const [index, sid] of [h.run, h.second].entries()) await h.record('P', sid, rehomeRecord({ scheduledTaskId: h.tasks[index].id, notifySessionId: `local_${h.notificationId}` }))
+  await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+  await interruptTaskFamily(h, 'move', 'record')
+  const file = path.join(h.dir('T'), `local_${h.notificationId}.json`), before = await readFile(file)
+  await writeFile(file, JSON.stringify({ ...JSON.parse(before), title: 'Changed after interruption' }))
+  const refused = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(refused.recoveryRequired, true)
+  assert.match(refused.reconciled.error, /task.*record changed/)
+  await writeFile(file, before)
+  await finishWorkflow(h.paths, { processes: [] })
+  const finished = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finished.ok, true)
+  assert.equal(JSON.parse(await readFile(file)).sessionId, `local_${h.notificationId}`)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+})
+
+test('task registry edits during publication and Undo retain their values and recovery', async () => {
+  for (const phase of ['publication', 'undo']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    if (phase === 'undo') await executeMove([from], to, h.paths, { processes: [] })
+    const hook = phase === 'publication' ? 'writeFile' : 'rename', original = fs[hook]
+    let injected = false
+    fs[hook] = async (...args) => {
+      const result = await original(...args)
+      const matches = phase === 'publication' ? String(args[0]).startsWith(h.targetFile + '.') : args[0] === path.join(h.dir('T'), `local_${SOURCE}.json`)
+      if (matches && !injected) {
+        injected = true
+        const registry = JSON.parse(await readFile(h.targetFile))
+        registry.duringWrite = { preserved: true }
+        if (phase === 'undo') registry.scheduledTasks.push({ ...h.tasks[0], enabled: true })
+        await originalWrite(h.targetFile, JSON.stringify(registry))
+      }
+      return result
+    }
+    const originalWrite = phase === 'publication' ? original : fs.writeFile
+    syncBuiltinESMExports()
+    let result
+    try { result = phase === 'publication' ? await executeMove([from], to, h.paths, { processes: [] }) : await undo(h.paths, { processes: [] }) }
+    finally { fs[hook] = original; syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)).duringWrite, { preserved: true })
+    if (phase === 'publication') {
+      assert.equal(result.ok, true)
+      assert.equal(result.receipt.sessions.length, 4)
+      assert.ok((await undo(h.paths, { processes: [] })).dest)
+    } else {
+      assert.match(result.restoreProblems.join(' '), /scheduled task/)
+      const registry = JSON.parse(await readFile(h.targetFile))
+      assert.equal(registry.scheduledTasks.find(task => task.id === h.tasks[0].id).enabled, true)
+      registry.scheduledTasks = registry.scheduledTasks.filter(task => !h.tasks.some(owned => owned.id === task.id))
+      await writeFile(h.targetFile, JSON.stringify(registry))
+      assert.ok((await finishWorkflow(h.paths, { processes: [] })).dest)
+    }
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), { ...h.targetRegistry, duringWrite: { preserved: true } })
+  }
+})
+
+test('a late destination alias cannot take a task family through an id collision', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), alias = id(715)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  await h.record('T', SOURCE, rehomeRecord({ sessionId: `local_${alias}` }))
+  await rename(path.join(h.dir('T'), `local_${SOURCE}.json`), path.join(h.dir('T'), `local_${alias}.json`))
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.match(result.receipt.failed.at(-1).error, /session id collision/)
+})
+
+test('rehome eligibility stays narrow around ownership locks', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const sourceRecord = JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`), 'utf8'))
+  await writeFile(path.join(h.dir('P'), `local_${SOURCE}.json`), JSON.stringify({ ...sourceRecord, scheduledTaskId: 'task_fixture' }))
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  const inv = await inventory([from], to, h.paths)
+  assert.equal(inv.move.length, 0)
+  assert.equal(inv.blocked.length, 1)
+  assert.match(inv.blocked[0].error, /scheduled task/)
+})
+
+test('an unresolved parent is named and left untouched', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, { forkedFromSessionId: `local_${id(778)}` })
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths)
+  assert.deepEqual(inv.move, [])
+  assert.equal(inv.blocked.length, 1)
+  assert.match(inv.blocked[0].error, /parent Desktop record is absent/)
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, false)
+  assert.equal(result.validationOnly, true)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.deepEqual(await readdir(h.dir('Z')), [])
+})
+
+test('same-account rehome preserves a parent link when both records move', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const child = id(778)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.write(child, [entry('user', 2, null, child)])
+  await h.record('P', SOURCE, rehomeRecord())
+  await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  const inv = await inventory([from], to, h.paths)
+  assert.deepEqual(inv.move.map((row) => row.strategy), ['rehome', 'rehome'])
+  const result = await move(inv, to, h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.every((row) => row.strategy === 'rehome'), true)
+  const childRecord = JSON.parse(await readFile(path.join(teamDir, `local_${child}.json`), 'utf8'))
+  assert.equal(childRecord.forkedFromSessionId, `local_${SOURCE}`)
+  assert.deepEqual((await readdir(h.project)).sort(), [`${SOURCE}.jsonl`, `${child}.jsonl`].sort())
+})
+
+test('compatible Desktop parent and archived fork move separately and undo without changing history', async () => {
+  for (const richer of ['parent', 'fork']) {
+    const h = await home(), child = id(777)
+    const targetDir = path.join(h.paths.records, h.acct.P, h.org.T)
+    await mkdir(targetDir, { recursive: true })
+    const base = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+    const branch = fork(base, SOURCE, child, 'Archived fork')
+    await h.write(SOURCE, richer === 'parent' ? [...base, entry('user', 3, 2, SOURCE)] : base)
+    await h.write(child, richer === 'fork' ? [...branch, entry('user', 4, null, child)] : branch)
+    await h.record('P', SOURCE, rehomeRecord({ title: 'Parent', isArchived: false, isStarred: true }))
+    await h.record('P', child, rehomeRecord({ title: 'Archived fork', isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+    const files = []
+    for (const sid of [SOURCE, child]) {
+      await mkdir(path.join(h.project, sid), { recursive: true })
+      const sidecar = path.join(h.project, sid, `${sid}.txt`)
+      await writeFile(sidecar, `supporting data for ${sid}`)
+      for (const file of [path.join(h.project, `${sid}.jsonl`), sidecar]) files.push({ file, bytes: await readFile(file), inode: (await stat(file)).ino })
+    }
+    const originalRecords = await Promise.all([SOURCE, child].map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`))))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P && row.org === h.org.P), to = all.find(row => row.account === h.acct.P && row.org === h.org.T)
+    const inv = await inventory([from], to, h.paths)
+    assert.deepEqual(inv.blocked.map(row => row.error), [])
+    assert.deepEqual(inv.move.map(row => row.id), [SOURCE, child])
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.sessions.length, 2)
+    assert.equal(moved.receipt.sessions.every(row => row.strategy === 'rehome'), true)
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    const parent = JSON.parse(await readFile(path.join(targetDir, `local_${SOURCE}.json`)))
+    const archived = JSON.parse(await readFile(path.join(targetDir, `local_${child}.json`)))
+    assert.equal(parent.title, 'Parent')
+    assert.equal(parent.isStarred, true)
+    assert.equal(parent.isArchived, false)
+    assert.equal(archived.title, 'Archived fork')
+    assert.equal(archived.isArchived, true)
+    assert.equal(archived.forkedFromSessionId, parent.sessionId)
+    for (const file of files) {
+      assert.deepEqual(await readFile(file.file), file.bytes)
+      assert.equal((await stat(file.file)).ino, file.inode)
+    }
+    const restored = await undo(h.paths)
+    assert.ok(restored.dest)
+    assert.deepEqual(await readdir(targetDir), [])
+    for (const [index, sid] of [SOURCE, child].entries()) assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${sid}.json`)), originalRecords[index])
+  }
+})
+
+test('a Desktop fork is preserved when its parent already covers its history in the destination', async () => {
+  const h = await home(), child = id(777)
+  const base = [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)]
+  await h.write(SOURCE, base)
+  await h.write(child, fork(base, SOURCE, child, 'Archived fork'))
+  await h.record('T', SOURCE, rehomeRecord({ title: 'Parent' }))
+  await h.record('P', child, rehomeRecord({ title: 'Archived fork', isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const inv = await inventory([from], to, h.paths)
+  assert.equal(inv.there.length, 0)
+  assert.deepEqual(inv.move.map(row => row.id), [child])
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.ok, true)
+  assert.equal(moved.receipt.superseded.some(row => !row.source), false)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual((await readdir(h.dir('T'))).sort(), [`local_${SOURCE}.json`, `local_${child}.json`].sort())
+  const archived = JSON.parse(await readFile(path.join(h.dir('T'), `local_${child}.json`)))
+  assert.equal(archived.isArchived, true)
+  assert.equal(archived.forkedFromSessionId, `local_${SOURCE}`)
+})
+
+test('destination parents survive richer replacements while Desktop forks still refer to them', async () => {
+  for (const location of ['source', 'destination', 'without history']) for (const isArchived of [false, true]) {
+    const h = await home(), richer = id(776), child = id(777)
+    const base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('T', SOURCE, rehomeRecord({ title: 'Parent' }))
+    await h.write(richer, [...fork(base, SOURCE, richer, 'Richer copy'), entry('user', 3, null, richer)])
+    await h.record('P', richer, rehomeRecord({ title: 'Richer copy' }))
+    if (location !== 'without history') await h.write(child, fork(base, SOURCE, child, 'Fork'))
+    await h.record(location === 'source' ? 'P' : 'T', child, rehomeRecord({ title: 'Fork', isArchived, forkedFromSessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = await Promise.all([...from.sessions, ...to.sessions].map(async row => [row.file, await readFile(row.file)]))
+    const inv = await inventory([from], to, h.paths)
+    assert.deepEqual(inv.move.map(row => row.id), location === 'source' ? [richer, child] : [richer])
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(moved.receipt.superseded.some(row => !row.source), false)
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    assert.deepEqual((await readdir(h.dir('T'))).sort(), [SOURCE, richer, child].map(sid => `local_${sid}.json`).sort())
+    const placed = JSON.parse(await readFile(path.join(h.dir('T'), `local_${child}.json`)))
+    assert.equal(placed.forkedFromSessionId, `local_${SOURCE}`)
+    assert.equal(placed.isArchived, isArchived)
+    assert.ok((await undo(h.paths)).dest)
+    assert.deepEqual((await readdir(h.dir('T'))).sort(), to.sessions.map(row => path.basename(row.file)).sort())
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+  }
+})
+
+test('required Desktop parents move by exact id despite richer compatible histories', async () => {
+  for (const location of ['P', 'T']) {
+    const h = await home(), richer = id(776), child = id(777), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(richer, [...fork(base, SOURCE, richer, 'Richer'), entry('user', 3, null, richer)])
+    await h.record(location, richer, rehomeRecord())
+    await h.write(child, fork(base, SOURCE, child, 'Fork'))
+    await h.record('P', child, rehomeRecord({ isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)]))
+    const inv = await inventory([from], to, h.paths)
+    assert.deepEqual(inv.blocked, [])
+    assert.deepEqual(inv.there, [])
+    assert.ok(inv.move.findIndex(row => row.id === SOURCE) < inv.move.findIndex(row => row.id === child))
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.deepEqual(moved.receipt.failed, [])
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    const placed = JSON.parse(await readFile(path.join(h.dir('T'), `local_${child}.json`)))
+    assert.equal(placed.forkedFromSessionId, `local_${SOURCE}`)
+    assert.equal(placed.isArchived, true)
+    assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+    assert.ok((await undo(h.paths)).dest)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    assert.deepEqual(await readdir(h.dir('T')), location === 'T' ? [`local_${richer}.json`] : [])
+  }
+})
+
+test('source parents stay with forks omitted, held, unreadable, empty, or failed', async () => {
+  for (const reason of ['omitted', 'worker', 'task', 'missing', 'empty', 'unreadable']) {
+    const h = await home(), richer = id(776), child = id(777), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(richer, [...fork(base, SOURCE, richer, 'Richer'), entry('user', 3, null, richer)])
+    await h.record('T', richer, rehomeRecord())
+    if (reason !== 'missing') await h.write(child, reason === 'empty' ? [] : fork(base, SOURCE, child, 'Fork'))
+    if (reason === 'unreadable') await appendFile(path.join(h.project, `${child}.jsonl`), '{broken\n')
+    const childRecord = rehomeRecord({ isArchived: true, forkedFromSessionId: `local_${SOURCE}`, ...(reason === 'task' ? { scheduledTaskId: 'fixture' } : {}) })
+    await h.record('P', child, childRecord)
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const source = reason === 'omitted' ? { ...from, sessions: from.sessions.filter(row => row.id === SOURCE) } : from
+    const inv = await inventory([source], to, h.paths, () => {}, { processes: reason === 'worker' ? desktopFixture(child) : [] })
+    const originals = await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)]))
+    const moved = await move(inv, to, h.paths)
+    if (['omitted', 'missing', 'empty'].includes(reason)) assert.equal(moved, null, reason)
+    else assert.equal(moved.receipt.superseded.some(row => row.source), false, reason)
+    assert.deepEqual((await readdir(h.dir('P'))).sort(), [SOURCE, child].map(sid => `local_${sid}.json`).sort())
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+  }
+})
+
+test('source parent retention follows ancestry within the affected account', async () => {
+  for (const location of ['P', 'Q']) {
+    const h = await home(), parent = id(776), child = id(777), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.write(parent, fork(base, SOURCE, parent, 'Parent'))
+    for (const account of new Set(['P', 'T', location])) {
+      await h.record(account, SOURCE, rehomeRecord())
+      await h.record(account, parent, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+    }
+    await h.record(location, child, rehomeRecord({ isArchived: true, forkedFromSessionId: `local_${parent}` }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const inv = await inventory([from], to, h.paths)
+    assert.equal(inv.there.length, 2)
+    const moved = await move(inv, to, h.paths)
+    if (location === 'P') assert.equal(moved, null)
+    else {
+      assert.equal(moved.ok, true)
+      assert.deepEqual(moved.receipt.failed, [])
+      assert.equal(moved.receipt.superseded.length, 2)
+    }
+    assert.deepEqual((await readdir(h.dir(location))).sort(), [SOURCE, parent, child].map(sid => `local_${sid}.json`).sort())
+    if (location === 'Q') {
+      assert.deepEqual(await readdir(h.dir('P')), [])
+      assert.ok((await undo(h.paths)).dest)
+    }
+  }
+})
+
+test('held forks move and retire their parents through Finish, sweep, and Undo', async () => {
+  for (const present of [false, true]) for (const continuation of [finishHeld, finishWorkflow, sweep]) {
+    const h = await home(), child = id(777), cold = id(778), later = id(779), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(child, fork(base, SOURCE, child, 'Fork'))
+    await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+    await h.write(cold, branchEntries(2, cold, 300))
+    await h.record('P', cold, rehomeRecord())
+    if (present) await h.record('T', SOURCE, rehomeRecord())
+    const originalParent = present ? await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)) : null
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)]))
+    const moved = await executeMove([from], to, h.paths, { processes: desktopFixture(child), moveOnly: true })
+    assert.equal(moved.ok, true)
+    assert.equal(moved.complete, false)
+    assert.deepEqual(moved.receipt.held.map(row => row.id), [child, SOURCE])
+    assert.deepEqual(moved.receipt.sessions.map(row => row.id), [cold])
+    assert.deepEqual(moved.receipt.failed, [])
+    assert.deepEqual((await readdir(h.dir('P'))).sort(), [SOURCE, child].map(sid => `local_${sid}.json`).sort())
+    assert.deepEqual((await readdir(h.dir('T'))).sort(), [cold, ...(present ? [SOURCE] : [])].map(sid => `local_${sid}.json`).sort())
+    await h.write(later, branchEntries(2, later, 400))
+    await h.record('P', later, rehomeRecord())
+    const result = await continuation(h.paths, { processes: [] }), finished = result.result ?? result
+    assert.equal(finished.file, moved.file)
+    assert.equal(finished.receipt.at, moved.receipt.at)
+    assert.equal(finished.ok, true)
+    assert.equal(finished.complete, true)
+    assert.deepEqual(finished.receipt.held, [])
+    assert.deepEqual(finished.receipt.failed, [])
+    assert.deepEqual(await readdir(h.dir('P')), [`local_${later}.json`])
+    assert.deepEqual((await readdir(h.dir('T'))).sort(), [SOURCE, child, cold].map(sid => `local_${sid}.json`).sort())
+    assert.equal((await sweep(h.paths, { processes: [] })).complete, true)
+    const undone = await undo(h.paths)
+    assert.ok(undone.dest)
+    assert.equal(JSON.parse(await readFile(path.join(undone.dest, 'receipt.json'))).at, moved.receipt.at)
+    assert.deepEqual(await readdir(h.dir('T')), present ? [`local_${SOURCE}.json`] : [])
+    if (present) assert.deepEqual(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)), originalParent)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    assert.ok(await readFile(path.join(h.dir('P'), `local_${later}.json`)))
+  }
+})
+
+test('held fork families include ancestors and siblings only in the same source account and org', async () => {
+  for (const sameLogin of [false, true]) {
+    const h = await home(), parent = id(776), child = id(777), sibling = id(778), other = id(779), base = branchEntries(2, SOURCE, 1)
+    if (sameLogin) { h.acct.Q = h.acct.P; await mkdir(h.dir('Q'), { recursive: true }) }
+    const parentEntries = fork(base, SOURCE, parent, 'Parent')
+    for (const [sid, entries, forkedFromSessionId] of [
+      [SOURCE, base, null],
+      [parent, parentEntries, `local_${SOURCE}`],
+      [child, fork(parentEntries, parent, child, 'Child'), `local_${parent}`],
+      [sibling, fork(parentEntries, parent, sibling, 'Sibling'), `local_${parent}`]
+    ]) {
+      await h.write(sid, entries)
+      await h.record('P', sid, rehomeRecord({ forkedFromSessionId }))
+    }
+    await h.record('T', SOURCE, rehomeRecord())
+    await h.write(other, fork(base, SOURCE, other, 'Other source fork'))
+    await h.record('Q', other, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths), from = all.filter(row => [h.org.P, h.org.Q].includes(row.org)), to = all.find(row => row.account === h.acct.T)
+    const originals = await Promise.all(from.flatMap(row => row.sessions).map(async row => [row.file, await readFile(row.file)]))
+    const table = [...desktopFixture(child), { ...desktopFixture(id(888))[1], pid: 502, started: 'collateral' }]
+    const plan = await restartPlan(await inventory(from, to, h.paths, () => {}, { processes: table }), h.paths, table)
+    assert.deepEqual(new Set(plan.held.map(row => row.id)), new Set([SOURCE, parent, child, sibling]))
+    assert.deepEqual(plan.interrupts.map(row => row.pid), [502])
+    assert.ok(plan.held.every(row => row.workers.length === 1 && row.workers[0].pid === 501 && row.sources.every(source => source.account === h.acct.P && source.org === h.org.P)))
+    const moved = await executeMove(from, to, h.paths, { processes: table, moveOnly: true })
+    assert.equal(moved.ok, true)
+    assert.deepEqual(moved.receipt.sessions.map(row => row.id), [other])
+    assert.deepEqual(await readdir(h.dir('Q')), [])
+    const finished = await finishHeld(h.paths, { processes: [] })
+    assert.equal(finished.ok, true)
+    assert.equal(finished.complete, true)
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    assert.ok((await undo(h.paths)).dest)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    assert.deepEqual(await readdir(h.dir('T')), [`local_${SOURCE}.json`])
+  }
+})
+
+test('unreadable Desktop metadata stops retirement and preserves recoverable source and destination records', async () => {
+  const h = await home(), child = id(777), corrupt = id(778), base = branchEntries(2, SOURCE, 1)
+  await h.write(SOURCE, base)
+  await h.record('P', SOURCE, rehomeRecord())
+  await h.write(child, fork(base, SOURCE, child, 'Fork'))
+  await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const originals = await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)]))
+  const inv = await inventory([from], to, h.paths)
+  const corruptFile = path.join(h.dir('P'), `local_${corrupt}.json`)
+  await writeFile(corruptFile, '{broken')
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.ok, false)
+  assert.match(moved.receipt.failed.at(-1).error, /unreadable Desktop record:/)
+  assert.deepEqual(moved.receipt.superseded, [])
+  assert.equal(moved.receipt.retiring, null)
+  assert.equal(moved.receipt.sessions.length, 0)
+  for (const [file, bytes] of originals) {
+    assert.deepEqual(await readFile(file), bytes)
+    assert.equal(await stat(path.join(h.dir('T'), path.basename(file))).catch(() => null), null)
+  }
+  const swept = await sweep(h.paths, { processes: [] })
+  assert.match(swept.verification.notMoved.at(-1).error, /unreadable Desktop record/)
+  await unlink(corruptFile)
+  assert.ok((await undo(h.paths)).dest)
+  for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('Undo refuses new destination forks before cloud or local changes and on every recovery entry', async () => {
+  for (const staged of [false, true]) for (const unreadable of [false, true]) {
+    const h = await home(), child = id(777), cold = id(778), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('P', SOURCE, rehomeRecord({ title: 'Parent' }))
+    await h.write(cold, branchEntries(2, cold, 300))
+    await h.record('P', cold, rehomeRecord())
+    const calls = []
+    let status = 'active'
+    const cloud = cloudFixture(h, {
+      list: async () => [remoteSession({ id: 'cse_undo_parent', title: 'Parent', status })],
+      eventRows: async () => remoteRows(base),
+      session: async () => { calls.push('session'); return remoteState(status) },
+      archive: async () => { calls.push('archive'); status = 'archived' },
+      unarchive: async () => { calls.push('unarchive'); status = 'active' }
+    })
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)]))
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.equal(status, 'archived')
+    if (staged) assert.deepEqual((await undo(h.paths, { cloud: { ...cloud, account: h.acct.Q, org: h.org.Q } })).pendingUndo, [from.email])
+    const childFile = path.join(h.dir('T'), `local_${child}.json`)
+    if (unreadable) await writeFile(childFile, '{broken')
+    else await h.record('T', child, rehomeRecord({ isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+    const receiptBytes = await readFile(moved.file)
+    const destination = await Promise.all((await readdir(h.dir('T'))).map(async name => [path.join(h.dir('T'), name), await readFile(path.join(h.dir('T'), name))]))
+    calls.length = 0
+    for (const operation of staged ? [undo, finishPending, finishWorkflow, sweep] : [undo]) {
+      const result = await operation(h.paths, { cloud, processes: [] })
+      const problems = result.restoreProblems ?? (result.reconciled ?? result.recovered)?.problems
+      if (operation === sweep) assert.equal(result.pending, true)
+      else assert.match(problems[0], unreadable ? /unreadable Desktop record:/ : /parent Desktop record would be removed by Undo/)
+      assert.equal(result.dest, undefined)
+      assert.deepEqual(calls, [])
+      assert.equal(status, 'archived')
+      assert.deepEqual(await readFile(moved.file), receiptBytes)
+      assert.deepEqual(await readdir(h.dir('P')), [])
+      for (const [file, bytes] of destination) assert.deepEqual(await readFile(file), bytes)
+    }
+    await unlink(childFile)
+    const undone = await undo(h.paths, { cloud })
+    assert.ok(undone.dest)
+    assert.equal(status, 'active')
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    assert.deepEqual(await readdir(h.dir('T')), [])
+  }
+})
+
+test('Undo rechecks destination forks after cloud restoration before removing any local record', async () => {
+  const h = await home(), child = id(777), base = branchEntries(2, SOURCE, 1)
+  await h.write(SOURCE, base)
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Parent' }))
+  let status = 'active'
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_undo_parent', title: 'Parent', status })],
+    eventRows: async () => remoteRows(base),
+    session: async () => remoteState(status),
+    archive: async () => { status = 'archived' },
+    unarchive: async () => {
+      await h.record('T', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+      status = 'active'
+    }
+  })
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
+  assert.equal(moved.ok, true)
+  const parentFile = path.join(h.dir('T'), `local_${SOURCE}.json`), parentBytes = await readFile(parentFile)
+  const refused = await undo(h.paths, { cloud })
+  assert.match(refused.restoreProblems[0], /parent Desktop record would be removed by Undo/)
+  assert.equal(status, 'active')
+  assert.deepEqual(await readFile(parentFile), parentBytes)
+  assert.deepEqual((await readdir(h.dir('T'))).sort(), [SOURCE, child].map(sid => `local_${sid}.json`).sort())
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.ok(JSON.parse(await readFile(moved.file)).undoing)
+  await unlink(path.join(h.dir('T'), `local_${child}.json`))
+  assert.ok((await undo(h.paths, { cloud })).dest)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('Undo restores destination parents when forks arrive during local mutations and remains recoverable', async () => {
+  for (const stage of ['restore source', 'park destination']) for (const unreadable of [false, true]) {
+    const h = await home(), child = id(777), later = id(778), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(child, fork(base, SOURCE, child, 'Moved fork'))
+    await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)]))
+    const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+    assert.equal(moved.ok, true)
+    const destination = await Promise.all(moved.receipt.sessions.map(async row => [row.record, await readFile(row.record)]))
+    const sourceParent = path.join(h.dir('P'), `local_${SOURCE}.json`), targetParent = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    const originalRename = fs.rename
+    let injected = false, refused
+    try {
+      fs.rename = async (source, target) => {
+        await originalRename(source, target)
+        if (injected || !(stage === 'restore source' ? target === sourceParent : source === targetParent)) return
+        injected = true
+        if (unreadable) await writeFile(path.join(h.dir('T'), `local_${later}.json`), '{broken')
+        else await h.record('T', later, rehomeRecord({ isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+      }
+      syncBuiltinESMExports()
+      refused = await undo(h.paths)
+    } finally {
+      fs.rename = originalRename
+      syncBuiltinESMExports()
+    }
+    assert.equal(injected, true)
+    assert.equal(refused.dest, undefined)
+    assert.match(refused.restoreProblems[0], unreadable ? /unreadable Desktop record:/ : /parent Desktop record would be removed by Undo/)
+    for (const [file, bytes] of destination) assert.deepEqual(await readFile(file), bytes)
+    if (!unreadable) assert.equal(JSON.parse(await readFile(path.join(h.dir('T'), `local_${later}.json`))).forkedFromSessionId, `local_${SOURCE}`)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    const receipt = JSON.parse(await readFile(moved.file))
+    assert.equal(receipt.undoing.length, 2)
+    assert.deepEqual(receipt.superseded, moved.receipt.superseded)
+    for (const row of receipt.superseded) for (const [, parked] of row.moved) assert.equal(await readFile(parked).catch(() => null), null)
+    const retried = await finishPending(h.paths)
+    assert.equal(retried.ok, false)
+    assert.match(retried.reconciled.problems[0], unreadable ? /unreadable Desktop record:/ : /parent Desktop record would be removed by Undo/)
+    for (const [file, bytes] of destination) assert.deepEqual(await readFile(file), bytes)
+    await unlink(path.join(h.dir('T'), `local_${later}.json`))
+    const undone = await finishWorkflow(h.paths)
+    assert.ok(undone.dest)
+    assert.equal(undone.complete, true)
+    assert.equal(JSON.parse(await readFile(path.join(undone.dest, 'receipt.json'))).at, moved.receipt.at)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    assert.deepEqual(await readdir(h.dir('T')), [])
+  }
+})
+
+test('Undo rollback preserves foreign records and source forks while restoring every safe destination record', async () => {
+  for (const change of ['source record', 'destination parent', 'destination sibling', 'source fork']) {
+    const h = await home(), child = id(777), later = id(778), sourceFork = id(779), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(child, fork(base, SOURCE, child, 'Moved fork'))
+    await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const originals = new Map(await Promise.all(from.sessions.map(async row => [row.file, await readFile(row.file)])))
+    const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+    assert.equal(moved.ok, true)
+    const destination = new Map(await Promise.all(moved.receipt.sessions.map(async row => [row.record, await readFile(row.record)])))
+    const sourceParent = path.join(h.dir('P'), `local_${SOURCE}.json`), targetParent = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    const targetChild = path.join(h.dir('T'), `local_${child}.json`), parkedParent = path.join(h.paths.state, 'quarantine', moved.receipt.at, path.basename(targetParent))
+    const foreignFile = change === 'source record' ? sourceParent : change === 'destination parent' ? targetParent : change === 'destination sibling' ? targetChild : path.join(h.dir('P'), `local_${sourceFork}.json`)
+    const originalRename = fs.rename
+    let injected = false, refused, foreignBytes
+    try {
+      fs.rename = async (source, target) => {
+        await originalRename(source, target)
+        if (injected || source !== targetParent || target !== parkedParent) return
+        injected = true
+        await h.record('T', later, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+        if (change === 'source fork') await h.record('P', sourceFork, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+        else await h.record(change === 'source record' ? 'P' : 'T', change === 'destination sibling' ? child : SOURCE,
+          rehomeRecord({ title: 'Independent change', ...(change === 'destination sibling' ? { forkedFromSessionId: `local_${SOURCE}` } : {}) }))
+        foreignBytes = await readFile(foreignFile)
+      }
+      syncBuiltinESMExports()
+      refused = await undo(h.paths)
+    } finally {
+      fs.rename = originalRename
+      syncBuiltinESMExports()
+    }
+    assert.equal(injected, true)
+    assert.equal(refused.dest, undefined)
+    assert.match(refused.restoreProblems[0], /parent Desktop record would be removed by Undo/)
+    if (change !== 'source fork') assert.ok(refused.restoreProblems.some(problem => /restore path occupied|recovery artifact changed/.test(problem)))
+    assert.deepEqual(await readFile(foreignFile), foreignBytes)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), file === foreignFile ? foreignBytes : bytes)
+    for (const [file, bytes] of destination) assert.deepEqual(await readFile(file), file === foreignFile ? foreignBytes : bytes)
+    if (change === 'destination parent') assert.deepEqual(await readFile(parkedParent), destination.get(targetParent))
+    const receipt = JSON.parse(await readFile(moved.file))
+    assert.equal(receipt.undoing.length, 2)
+    assert.deepEqual(receipt.superseded, moved.receipt.superseded)
+    if (change !== 'source fork') {
+      await rename(foreignFile, `${foreignFile}.foreign`)
+      if (change === 'source record') await writeFile(foreignFile, originals.get(foreignFile))
+      if (change === 'destination sibling') await writeFile(foreignFile, destination.get(foreignFile))
+    }
+    await unlink(path.join(h.dir('T'), `local_${later}.json`))
+    const undone = await finishWorkflow(h.paths)
+    assert.ok(undone.dest)
+    assert.equal(undone.complete, true)
+    for (const [file, bytes] of originals) assert.deepEqual(await readFile(file), bytes)
+    for (const file of destination.keys()) assert.equal(await readFile(file).catch(() => null), null)
+    assert.deepEqual(await readFile(change === 'source fork' ? foreignFile : `${foreignFile}.foreign`), foreignBytes)
+  }
+})
+
+test('destination parents survive forks added after inventory or during final preparation', async () => {
+  for (const stage of ['inventory', 'finalize']) {
+    const h = await home(), richer = id(776), child = id(777), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record('T', SOURCE, rehomeRecord())
+    await h.write(richer, [...fork(base, SOURCE, richer, 'Richer'), entry('user', 3, null, richer)])
+    await h.record('P', richer, rehomeRecord())
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const inv = await inventory([from], to, h.paths)
+    const addFork = () => writeFileSync(path.join(h.dir('T'), `local_${child}.json`), JSON.stringify({ sessionId: `local_${child}`, cliSessionId: child, isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
+    if (stage === 'inventory') addFork()
+    const moved = await move(inv, to, h.paths, current => { if (stage === 'finalize' && current === stage) addFork() })
+    assert.equal(moved.ok, true)
+    assert.deepEqual(moved.receipt.failed, [])
+    assert.equal(moved.receipt.superseded.some(row => !row.source), false)
+    assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+    assert.ok((await undo(h.paths)).dest)
+    assert.deepEqual((await readdir(h.dir('T'))).sort(), [SOURCE, child].map(sid => `local_${sid}.json`).sort())
+  }
+})
+
+test('new or changed parent references during retirement roll back the journal', async () => {
+  for (const change of ['new', 'changed']) for (const location of ['P', 'T']) {
+    const h = await home(), richer = id(776), child = id(777), base = branchEntries(2, SOURCE, 1)
+    await h.write(SOURCE, base)
+    await h.record(location, SOURCE, rehomeRecord())
+    await h.write(richer, [...fork(base, SOURCE, richer, 'Richer'), entry('user', 3, null, richer)])
+    await h.record(location === 'P' ? 'T' : 'P', richer, rehomeRecord())
+    if (change === 'changed') await h.record(location, child, rehomeRecord({ isArchived: true }))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const inv = await inventory([from], to, h.paths)
+    let coordinate
+    const result = await move(inv, to, h.paths, (stage, text) => {
+      if (stage !== 'finalize' || text !== 'preparing') return
+      const taskFile = from.taskFile
+      assert.equal(spawnSync('/usr/bin/mkfifo', [taskFile]).status, 0)
+      coordinate = duringSecondRead(taskFile, JSON.stringify({ scheduledTasks: [] }), () => h.record(location, child, rehomeRecord({ isArchived: true, forkedFromSessionId: `local_${SOURCE}` })))
+    })
+    await coordinate
+    assert.equal(result.ok, location === 'T')
+    if (location === 'P') assert.match(result.receipt.failed.at(-1).error, /parent reference changed during retirement/)
+    assert.equal(result.receipt.retiring, null)
+    assert.deepEqual(result.receipt.superseded.map(row => row.id), location === 'T' ? [richer] : [])
+    assert.ok(await readFile(path.join(h.dir(location), `local_${SOURCE}.json`)))
+    const kept = JSON.parse(await readFile(path.join(h.dir(location), `local_${child}.json`)))
+    assert.equal(kept.forkedFromSessionId, `local_${SOURCE}`)
+    assert.equal(kept.isArchived, true)
+    if (location === 'T') assert.ok((await undo(h.paths)).dest)
+  }
+})
+
+test('identical Desktop parent and fork histories are reported as overlapping versions', async () => {
+  const h = await home(), child = id(777), base = branchEntries(2, SOURCE, 1)
+  await h.write(SOURCE, base)
+  await h.write(child, fork(base, SOURCE, child, 'Fork'))
+  await h.record('P', SOURCE, rehomeRecord())
+  await h.record('P', child, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}` }))
+  const result = await cli(h.root, ['--from', 'p@example.com personal', '--to', 'z@example.com personal', '--dry-run'])
+  assert.equal(result.code, 0)
+  assert.match(result.stdout, /2 overlapping versions, kept separate/)
+  assert.doesNotMatch(result.stdout, /grew apart/)
+})
+
+test('progress begins before analysis and every counted phase reaches its total', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  const progress = []
+  const report = (stage, text, extra = {}) => {
+    if (extra.live) progress.push({ stage, text, completed: extra.completed, total: extra.total })
+  }
+  const inv = await inventory([from], to, h.paths, report)
+  await move(inv, to, h.paths, report)
+  assert.deepEqual(progress[0], { stage: 'scan', text: '0/1', completed: 0, total: 1 })
+  for (const stage of ['scan', 'move', 'verify', 'retire']) {
+    const rows = progress.filter((row) => row.stage === stage && Number.isInteger(row.completed) && Number.isInteger(row.total))
+    assert.ok(rows.length >= 2, `${stage} did not report a counted phase`)
+    assert.equal(rows[0].completed, 0)
+    assert.equal(rows.at(-1).completed, rows.at(-1).total)
+    assert.ok(rows.every((row, i) => i === 0 || row.completed >= rows[i - 1].completed))
+  }
+})
+
+test('dry-run and real move agree that bridges rehome across logins', async () => {
+  const h = await home()
+  await h.write(SOURCE, [
+    entry('user', 1, null, SOURCE),
+    { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'session_fixture' }
+  ])
+  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_fixture'] }))
+  const sourceRecord = JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`), 'utf8'))
+  const dry = await cli(h.root, ['--from', `${h.acct.P} ${h.org.P}`, '--to', `${h.acct.Z} ${h.org.Z}`, '--dry-run', '--json'])
+  assert.equal(dry.code, 0, dry.stderr || dry.stdout)
+  const planned = dry.stdout.trim().split('\n').map((line) => JSON.parse(line)).at(-1)
+  assert.equal(planned.planned, 1)
+  assert.equal(planned.retiring, 1)
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const result = await move(await inventory([from], to, h.paths), to, h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions[0].strategy, 'rehome')
+  const placed = JSON.parse(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`), 'utf8'))
+  assert.deepEqual(placed.bridgeSessionIds, [])
+  assert.equal(placed.cliSessionId, SOURCE)
+  assert.deepEqual({ ...placed, bridgeSessionIds: ['session_fixture'] }, sourceRecord)
+  assert.ok((await undo(h.paths)).dest)
+  const restored = JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`), 'utf8'))
+  assert.deepEqual(restored.bridgeSessionIds, ['session_fixture'])
+})
+
+test('a bridge marker without a recognized id remains conservatively bridged', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), { type: 'bridge-session', sessionId: SOURCE }])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths)
+  assert.equal(inv.move[0].bridge, true)
+  assert.deepEqual(inv.move[0].bridgeIds, [])
+})
+
+test('the planning cache skips unchanged analysis but never authorizes a move', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const pick = async () => {
+    const all = await accounts(h.paths)
+    return {
+      from: all.find((a) => a.account === h.acct.P && a.org === h.org.P),
+      to: all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+    }
+  }
+  const selected = await pick()
+  const cold = await inventory([selected.from], selected.to, h.paths, () => {}, { writeCache: true })
+  assert.ok(cold.cacheStats.historyMisses > 0)
+  const cache = JSON.parse(await readFile(path.join(h.paths.state, 'cache.json'), 'utf8'))
+  assert.ok(Object.values(cache.histories).every((row) => typeof row.value.result.contentSha === 'string'))
+  const warm = await inventory([selected.from], selected.to, h.paths)
+  assert.ok(warm.cacheStats.historyHits > 0)
+  assert.equal(warm.cacheStats.historyMisses, 0)
+  assert.ok(warm.cacheStats.manifestHits > 0)
+
+  await appendFile(transcript, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`)
+  const reports = [], retried = await move(warm, selected.to, h.paths, (stage, text) => reports.push(`${stage} ${text}`))
+  assert.ok(reports.includes('recovery Retrying unfinished sessions once'))
+  assert.equal(retried.receipt.sessions.length, 1)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(teamDir), [`local_${SOURCE}.json`])
+})
+
+test('rehome verification catches transcript and sidecar drift after placement', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const sidecar = path.join(h.project, SOURCE, 'subagents', 'agent.jsonl')
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await mkdir(path.dirname(sidecar), { recursive: true })
+  await writeFile(sidecar, '{"before":true}\n')
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  const inv = await inventory([from], to, h.paths)
+  const reports = [], result = await move(inv, to, h.paths, (stage, text, progress) => {
+    reports.push(`${stage} ${text}`)
+    if (stage !== 'verify' || progress?.completed !== 0) return
+    appendFileSync(transcript, `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
+    appendFileSync(sidecar, '{"after":true}\n')
+  })
+  assert.ok(reports.includes('recovery Retrying unfinished sessions once'))
+  assert.equal(result.ok, true)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(teamDir), [`local_${SOURCE}.json`])
+})
+
+test('rehome retirement allows shared growth without duplicate records', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  let changed = false
+  const result = await move(await inventory([from], to, h.paths), to, h.paths, (stage, text) => {
+    if (stage !== 'retire' || text !== 'checking' || changed) return
+    changed = true
+    appendFileSync(transcript, `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
+  })
+  assert.equal(result.ok, true)
+  assert.equal(changed, true)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.deepEqual(await readdir(teamDir), [`local_${SOURCE}.json`])
+  assert.ok((await readFile(transcript, 'utf8')).includes('message 2'))
+})
+
+test('corrupt and legacy planning caches refresh replay analysis', async () => {
+  for (const state of ['corrupt', 'legacy']) {
+    const h = await home()
+    const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+    await mkdir(teamDir, { recursive: true })
+    const parent = entry('assistant', 1, null, SOURCE)
+    const full = entry('user', 2, 1, SOURCE, { toolUseResult: { type: 'image', file: { base64: Buffer.from('synthetic image bytes').toString('base64'), dimensions: { width: 1, height: 1 }, originalSize: 21, type: 'image/png' } } })
+    const replay = { ...full, toolUseResult: { ...full.toolUseResult, file: { ...full.toolUseResult.file, base64: '' } } }
+    const edits = [3, 4, 5, 6].flatMap(k => {
+      const original = entry('attachment', k, 2, SOURCE, { attachment: { type: 'edited_text_file', filename: `/tmp/fixture-${k}.txt`, snippet: `synthetic edit ${k}` } })
+      return [original, { ...original, attachment: { ...original.attachment, displayPath: `fixture-${k}.txt` } }]
+    })
+    const entries = [parent, full, replay, ...edits]
+    assert.equal(normalize(entries).replays, 5)
+    await h.write(SOURCE, entries)
+    await h.record('P', SOURCE, rehomeRecord())
+    const transcript = path.join(h.project, `${SOURCE}.jsonl`), before = await readFile(transcript)
+    const all = await accounts(h.paths)
+    const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+    const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+    await inventory([from], to, h.paths, () => {}, { writeCache: true, processes: [] })
+    const file = path.join(h.paths.state, 'cache.json'), stored = JSON.parse(await readFile(file))
+    stored.version = 10
+    for (const row of Object.values(stored.histories)) {
+      row.value.result.conflicts = 10
+      row.value.result.comparable = false
+    }
+    await writeFile(file, state === 'corrupt' ? '{broken' : JSON.stringify(stored))
+    const inv = await inventory([from], to, h.paths, () => {}, { writeCache: true, processes: [] })
+    assert.equal(inv.blocked.length, 0)
+    assert.equal(inv.move.length, 1)
+    assert.equal(inv.cacheStats.historyHits, 0)
+    assert.ok(inv.cacheStats.historyMisses > 0)
+    const refreshed = JSON.parse(await readFile(file))
+    assert.equal(refreshed.version, 13)
+    assert.equal(refreshed.semanticVersion, 3)
+    assert.ok(Object.values(refreshed.histories).every(row => row.value.result.conflicts === 0 && row.value.result.comparable))
+    const warm = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    assert.equal(warm.blocked.length, 0)
+    assert.equal(warm.move.length, 1)
+    assert.ok(warm.cacheStats.historyHits > 0)
+    assert.equal(warm.cacheStats.historyMisses, 0)
+    assert.deepEqual(await readFile(transcript), before)
+  }
+})
+
+test('an interrupted rehome removes only its unchanged target record', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const sourceRecord = path.join(h.dir('P'), `local_${SOURCE}.json`)
+  const targetRecord = path.join(teamDir, `local_${SOURCE}.json`)
+  const record = await readFile(sourceRecord)
+  await writeFile(targetRecord, record)
+  const at = '2099-01-02T00-00-00-000'
+  const receipt = {
+    at,
+    from: ['source'],
+    to: 'target',
+    sessions: [],
+    failed: [],
+    superseded: [],
+    cloudChecks: [{ account: h.acct.P, org: h.org.P, label: 'source', status: 'pending' }],
+    finalizing: true,
+    pending: {
+      strategy: 'rehome',
+      id: SOURCE,
+      targetId: SOURCE,
+      title: 'Session 001',
+      made: [targetRecord],
+      recordSha: createHash('sha256').update(record).digest('hex')
+    }
+  }
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, `${at}.json`), JSON.stringify(receipt))
+  const all = await accounts(h.paths)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  const result = await move({ move: [] }, to, h.paths)
+  assert.equal(result.recoveryRequired, true)
+  assert.ok(await readFile(sourceRecord))
+  assert.ok(await readFile(path.join(h.project, `${SOURCE}.jsonl`)))
+  assert.equal(await readFile(targetRecord).catch(() => null), null)
+  assert.deepEqual(await readdir(path.join(h.paths.state, 'quarantine', at, 'failed')), [`local_${SOURCE}.json`])
+  assert.equal(JSON.parse(await readFile(path.join(h.paths.state, `${at}.json`), 'utf8')).cloudChecks[0].status, 'cancelled')
+})
+
+test('interrupted placement leaves a foreign byte-identical target untouched', async () => {
+  for (const replaced of [false, true]) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE)
+    const target = path.join(h.dir('T'), `local_${SOURCE}.json`)
+    const text = JSON.stringify(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))), null, 2) + '\n'
+    await writeFile(target, text)
+    const identity = await stat(target)
+    if (replaced) {
+      await rename(target, target + '.original')
+      await writeFile(target, text)
+    }
+    const at = '2099-01-02T00-00-00-000'
+    const receipt = { at, sessions: [], superseded: [], failed: [], finalizing: true, pending: {
+      strategy: 'rehome', id: SOURCE, title: 'Interrupted', targetId: SOURCE, made: [target],
+      recordSha: createHash('sha256').update(text).digest('hex'), creationRequired: true,
+      ...(replaced ? { created: { dev: identity.dev, ino: identity.ino } } : {})
+    } }
+    await mkdir(h.paths.state, { recursive: true })
+    const file = path.join(h.paths.state, at + '.json')
+    await writeFile(file, JSON.stringify(receipt))
+    assert.ok((await undo(h.paths)).reconciled)
+    assert.equal(await readFile(target, 'utf8'), text)
+    assert.equal(JSON.parse(await readFile(file)).retained, undefined)
+  }
+})
+
+test('interrupted rehome rollback keeps shared transcript and sidecar changes', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const sidecar = path.join(h.project, SOURCE, 'subagents', 'agent.jsonl')
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await mkdir(path.dirname(sidecar), { recursive: true })
+  await writeFile(sidecar, '{"before":true}\n')
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  receipt.finalizing = true
+  await writeFile(moved.file, JSON.stringify(receipt))
+  await appendFile(transcript, `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
+  await appendFile(sidecar, '{"after":true}\n')
+  const recovered = await undo(h.paths)
+  assert.match(recovered.reconciled.error, /finalization rolled back/)
+  assert.ok((await readFile(transcript, 'utf8')).includes('message 2'))
+  assert.ok((await readFile(sidecar, 'utf8')).includes('after'))
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.equal(await readFile(path.join(teamDir, `local_${SOURCE}.json`)).catch(() => null), null)
+})
+
+test('interrupted rehome recovery identifies vanished shared artifacts', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const sidecarDir = path.join(h.project, SOURCE)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await mkdir(sidecarDir, { recursive: true })
+  await writeFile(path.join(sidecarDir, 'agent.jsonl'), '{"before":true}\n')
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+  const receipt = JSON.parse(await readFile(moved.file, 'utf8'))
+  receipt.finalizing = true
+  await writeFile(moved.file, JSON.stringify(receipt))
+  await rename(transcript, `${transcript}.missing`)
+  await rename(sidecarDir, `${sidecarDir}.missing`)
+  const recovered = await undo(h.paths)
+  assert.match(recovered.reconciled.error, /changed copies left in place/)
+  const tracked = JSON.parse(await readFile(moved.file, 'utf8'))
+  assert.match(tracked.failed.at(-1).error, new RegExp(`${SOURCE}\\.jsonl is missing, ${SOURCE} is missing`))
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.ok(await readFile(path.join(teamDir, `local_${SOURCE}.json`)))
+})
+
+test('rehome undo keeps shared transcript and sidecar changes', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const sidecar = path.join(h.project, SOURCE, 'subagents', 'agent.jsonl')
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await mkdir(path.dirname(sidecar), { recursive: true })
+  await writeFile(sidecar, '{"before":true}\n')
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  assert.equal((await move(await inventory([from], to, h.paths), to, h.paths)).ok, true)
+  await appendFile(transcript, `${JSON.stringify(entry('assistant', 2, 1, SOURCE))}\n`)
+  await appendFile(sidecar, '{"after":true}\n')
+  const undone = await undo(h.paths)
+  assert.ok(undone.dest)
+  assert.ok((await readFile(transcript, 'utf8')).includes('message 2'))
+  assert.ok((await readFile(sidecar, 'utf8')).includes('after'))
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.equal(await readFile(path.join(teamDir, `local_${SOURCE}.json`)).catch(() => null), null)
+})
+
+test('rehome undo refuses when shared artifacts vanished', async () => {
+  const h = await home()
+  const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)
+  await mkdir(teamDir, { recursive: true })
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  const sidecarDir = path.join(h.project, SOURCE)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await mkdir(sidecarDir, { recursive: true })
+  await writeFile(path.join(sidecarDir, 'agent.jsonl'), '{"before":true}\n')
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.P && a.org === h.org.T)
+  assert.equal((await move(await inventory([from], to, h.paths), to, h.paths)).ok, true)
+  await rename(transcript, `${transcript}.missing`)
+  await rename(sidecarDir, `${sidecarDir}.missing`)
+  const refused = await undo(h.paths)
+  assert.match(refused.changed[0], /transcript missing, sidecars missing changed/)
+  assert.equal(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)).catch(() => null), null)
+  assert.ok(await readFile(path.join(teamDir, `local_${SOURCE}.json`)))
+})
+
+test('restart reuses preparation across cloud and local phases and reparses only changed history', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  await Promise.all(Array.from({ length: 180 }, async (_, offset) => {
+    const session = id(2000 + offset)
+    await h.write(session, [entry('user', 10000 + offset, null, session)])
+    await h.record('T', session)
+  }))
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(), scanned
+  const cloud = cloudFixture(h)
+  const io = { inspect: () => rows, command: async (file) => {
+    if (file.endsWith('osascript')) {
+      await appendFile(path.join(h.project, `${SOURCE}.jsonl`), JSON.stringify(entry('assistant', 2, 1, SOURCE)) + '\n')
+      rows = []
+    } else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { cloud, io })
+  assert.ok(planned.plan)
+  const result = await executeMove([from], to, h.paths, { cloudRequested: true, io, approve: planned.plan.token, summary: inv => { scanned = inv.cacheStats } })
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(scanned.historyHits, 180)
+  assert.equal(scanned.historyMisses, 1)
+  assert.equal(result.receipt.sessions[0].events, 2)
+})
+
+test('inventory interrupts preparation at record boundaries when its deadline is spent', async () => {
+  const h = await home()
+  for (const session of [SOURCE, id(2)]) {
+    await h.write(session, [entry('user', Number(session.slice(-1)), null, session)])
+    await h.record('P', session)
+  }
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let completed = 0
+  await assert.rejects(inventory([from], to, h.paths, (stage, text, progress) => {
+    if (stage === 'scan') completed = progress.completed
+  }, { processes: [], check: () => { if (completed > 0) throw new Error('fixture deadline spent') } }), /fixture deadline spent/)
+  assert.equal(completed, 1)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+})
+
+test('a thousand source records finish one restart with bounded polling and a linear journal', async () => {
+  const h = await home(), amount = 1000
+  for (let i = 0; i < amount; i++) {
+    const session = id(10000 + i)
+    await h.write(session, [entry('user', 20000 + i, null, session)])
+    await h.record('P', session, rehomeRecord({ sessionSettings: { fixture: 'x'.repeat(4096) } }))
+  }
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(id(10000)), inspections = 0, journalBytes = 0, checkpointBytes = 0
+  const io = { inspect: () => { inspections++; return rows }, command: async file => {
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, _text, progress) => {
+    if (stage !== 'move' || !progress?.live || progress.total < amount - 1 || progress.completed !== progress.total) return
+    const log = readdirSync(h.paths.state).find(name => name.endsWith('.journal'))
+    journalBytes = readFileSync(path.join(h.paths.state, log)).length
+    checkpointBytes = readFileSync(path.join(h.paths.state, log.slice(0, -8))).length
+  } })
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, amount)
+  assert.equal(result.receipt.superseded.length, amount)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+  assert.equal((await readdir(h.dir('T'))).length, amount)
+  assert.ok(inspections < 150, `Unexpected process scans: ${inspections}`)
+  assert.ok(checkpointBytes < 5000, `Receipt was rewritten during placement: ${checkpointBytes}`)
+  assert.ok(journalBytes > 0)
+  assert.ok(journalBytes < 12_000 * amount, `Journal grew beyond its per-record bound: ${journalBytes}`)
+  assert.equal((await readdir(h.paths.state)).some(name => name.endsWith('.journal')), false)
+  assert.ok((await undo(h.paths)).dest)
+  assert.equal((await readdir(h.dir('P'))).length, amount)
+  assert.equal((await readdir(h.dir('T'))).length, 0)
+})
+
+test('a thousand records in one task family finish one restart with linear reads', async t => {
+  const h = await home(), amount = 1000, first = id(10000)
+  const registry = { scheduledTasks: [{ id: 'large_task', notifySessionId: `local_${first}`, enabled: false, fireAt: 123456 }],
+    recordedSkips: { large_task: [{ at: '2026-09-02T00:00:00Z', reason: 'app_closed' }] },
+    runRetries: { large_task: { slot: '2026-09-02T00:00:00Z', attempts: 2, notBefore: '2026-09-02T00:05:00Z' } } }
+  for (let i = 0; i < amount; i++) {
+    const sid = id(10000 + i)
+    await h.write(sid, [entry('user', 20000 + i, null, sid)])
+    await h.record('P', sid, rehomeRecord(i ? { scheduledTaskId: 'large_task', notifySessionId: `local_${first}` } : {}))
+  }
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  await writeFile(sourceFile, JSON.stringify(registry))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = [desktopFixture()[0]], recordReads = 0, namespaceReads = 0
+  const calls = [], io = { inspect: () => rows, command: async file => {
+    calls.push(file)
+    rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'reopened' }]
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  assert.equal(planned.plan.held.length, amount)
+  const read = fs.readFile, list = fs.readdir
+  fs.readFile = async (...args) => {
+    if (/^local_.*\.json$/.test(path.basename(String(args[0])))) recordReads++
+    return read(...args)
+  }
+  fs.readdir = async (...args) => {
+    if ([h.dir('P'), h.dir('T')].includes(args[0])) namespaceReads++
+    return list(...args)
+  }
+  syncBuiltinESMExports()
+  const began = performance.now()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token }) }
+  finally { fs.readFile = read; fs.readdir = list; syncBuiltinESMExports() }
+  const seconds = (performance.now() - began) / 1000
+  t.diagnostic(JSON.stringify({ benchmark: 'task-family-1000', root: h.root, seconds, recordReads, namespaceReads,
+    moved: result.receipt?.sessions.length ?? 0, ok: result.ok, reason: result.reason ?? null }))
+  assert.equal(result.ok, true, result.reason)
+  assert.equal(result.restarted, true)
+  assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.equal(result.receipt.sessions.length, amount)
+  assert.equal(result.receipt.superseded.length, amount)
+  assert.equal(result.receipt.taskTransfers.length, 1)
+  assert.equal(result.receipt.finalizing, false)
+  assert.deepEqual(JSON.parse(await readFile(sourceFile)), { scheduledTasks: [], recordedSkips: {}, runRetries: {} })
+  assert.deepEqual(JSON.parse(await readFile(targetFile)), registry)
+  assert.deepEqual(await readdir(h.dir('P')), ['scheduled-tasks.json'])
+  assert.equal((await readdir(h.dir('T'))).filter(name => name.startsWith('local_')).length, amount)
+  assert.ok(recordReads < 80 * amount, `Unexpected record reads: ${recordReads}`)
+  assert.ok(namespaceReads < 80, `Unexpected namespace scans: ${namespaceReads}`)
+  const receipt = JSON.parse(await readFile(result.file))
+  assert.equal(receipt.taskTransfers[0].links.length, amount)
+  assert.equal(receipt.taskTransfers[0].recordIds.length, amount)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(sourceFile)), registry)
+  assert.equal((await readdir(h.dir('P'))).filter(name => name.startsWith('local_')).length, amount)
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('one restart batches the 361 record seven family shape and multiple registry pairs', async t => {
+  for (const [ordinary, sizes, pairs, padding] of [[243, [11, 1, 1, 3, 96, 2, 4], 1, 30000], [3, [2, 1, 3, 2], 2, 0]]) {
+    const h = await home(), sources = ['P', 'Q'].slice(0, pairs), registries = Object.fromEntries(sources.map(key => [key, { scheduledTasks: [], recordedSkips: {}, runRetries: {} }]))
+    let index = 0
+    const add = async (key, extra = {}) => {
+      const sid = id(10000 + index++)
+      await h.write(sid, [entry('user', 20000 + index, null, sid)])
+      await h.record(key, sid, rehomeRecord({ fixturePadding: 'x'.repeat(padding), ...extra }))
+      return sid
+    }
+    for (let n = 0; n < ordinary; n++) await add('P')
+    for (const [n, size] of sizes.entries()) {
+      const key = sources[n % pairs], anchor = id(10000 + index), taskId = `fixture_task_${n}`, registry = registries[key]
+      registry.scheduledTasks.push({ id: taskId, notifySessionId: `local_${anchor}`, enabled: false, fireAt: 123456 + n })
+      registry.recordedSkips[taskId] = [{ reason: 'closed', at: n }]
+      registry.runRetries[taskId] = { attempts: n }
+      for (let j = 0; j < size; j++) await add(key, j ? { scheduledTaskId: taskId, notifySessionId: `local_${anchor}` } : {})
+    }
+    for (const key of sources) await writeFile(path.join(h.dir(key), 'scheduled-tasks.json'), JSON.stringify(registries[key]))
+    const all = await accounts(h.paths, []), from = sources.map(key => all.find(row => row.account === h.acct[key])), to = all.find(row => row.account === h.acct.T)
+    const mock = taskHarness()
+    delete mock.io.now
+    let quitAt, reopenAt, beforeReceipt
+    mock.beforeQuit = async () => {
+      quitAt = performance.now()
+      assert.equal((await readdir(h.dir('T'))).filter(name => name.startsWith('local_')).length, ordinary)
+      const names = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
+      assert.equal(names.length, 1)
+      beforeReceipt = path.join(h.paths.state, names[0])
+      const receipt = JSON.parse(await readFile(beforeReceipt))
+      assert.equal(receipt.finalizing, false)
+      assert.equal(receipt.sessions.length, ordinary)
+      assert.equal(receipt.held.length, sizes.reduce((sum, n) => sum + n, 0))
+    }
+    const command = mock.io.command
+    mock.io.command = async file => { if (file.endsWith('/open')) reopenAt = performance.now(); return command(file) }
+    const planned = await executeMove(from, to, h.paths, { io: mock.io })
+    assert.equal(planned.plan.remainingCount, index)
+    assert.equal(new Set(planned.plan.held.flatMap(row => row.sources.map(source => source.file))).size, sizes.reduce((sum, n) => sum + n, 0))
+    let recordReads = 0, readBytes = 0, receiptWrites = 0, writeBytes = 0, namespaceScans = 0
+    const read = fs.readFile, write = fs.writeFile, list = fs.readdir
+    fs.readFile = async (...args) => {
+      const result = await read(...args)
+      if (String(args[0]).startsWith(h.paths.records) && /^local_.*\.json$/.test(path.basename(String(args[0])))) { recordReads++; readBytes += Buffer.byteLength(result) }
+      return result
+    }
+    fs.writeFile = async (...args) => {
+      if (String(args[0]).startsWith(h.paths.state) && !String(args[0]).includes('cache.json')) { receiptWrites++; writeBytes += Buffer.byteLength(args[1]) }
+      return write(...args)
+    }
+    fs.readdir = async (...args) => { if (String(args[0]).startsWith(h.paths.records)) namespaceScans++; return list(...args) }
+    syncBuiltinESMExports()
+    const began = performance.now()
+    let result
+    try { result = await executeMove(from, to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+    finally { fs.readFile = read; fs.writeFile = write; fs.readdir = list; syncBuiltinESMExports() }
+    t.diagnostic(JSON.stringify({ benchmark: 'restart-batches', records: index, families: sizes, pairs, seconds: (performance.now() - began) / 1000,
+      closedSeconds: (reopenAt - quitAt) / 1000, recordReads, readBytes, receiptWrites, writeBytes, namespaceScans }))
+    assert.equal(result.ok, true, result.reason)
+    assert.equal(result.receipt.sessions.length, index)
+    assert.equal(result.receipt.superseded.length, index)
+    assert.equal(result.receipt.taskTransfers.length, pairs)
+    assert.equal(result.file, beforeReceipt)
+    assert.equal(result.added, index)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.ok(recordReads < 25 * index)
+    assert.ok(receiptWrites < 12 + 10 * pairs)
+    assert.ok(namespaceScans < 40 + 10 * pairs)
+    const events = lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8'))
+    assert.deepEqual(events.map(row => row.event), ['start', 'exited', 'outcome'])
+    assert.equal(new Set(events.map(row => row.attemptId)).size, 1)
+    assert.ok(events.every(row => row.receiptId === path.basename(result.file)))
+    assert.equal(events.at(-1).stopCode, 'COMPLETE')
+    const targetFile = path.join(h.dir('T'), 'scheduled-tasks.json'), target = JSON.parse(await readFile(targetFile))
+    assert.deepEqual(target.scheduledTasks.map(task => task.id).sort(), Object.values(registries).flatMap(registry => registry.scheduledTasks.map(task => task.id)).sort())
+    target.later = 'unrelated edit'
+    target.scheduledTasks.push({ id: 'later_task', enabled: false })
+    await writeFile(targetFile, JSON.stringify(target))
+    const later = id(99000)
+    await h.record('T', later, rehomeRecord())
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(targetFile)), { scheduledTasks: [{ id: 'later_task', enabled: false }], later: 'unrelated edit' })
+    assert.ok(await readFile(path.join(h.dir('T'), `local_${later}.json`)))
+    for (const key of sources) assert.deepEqual(JSON.parse(await readFile(path.join(h.dir(key), 'scheduled-tasks.json'))), registries[key])
+  }
+})
+
+test('restart batches restore task twins at every existing checkpoint', async () => {
+  for (const stage of ['receipt', 'source', 'record', 'retiring', 'target']) {
+    const h = await taskCheckpointFixture()
+    h.restart = true
+    h.targetRegistry = { scheduledTasks: [{ id: 'before', enabled: false }, ...h.tasks.map(task => ({ ...task, enabled: false, notifySessionId: null })), { id: 'after', enabled: false }],
+      recordedSkips: { task_1: h.sourceRegistry.recordedSkips.task_1 }, future: 'preserved' }
+    await writeFile(h.targetFile, JSON.stringify(h.targetRegistry))
+    h.notificationId = h.sessions[0]
+    await interruptTaskFamily(h, 'move', stage)
+    const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+    const interrupted = JSON.parse(await readFile(file))
+    assert.equal(interrupted.taskTransfers.length, 1)
+    assert.equal(interrupted.taskTransfers[0].ids.length, 2)
+    assert.deepEqual(interrupted.taskTransfers[0].replaced.map(row => row.index), [1, 2])
+    const mock = taskHarness([])
+    const recovered = await finishWorkflow(h.paths, { io: mock.io, processes: [] })
+    assert.equal(recovered.recoveryRequired, true, stage)
+    assert.deepEqual(mock.calls, ['/usr/bin/open'])
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+    for (const [n, sid] of h.sessions.entries()) {
+      assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${sid}.json`)), h.originalRecords[n])
+      assert.equal(await stat(path.join(h.dir('T'), `local_${sid}.json`)).catch(() => null), null)
+    }
+  }
+})
+
+test('restart replans scheduler closure after quit without widening the approved files', async () => {
+  for (const change of ['new task', 'new run', 'new run with another family', 'unrelated record']) {
+    const h = await taskFamilyFixture(), mixed = change === 'new run with another family'
+    if (mixed) {
+      h.sourceRegistry.scheduledTasks[1].notifySessionId = `local_${h.second}`
+      await h.record('P', h.second, rehomeRecord({ scheduledTaskId: h.tasks[1].id, notifySessionId: `local_${h.second}` }))
+      await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+    }
+    const { from, to } = await h.selection(), mock = taskHarness()
+    const plan = await executeMove([from], to, h.paths, { io: mock.io })
+    const later = id(798)
+    mock.beforeQuit = async () => {
+      assert.ok(await readFile(path.join(h.dir('T'), `local_${h.cold}.json`)))
+      if (change === 'new task') {
+        h.sourceRegistry.scheduledTasks.push({ id: 'new_task', notifySessionId: `local_${SOURCE}`, enabled: true })
+        await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+      } else {
+        await h.write(later, [entry('user', 798, null, later)])
+        await h.record('P', later, rehomeRecord(change.startsWith('new run') ? { scheduledTaskId: h.tasks[0].id, notifySessionId: `local_${SOURCE}` } : {}))
+      }
+    }
+    const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token })
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.equal(result.restarted, true)
+    if (change.startsWith('new run')) {
+      assert.equal(result.ok, false)
+      assert.equal(result.receipt.sessions.length, mixed ? 2 : 1)
+      assert.equal(result.receipt.held.length, mixed ? 2 : 3)
+      assert.equal(result.receipt.startedAt, plan.plan.requestedAt)
+      assert.ok(result.receipt.failed.some(row => /family member missing/.test(row.error)))
+      if (!mixed) assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    } else {
+      assert.equal(result.ok, true, result.reason)
+      assert.equal(result.receipt.sessions.length, 4)
+      if (change === 'new task') assert.deepEqual(JSON.parse(await readFile(h.targetFile)).scheduledTasks.slice(1), h.sourceRegistry.scheduledTasks)
+    }
+    if (change !== 'new task') {
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${later}.json`)))
+      assert.equal(await stat(path.join(h.dir('T'), `local_${later}.json`)).catch(() => null), null)
+    }
+  }
+})
+
+test('restart batches keep their receipt on native quit veto and reopen failure without retrying', async () => {
+  for (const failure of ['quit', 'reopen']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness(), command = mock.io.command
+    mock.io.wait = async ms => { mock.time += ms }
+    mock.io.command = async file => {
+      if (failure === 'quit' && file.endsWith('osascript') || failure === 'reopen' && file.endsWith('/open')) {
+        mock.calls.push(file)
+        return { status: 1 }
+      }
+      return command(file)
+    }
+    const plan = await executeMove([from], to, h.paths, { io: mock.io })
+    const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token })
+    assert.equal(result.ok, false)
+    assert.equal(result.restarted, false)
+    assert.equal(result.restartOutcome.outcome, failure === 'quit' ? 'quit-not-confirmed' : 'reopen-failed')
+    assert.deepEqual(mock.calls, failure === 'quit' ? ['/usr/bin/osascript'] : ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.ok(mock.time <= 30000)
+    const receipt = JSON.parse(await readFile(result.file))
+    assert.equal(receipt.finalizing, false)
+    assert.equal(receipt.sessions.length, failure === 'quit' ? 1 : 4)
+    assert.equal(receipt.held.length, failure === 'quit' ? 3 : 0)
+    const events = lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8'))
+    assert.equal(new Set(events.map(row => row.attemptId)).size, 1)
+    assert.equal(events.at(-1).stopCode, failure === 'quit' ? 'QUIT_UNCONFIRMED' : 'REOPEN_FAILED')
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+  }
+})
+
+test('a worker appearing during an approved warm scan returns a typed plan change without moving or quitting', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  const file = path.join(h.paths.state, 'restart-plan.json'), planBytes = await readFile(file), before = await fixtureSnapshot(h)
+  let changed = false
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: stage => {
+    if (stage !== 'scan' || changed) return
+    changed = true
+    mock.rows = [...mock.rows, { ...desktopFixture(h.run)[1], pid: 701 }]
+  } })
+  assert.equal(changed, true)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'RESTART_PLAN_CHANGED')
+  assert.match(result.reason, /Open Claude sessions changed/)
+  assert.equal(result.receipt, undefined)
+  assert.deepEqual(mock.calls, [])
+  assert.deepEqual(await fixtureSnapshot(h), before)
+  assert.deepEqual(await readFile(file), planBytes)
+})
+
+test('a changed pre-quit inventory preserves completed ordinary work and the held selection', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const plan = await executeMove([from], to, h.paths, { io: mock.io })
+  let changed = false
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token, report: (stage, text, progress) => {
+    if (changed || stage !== 'move' || progress?.completed !== 1) return
+    changed = true
+    mock.rows = [...mock.rows, { ...desktopFixture(h.run)[1], pid: 701 }]
+  } })
+  assert.equal(changed, true)
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /sessions changed/)
+  assert.deepEqual(mock.calls, [])
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+  assert.equal(result.receipt.held.length, 3)
+  assert.equal(JSON.parse(await readFile(path.join(h.paths.state, 'restart-plan.json'))).token, plan.plan.token)
+  const next = await finishHeld(h.paths, { io: mock.io })
+  assert.ok(next.plan)
+  assert.equal(next.plan.receiptFile, result.file)
+  assert.equal(next.plan.requestedAt, plan.plan.requestedAt)
+  assert.deepEqual(next.plan.selection.from[0].files.sort(), result.receipt.held.flatMap(row => row.sources.map(source => source.file)).sort())
+  assert.notEqual(next.plan.token, plan.plan.token)
+  assert.deepEqual(mock.calls, [])
+})
+
+test('scheduler changes before approval move into the fresh restart batch', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const plan = await executeMove([from], to, h.paths, { io: mock.io })
+  h.sourceRegistry.scheduledTasks.push({ id: 'new_task', notifySessionId: `local_${h.cold}`, enabled: true })
+  await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+  mock.beforeQuit = async () => assert.deepEqual(await readdir(h.dir('T')), ['scheduled-tasks.json'])
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token })
+  assert.equal(result.ok, true, result.reason)
+  assert.equal(result.receipt.sessions.length, 4)
+  assert.equal(result.receipt.taskTransfers.length, 1)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)).scheduledTasks.slice(1), h.sourceRegistry.scheduledTasks)
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+})
+
+test('a partial restart batch publication restores the failed twin and completes the independent family', async () => {
+  const h = await taskCheckpointFixture()
+  const target = { scheduledTasks: h.tasks.map(task => ({ ...task, enabled: false, notifySessionId: null })) }
+  await writeFile(h.targetFile, JSON.stringify(target))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T), mock = taskHarness()
+  const plan = await executeMove([from], to, h.paths, { io: mock.io }), link = fs.link
+  fs.link = async (...args) => { if (args[1] === path.join(h.dir('T'), `local_${h.sessions[1]}.json`)) throw new Error('fixture second placement failed'); return link(...args) }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token }) }
+  finally { fs.link = link; syncBuiltinESMExports() }
+  assert.equal(result.ok, false)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(result.receipt.sessions[0].id, h.sessions[0])
+  assert.equal(result.receipt.finalizing, false)
+  const source = JSON.parse(await readFile(h.sourceFile)), destination = JSON.parse(await readFile(h.targetFile))
+  assert.deepEqual(source.scheduledTasks, [h.tasks[1]])
+  assert.deepEqual(destination.scheduledTasks, [target.scheduledTasks[1], h.tasks[0]])
+  assert.deepEqual(source.recordedSkips, { task_2: h.sourceRegistry.recordedSkips.task_2 })
+  assert.deepEqual(source.runRetries, { task_2: h.sourceRegistry.runRetries.task_2 })
+  assert.deepEqual((await readdir(h.dir('T'))).filter(name => name.startsWith('local_')), [`local_${h.sessions[0]}.json`])
+  assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${h.sessions[1]}.json`)), h.originalRecords[1])
+  assert.equal(result.summary.notMoved.length, 1)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), target)
+})
+
+test('a parent moves and keeps its source for an archived fork without history, and Undo restores both', async () => {
+  const h = await home(), fork = id(730)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE), entry('assistant', 2, 1, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  await h.record('P', fork, rehomeRecord({ forkedFromSessionId: `local_${SOURCE}`, isArchived: true }))
+  const before = await fixtureSnapshot(h, [h.paths.records])
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const result = await executeMove([from], to, h.paths, { processes: [] })
+  assert.equal(result.ok, true, JSON.stringify(result.receipt.failed))
+  assert.equal(result.complete, true)
+  assert.deepEqual(result.receipt.failed, [])
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [SOURCE])
+  assert.equal(result.receipt.superseded.length, 0)
+  assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records]), before)
+})
+
+test('cold moves tolerate unrelated runtime writes while still catching new parent dependencies', async () => {
+  for (const change of ['runtime', 'parent']) {
+    const h = await home(), other = id(2)
+    for (const sid of [SOURCE, other]) {
+      await h.write(sid, [entry('user', sid === SOURCE ? 101 : 102, null, sid)])
+      await h.record('P', sid, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    from.sessions = from.sessions.filter(row => row.id === SOURCE)
+    const read = fs.readFile, file = path.join(h.dir('P'), `local_${other}.json`)
+    let armed = false, changed = false
+    fs.readFile = async (...args) => {
+      const result = await read(...args)
+      if (armed && !changed && args[0] === file) {
+        changed = true
+        const record = JSON.parse(result)
+        if (change === 'runtime') record.completedTurns = 7
+        else record.forkedFromSessionId = `local_${SOURCE}`
+        await writeFile(file, JSON.stringify(record))
+      }
+      return result
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { processes: [], report: stage => { if (stage === 'retire') armed = true } }) }
+    finally { fs.readFile = read; syncBuiltinESMExports() }
+    assert.equal(changed, true)
+    assert.equal(result.ok, true)
+    assert.equal(result.receipt.sessions.length, 1)
+    assert.deepEqual(result.receipt.failed, [])
+    if (change === 'runtime') {
+      assert.equal(result.receipt.superseded.length, 1)
+      assert.equal(JSON.parse(await readFile(file)).completedTurns, 7)
+    } else {
+      assert.equal(result.receipt.superseded.length, 0)
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+      assert.ok(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)))
+    }
+  }
+})
+
+test('restart snapshots notice in-place external dependencies before registry publication', async () => {
+  const h = await taskCheckpointFixture(), foreign = id(799)
+  await h.record('T', foreign, rehomeRecord())
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T), mock = taskHarness()
+  const plan = await executeMove([from], to, h.paths, { io: mock.io })
+  const write = fs.writeFile
+  let edited = false
+  fs.writeFile = async (...args) => {
+    const result = await write(...args)
+    if (!edited && String(args[0]).startsWith(h.targetFile + '.')) {
+      edited = true
+      const file = path.join(h.dir('T'), `local_${foreign}.json`), record = JSON.parse(await readFile(file))
+      record.forkedFromSessionId = `local_${h.sessions[0]}`
+      await write(file, JSON.stringify(record))
+    }
+    return result
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token }) }
+  finally { fs.writeFile = write; syncBuiltinESMExports() }
+  assert.equal(edited, true)
+  assert.equal(result.ok, false)
+  assert.equal(result.recoveryRequired, true)
+  assert.equal(await stat(h.targetFile).catch(() => null), null)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('T'), `local_${foreign}.json`))).forkedFromSessionId, `local_${h.sessions[0]}`)
+  await h.record('T', foreign, rehomeRecord())
+  mock.rows = []
+  await finishWorkflow(h.paths, { io: mock.io, processes: [] })
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+})
+
+test('interrupted placement replays complete journal entries and ignores only a torn final append', async () => {
+  for (const keep of [3, 4]) {
+    const h = await home()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    const original = await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))
+    const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    const reported = []
+    await assert.rejects(move(await inventory([from], to, h.paths), to, h.paths, (stage, text, progress) => {
+      reported.push({ stage, text, progress })
+      if (stage === 'move' && progress?.completed === 1) throw new Error('fixture interrupted publication')
+    }), /fixture interrupted publication/)
+    const log = (await readdir(h.paths.state)).find(name => name.endsWith('.journal'))
+    const file = path.join(h.paths.state, log)
+    const patches = (await readFile(file, 'utf8')).trimEnd().split('\n')
+    assert.equal(patches.length, 4)
+    assert.ok(JSON.parse(patches[2]).pending.created)
+    await writeFile(file, patches.slice(0, keep).join('\n') + '\n{"sequence":')
+    assert.equal(reported.some(row => row.stage === 'move' && row.text.includes('✓')), false)
+    assert.equal(JSON.parse(await readFile(file.slice(0, -8))).sessions.length, 0)
+    const recovered = await sweep(h.paths)
+    assert.ok(recovered.recovered)
+    assert.equal((await readdir(h.dir('T'))).length, 0)
+    assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)), original)
+    assert.equal((await readdir(h.paths.state)).some(name => name.endsWith('.journal')), false)
+    assert.equal((await sweep(h.paths)).recovered, undefined)
+  }
+})
+
+test('polling without productive work stalls without racing unfinished mutations', async () => {
+  const h = await home(), mock = taskHarness(desktopFixture())
+  const plan = await restartPlan(null, h.paths, mock.rows)
+  let settled = false
+  const command = mock.io.command
+  mock.io.command = async (...args) => { if (args[0].endsWith('/open')) assert.equal(settled, true); return command(...args) }
+  const result = await withDesktopRestart(plan, h.paths, async ({ check }) => {
+    await Promise.resolve().then(() => { mock.time += 61_000; settled = true })
+    check()
+  }, () => {}, mock.io)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'MOVE_STALLED')
+  assert.equal(result.restart.outcome, 'reopened')
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+})
+
+test('a forced boundary detects reopening before retirement even inside the polling interval', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  let rows = desktopFixture(), opens = 0
+  const io = { now: () => 0, inspect: () => rows, command: async file => {
+    if (!file.endsWith('osascript')) opens++
+    rows = []
+    return { status: 0 }
+  } }
+  const planned = await executeMove([from], to, h.paths, { io })
+  const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, _text, progress) => {
+    if (stage === 'verify' && progress?.completed === 1) rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+  } })
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /reopened before/)
+  assert.equal(opens, 0)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+test('restart warnings group a helper and its child as one session and resolve copied records', async () => {
+  const h = await home(), other = id(400)
+  await h.record('P', SOURCE, { title: 'First session' })
+  await h.record('T', other, { title: 'Second session' })
+  await h.record('Z', other, { title: 'Second session' })
+  const rows = [
+    desktopFixture()[0],
+    { pid: 501, ppid: 500, started: 'helper one', executable: '/Applications/Claude.app/Contents/Helpers/disclaimer', worker: true, desktopPid: 500, ids: [] },
+    { pid: 502, ppid: 501, started: 'child one', executable: '/tmp/claude', worker: true, desktopPid: 500, ids: [SOURCE] },
+    { pid: 503, ppid: 500, started: 'helper two', executable: '/Applications/Claude.app/Contents/Helpers/disclaimer', worker: true, desktopPid: 500, ids: [] },
+    { pid: 504, ppid: 503, started: 'child two', executable: '/tmp/claude', worker: true, desktopPid: 500, ids: [other] }
+  ]
+  const plan = await restartPlan(null, h.paths, rows)
+  assert.equal(plan.affected.length, 2)
+  assert.deepEqual(plan.affected.map(row => row.title), ['First session', 'Second session'])
+  assert.deepEqual(plan.affected.map(row => row.pids), [[501, 502], [503, 504]])
+  assert.equal(plan.members.length, 5)
+  const unknown = await restartPlan(null, h.paths, rows.map(row => ({ ...row, ids: [] })))
+  assert.equal(unknown.affected.length, 2)
+})
+
+test('connected Remote Control is waiting, not failed, and completes in the same receipt after disconnect', async () => {
+  const h = await home()
+  const entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, { bridgeSessionIds: ['session_live'] })
+  let connected = true, status = 'active', historyReads = 0
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_live', title: 'Session 001', status })],
+    session: async () => remoteState(status, { connection_status: connected ? 'connected' : 'disconnected' }),
+    eventRows: async () => { historyReads++; return remoteRows(entries) },
+    archive: async () => { status = 'archived' }
+  })
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const inv = await inventory([from], to, h.paths, () => {}, { cloud, processes: [] })
+  assert.equal(inv.cloud.blocked.length, 0)
+  assert.equal(inv.cloud.waiting.length, 1)
+  assert.equal(inv.cloud.waiting[0].localId, SOURCE)
+  assert.equal(inv.pendingCloud, 1)
+  assert.equal(historyReads, 0)
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.receipt.failed.length, 0)
+  assert.equal(moved.receipt.cloudChecks[0].status, 'waiting')
+  assert.equal(moved.pendingCloud, 1)
+  connected = false
+  const finished = await finishPending(h.paths, { cloud })
+  assert.equal(finished.file, moved.file)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.receipt.failed.length, 0)
+  assert.equal(status, 'archived')
+})
+
+
+test('Finish pending offers a receipt-bound restart for a connected mirror and completes after reopen', async () => {
+  const h = await home(), entries = [entry('user', 1, null, SOURCE)]
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, { bridgeSessionIds: ['session_open'] })
+  let connected = true, status = 'active', rows = desktopFixture(), quits = 0
+  const cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_open', title: 'Session 001', status })],
+    session: async () => remoteState(status, { connection_status: connected ? 'connected' : 'disconnected' }),
+    eventRows: async () => remoteRows(entries), archive: async () => { status = 'archived' }
+  })
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud, processes: [] }), to, h.paths)
+  const io = { inspect: () => rows, command: async file => {
+    if (file.endsWith('osascript')) { quits++; rows = []; connected = false }
+    else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const planned = await finishWorkflow(h.paths, { cloud, io })
+  assert.equal(planned.plan.kind, 'finish')
+  assert.equal(planned.plan.receiptFile, moved.file)
+  assert.equal(quits, 0)
+  const completed = await finishWorkflow(h.paths, { cloud, io, approve: planned.plan.token })
+  assert.equal(completed.complete, true)
+  assert.equal(completed.file, moved.file)
+  assert.equal(completed.receipt.remote.length, 1)
+  assert.equal(completed.receipt.failed.length, 0)
+  assert.equal(quits, 1)
+  const stale = await finishWorkflow(h.paths, { cloud, io, approve: planned.plan.token })
+  assert.equal(stale.ok, false)
+  assert.equal(quits, 1)
+})
+
+test('mixed cloud Finish keeps its first pass preparatory until the restart decision', async () => {
+  const h = await home(), other = id(300)
+  const histories = { cse_ready: [entry('user', 1, null, SOURCE)], cse_open: [entry('user', 300, null, other)] }
+  const connected = { cse_ready: true, cse_open: true }, status = { cse_ready: 'active', cse_open: 'active' }
+  for (const [session, remote] of [[SOURCE, 'ready'], [other, 'open']]) {
+    await h.write(session, histories[`cse_${remote}`])
+    await h.record('P', session, rehomeRecord({ bridgeSessionIds: [`session_${remote}`] }))
+  }
+  const cloud = cloudFixture(h, {
+    list: async () => Object.keys(histories).map(id => remoteSession({ id, title: id, status: status[id] })),
+    session: async id => remoteState(status[id], { connection_status: connected[id] ? 'connected' : 'disconnected' }),
+    eventRows: async id => remoteRows(histories[id]), archive: async id => { status[id] = 'archived' }
+  })
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud, processes: [] }), to, h.paths)
+  connected.cse_ready = false
+  let rows = desktopFixture(other)
+  const io = { inspect: () => rows, command: async file => {
+    if (file.endsWith('osascript')) { rows = []; connected.cse_open = false }
+    else rows = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+    return { status: 0 }
+  } }
+  const before = [], after = []
+  const plan = await finishWorkflow(h.paths, { cloud, io, report: (stage, text, extra) => before.push({ stage, text, ...extra }) })
+  assert.equal(plan.plan.kind, 'finish')
+  assert.equal(status.cse_ready, 'archived')
+  assert.equal(status.cse_open, 'active')
+  assert.ok(before.some(event => event.stage === 'cloud' && event.completed === 1))
+  assert.ok(before.filter(event => event.live).every(event => event.preparatory === true))
+  const completed = await finishWorkflow(h.paths, { cloud, io, approve: plan.plan.token, report: (stage, text, extra) => after.push({ stage, text, ...extra }) })
+  assert.equal(completed.file, moved.file)
+  assert.equal(completed.complete, true)
+  assert.equal(completed.receipt.remote.length, 2)
+  assert.ok(after.some(event => event.stage === 'reopen'))
+  assert.ok(after.filter(event => event.live).every(event => !event.preparatory))
+})
+
+test('a local move explicitly reports that no cloud phase remains', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T), cloud = []
+  const result = await move(await inventory([from], to, h.paths), to, h.paths, (stage, _text, extra) => { if (stage === 'cloud') cloud.push(extra) })
+  assert.equal(result.ok, true)
+  assert.deepEqual(cloud, [{ live: true, completed: 0, total: 0 }])
+})
+
+
+test('process registry identifies a new worker without argv ids and rejects stale pid reuse', () => {
+  const started = 'Fri Sep  4 18:00:00 2026'
+  const utc = new Date(started).toUTCString().replace(/^(\w+), (\d+) (\w+) (\d+) (.*) GMT$/, '$1 $3 $2 $5 $4')
+  const processes = `500 1 ${started} /Applications/Claude.app/Contents/MacOS/Claude\n501 500 ${started} /Applications/Claude.app/Contents/Helpers/disclaimer\n502 501 ${started} /tmp/claude`
+  const commands = `500 1 ${started} Claude\n501 500 ${started} disclaimer\n502 501 ${started} claude --input-format stream-json`
+  const registration = { pid: 502, sessionId: SOURCE, cwd: '/tmp/fixture', name: 'A new session', procStart: utc, pidDomain: 'darwin' }
+  const rows = parseProcesses(processes, commands, '/Applications/Claude.app', [registration])
+  assert.deepEqual(rows.find(row => row.pid === 502).ids, [SOURCE])
+  assert.equal(rows.find(row => row.pid === 502).desktopPid, 500)
+  const stale = parseProcesses(processes, commands, '/Applications/Claude.app', [{ ...registration, procStart: 'Thu Sep 3 00:00:00 2026' }])
+  assert.deepEqual(stale.find(row => row.pid === 502).ids, [])
+  const foreign = parseProcesses(processes, commands, '/Applications/Claude.app', [{ ...registration, pidDomain: 'linux' }])
+  assert.deepEqual(foreign.find(row => row.pid === 502).ids, [])
+})
+
+test('panel idle timing joins distinct record and CLI IDs without timing stopped, unrelated or scheduler-held workers', async () => {
+  const h = await home(), f = await identityFixture(h), second = id(2), cold = id(3)
+  const recordIds = new Map([[SOURCE, id(101)], [second, id(102)], [cold, id(103)]])
+  const started = new Date(f.started).toString().replace(/^(\w+ \w+ \d+) (\d+) ([\d:]+).*$/, '$1 $3 $2')
+  const processes = {
+    list: `500 1 ${started} /Applications/Claude.app/Contents/MacOS/Claude\n501 500 ${started} /tmp/claude\n502 500 ${started} /tmp/claude`,
+    commands: `500 1 ${started} Claude\n501 500 ${started} claude --resume ${SOURCE}\n502 500 ${started} claude --resume ${second}`
+  }
+  const table = parseProcesses(processes.list, processes.commands)
+  for (const session of [SOURCE, second, cold]) {
+    await h.write(session, [entry('user', Number(session.slice(-3)), null, session)])
+    await h.record('P', recordIds.get(session), rehomeRecord({ cliSessionId: session }))
+  }
+  const all = await accounts(h.paths, table), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await executeMove([from], to, h.paths, { processes: table, moveOnly: true })
+  assert.equal(moved.receipt.held.length, 2)
+  for (const held of moved.receipt.held) {
+    assert.equal(held.recordId, `local_${recordIds.get(held.id)}`)
+    assert.notEqual(held.recordId, `local_${held.id}`)
+  }
+  const idle = (session = SOURCE, seconds = 900, offset = 1) => f.event(offset, `[WarmLifecycle:session] Starting idle timeout for local_${recordIds.get(session) ?? session}: ${seconds}s`)
+  for (const [name, text, expected] of [
+    ['matching', idle() + idle(second), 900],
+    ['different duration', idle(SOURCE, 120) + idle(second, 120), 120],
+    ['stale launch', idle(SOURCE, 900, -1) + idle(second), null],
+    ['other worker', idle(id(99)) + idle(second), null],
+    ['unknown shape', f.event(1, '[WarmLifecycle:session] Idle timeout: 900s'), null],
+    ['mixed duration', idle() + idle(second, 600), null],
+    ['ambiguous duration', idle() + idle(second) + idle(SOURCE, 600), null],
+    ['partial line', idle() + idle(second).trimEnd(), null],
+    ['future line', idle(SOURCE, 900, 172800) + idle(second), null],
+    ['outside bounded tail', idle() + 'x'.repeat(4 * 1024 * 1024) + '\n' + idle(second), null]
+  ]) {
+    await f.write(f.init() + text)
+    const result = pendingPresentation(moved.receipt, from, from, 'local', table, false, await idleTimeouts(h.paths, table))
+    assert.equal(result.pendingIdleSeconds, expected, name)
+    assert.equal(result.pendingAutomatic, true, name)
+    if (name === 'matching') {
+      const listed = await cli(h.root, ['accounts', '--json'], processSetup(processes))
+      assert.equal(listed.code, 0, listed.stderr)
+      assert.equal(lines(listed.stdout)[0].find(row => row.account === from.account).pendingIdleSeconds, 900)
+      for (const [name, workers] of [
+        ['stopped', table.slice(0, 1)],
+        ['unrelated', table.map(row => ({ ...row, ids: [id(99)] }))],
+        ['external', table.map(row => row.pid === 501 ? { ...row, desktopPid: null } : row)]
+      ]) {
+        const timeouts = await idleTimeouts(h.paths, workers)
+        assert.equal(timeouts.get(`local_${recordIds.get(SOURCE)}`), 900, name)
+        assert.equal(pendingPresentation(moved.receipt, from, from, 'local', workers, false, timeouts).pendingIdleSeconds, null, name)
+      }
+      for (const scheduler of [false, true]) {
+        const receipt = structuredClone(moved.receipt)
+        if (!scheduler) receipt.held[0].release = 'scheduler'
+        const protectedState = pendingPresentation(receipt, from, from, 'local', table, scheduler, await idleTimeouts(h.paths, table))
+        assert.equal(protectedState.pendingAutomatic, false)
+        assert.equal(protectedState.pendingIdleSeconds, null)
+      }
+      assert.equal((await idleTimeouts(h.paths, [])).size, 0)
+      assert.equal((await idleTimeouts(h.paths, [...table, { ...table[0], pid: 999 }])).size, 0)
+    }
+  }
+  await unlink(path.join(h.paths.logs, 'main.log'))
+  assert.equal((await idleTimeouts(h.paths, table)).size, 0)
+  assert.deepEqual(JSON.parse(await readFile(moved.file)).held, moved.receipt.held)
+})
+
+test('panel states distinguish typed waiting, ownership and login scopes', () => {
+  const source = { account: id(901), org: id(911), sessionIds: ['session_one'] }, receipt = { remote: [] }
+  const engine = createHash('sha256').update(readFileSync(path.join(here, 'engine.js'))).digest('hex')
+  for (const [code, state, action] of [
+    ['CLOUD_HISTORY_UNREADABLE', 'waiting', 'wait'],
+    ['CLOUD_ARTIFACT_UNCERTAIN', 'waiting', 'wait'], ['CLOUD_ARTIFACT_BUDGET', 'waiting', 'wait'], [undefined, 'waiting', 'wait']
+  ]) {
+    const current = pendingPresentation(receipt, { ...source, attemptEngine: engine, failures: [{ id: 'cse_one', code, error: 'not proven to be on this Mac' }] }, { active: true, signedIn: true }, 'cloud')
+    assert.equal(current.pendingState, state)
+    assert.equal(current.pendingAction, action)
+    assert.equal(current.pendingAutomatic, true)
+  }
+  const waiting = [{ id: 'cse_two', localId: SOURCE, recordId: `local_${id(99)}` }]
+  const mixed = pendingPresentation(receipt, { ...source, failures: [{ id: 'cse_one', code: 'CLOUD_HISTORY_UNREADABLE' }], waiting }, { active: true, signedIn: true }, 'cloud', desktopFixture())
+  assert.equal(mixed.pendingState, 'waiting')
+  assert.equal(mixed.pendingAction, 'restart')
+  assert.equal(mixed.pendingCount, 2)
+  assert.equal(mixed.pendingAutomatic, true)
+  assert.equal(pendingPresentation(receipt, { ...source, waiting }, { active: true, signedIn: true }, 'cloud', desktopFixture()).pendingState, 'cloud-open')
+  assert.equal(pendingPresentation(receipt, source, { active: false, signedIn: true }, 'cloud').pendingAction, 'wait')
+  assert.equal(pendingPresentation(receipt, source, { active: false, signedIn: false }, 'cloud').pendingAction, 'sign-in')
+  for (const [remaining, signedIn, action] of [[true, true, 'finish'], [true, false, 'sign-in'], [false, false, 'finish']]) {
+    const pending = pendingPresentation({ remoteUndoing: remaining ? [{ id: 'cse_one' }] : [] }, source, { active: false, signedIn }, 'undo')
+    assert.equal(pending.pendingAction, action)
+    assert.equal(pending.pendingState, remaining ? 'undo-login' : 'undo')
+  }
+  for (const release of ['worker', 'scheduler', undefined]) {
+    const held = { id: SOURCE, recordId: `local_${SOURCE}`, release, sources: [{ ...source, id: SOURCE, file: '/synthetic/held.json' }] }
+    const current = pendingPresentation({ held: [held] }, source, {}, 'local', desktopFixture(), release === 'scheduler')
+    assert.equal(current.pendingAutomatic, release === 'worker')
+    assert.equal(current.pendingState, release === 'worker' ? 'open' : 'held')
+    assert.equal(current.pendingAction, 'restart')
+    const external = pendingPresentation({ held: [held] }, source, {}, 'local', [{ ...desktopFixture()[1], desktopPid: null }])
+    assert.equal(external.pendingAction, 'wait')
+    assert.equal(external.pendingAutomatic, false)
+  }
+})
+
+test('panel leave tokens survive sweep bookkeeping and reject changed receipt or selection while preserving other work', async () => {
+  for (const change of ['none', 'retry', 'selection', 'receipt', 'source']) {
+    const h = await home()
+    await h.write(SOURCE, branchEntries(4, SOURCE, 1))
+    await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_scope'] }))
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, processes: [] }), to, h.paths)
+    if (change === 'retry') {
+      const initial = JSON.parse(await readFile(moved.file))
+      Object.assign(initial.cloudChecks[0], { checkedAt: '2026-10-10T00:00:00.000Z', status: 'failed', failures: [{ id: 'cse_scope', code: 'CLOUD_ARTIFACT_UNCERTAIN', error: 'Waiting for a complete check' }] })
+      await writeFile(moved.file, JSON.stringify(initial))
+    }
+    const listed = await cli(h.root, ['accounts', '--json'])
+    assert.equal(listed.code, 0, listed.stderr)
+    const selected = lines(listed.stdout)[0].find(row => row.account === from.account)
+    assert.match(selected.pendingCancel, /^[a-f0-9]{64}$/)
+    assert.equal(selected.receiptDone, null)
+    const receipt = JSON.parse(await readFile(moved.file)), other = { account: h.acct.Q, org: h.org.Q, label: 'Other source', status: 'pending', sessionIds: ['session_other'] }
+    receipt.cloudChecks.push(other)
+    receipt.held = [{ id: id(998), title: 'Unrelated held work', sources: [{ account: h.acct.T, org: h.org.T, id: id(998), file: '/synthetic/held.json' }], workers: [] }]
+    if (change === 'retry') {
+      receipt.cloudChecks[0].checkedAt = new Date().toISOString()
+      receipt.cloudChecks[0].status = 'failed'
+      receipt.cloudChecks[0].failures = [{ id: 'cse_scope', code: 'CLOUD_ARTIFACT_UNCERTAIN', error: 'Waiting for a complete check' }]
+    }
+    if (change === 'selection') receipt.cloudChecks[0].sessionIds.push('session_later')
+    if (change === 'source') receipt.cloudChecks[0].org = h.org.T
+    await writeFile(moved.file, JSON.stringify(receipt))
+    if (change === 'receipt') await writeFile(path.join(h.paths.state, '2099-01-01T00-00-00-000.json'), JSON.stringify(receipt))
+    const before = await readFile(moved.file), result = await keepLocal(h.paths, { checks: [selected.pendingCancel] })
+    if (['selection', 'receipt', 'source'].includes(change)) {
+      assert.equal(result.code, 'PENDING_CHANGED')
+      assert.deepEqual(await readFile(moved.file), before)
+    } else {
+      assert.equal(result.cancelled, 1)
+      assert.equal(result.complete, false)
+      assert.equal(result.heldCancelled, 0)
+      assert.deepEqual(result.receipt.held, receipt.held)
+      assert.deepEqual(result.receipt.cloudChecks[1], other)
+      assert.equal(result.receipt.localCancelledAt, undefined)
+    }
+  }
+})
+
+async function cliProgressFixture() {
+  const h = await home()
+  for (const [index, sid] of [SOURCE, id(710)].entries()) {
+    await h.write(sid, [entry('user', 810 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  await h.record('P', id(799), rehomeRecord())
+  const output = await cli(h.root, ['--from', 'p@example.com', '--to', 't@example.com', '--json'], processSetup({ list: '', commands: '' }))
+  assert.equal(output.code, 0, output.stderr)
+  const events = lines(output.stdout), counts = events.filter(row => row.stage === 'sessions')
+  assert.deepEqual(counts.map(row => [row.sessionTotal, row.remainingCount]), [[2, 2], [2, 0]])
+  assert.ok(counts.every(row => row.live && Number.isSafeInteger(row.sessionTotal) && Number.isSafeInteger(row.remainingCount) && row.remainingCount >= 0 && row.remainingCount <= row.sessionTotal))
+  assert.equal(events.at(-1).summary.moved, 2)
+  assert.equal(events.at(-1).summary.notMoved.length, 0)
+  return output.stdout.trim().split('\n')
+}
+
+test('CLI JSON forwards validated whole-move session counters', async () => { await cliProgressFixture() })
+
+function wordingFixtures() {
+  const base = [
+    { account: 'work', org: 'company', email: 'work@example.test', orgName: 'Nomad Inc.', label: 'work@example.test · Nomad Inc.', active: true, signedIn: true },
+    { account: 'work', org: 'personal', email: 'work@example.test', orgName: 'Personal', label: 'work@example.test · Personal', active: false, signedIn: true },
+    { account: 'home', org: 'personal', email: 'home@example.test', orgName: 'Personal', label: 'home@example.test · Personal', active: false, signedIn: false }
+  ].map((row, index) => ({ ...row, activeAt: 3 - index, pending: null, pendingFailures: [], identityState: 'known' }))
+  const pending = (index, mode, count, code = null, release = null, activeIndex = 0, seconds = null) => {
+    const rows = structuredClone(base).map((row, index) => ({ ...row, active: index === activeIndex, signedIn: row.account === base[activeIndex].account })), account = rows[index], source = { account: account.account, org: account.org, sessionIds: Array.from({ length: count }, (_, i) => `session_${i}`) }
+    if (code) source.failures = source.sessionIds.map(id => ({ id, title: 'Research conversation', code, error: code }))
+    if (['CLOUD_HISTORY_LIMIT', 'CLOUD_BUDGET_LIMIT', 'CLOUD_PARSER_LIMIT'].includes(code)) {
+      source.attemptEngine = createHash('sha256').update(readFileSync(path.join(here, 'engine.js'))).digest('hex')
+      source.attemptBudget = memoryBudget().signature
+    }
+    const held = mode === 'local' ? Array.from({ length: count }, (_, i) => ({ id: id(i + 1), recordId: `local_${id(i + 1)}`, release, title: `Open chat ${i + 1}`, sources: [{ ...source, file: `/synthetic/${i}.json` }] })) : []
+    const receipt = { held, remote: mode === 'undo' ? [{ id: 'cse_0' }, { id: 'cse_1' }] : [], remoteUndoing: mode === 'undo' ? [{ ...source, id: 'cse_1' }] : [] }
+    const table = release === 'worker' ? [desktopFixture()[0], ...held.map((row, index) => ({ ...desktopFixture()[1], pid: 501 + index, ids: [row.id] }))] : desktopFixture()
+    Object.assign(account, { pending: mode, pendingFailures: source.failures ?? [], pendingWaiting: source.waiting ?? [], receipt: 'synthetic-receipt', receiptMoved: mode === 'local' ? 359 : 361,
+      receiptDestination: index === 0 ? 'work/personal' : 'work/company', pendingCancel: mode === 'cloud' ? String(index + 1).repeat(64) : null,
+      ...pendingPresentation(receipt, source, account, mode, table, release === 'scheduler', new Map(held.map(row => [row.recordId, seconds]))), pendingRetryAt: null })
+    return rows
+  }
+  const plan = { plan: true, kind: 'move', token: 'a'.repeat(64), heldCount: 102, remainingCount: 102, moved: 259,
+    sourceLabels: [base[1].label], affected: [{ pid: 501, started: 'synthetic', recordId: 'local_one', title: 'Research notes' }, { pid: 502, started: 'synthetic', recordId: 'local_two', title: 'Daily brief' }] }
+  const capacityPlan = { ...plan, ok: false, code: 'RESTART_CAPACITY', capacity: { records: 102, estimatedMs: 26000, availableMs: 22000, fits: false } }
+  const held = pending(1, 'local', 102, null, 'scheduler')
+  held[1].receiptMoved = 259
+  const mixed = pending(2, 'cloud', 3)
+  mixed[1] = held[1]
+  mixed[2].receiptMoved = 259
+  const mixedWaiting = pending(0, 'cloud', 2, 'CLOUD_HISTORY_UNREADABLE'), mixedAccount = mixedWaiting[0]
+  const mixedSource = { account: mixedAccount.account, org: mixedAccount.org, failures: mixedAccount.pendingFailures.slice(0, 1), waiting: [{ id: 'session_1', title: 'Another open conversation', localId: SOURCE }] }
+  Object.assign(mixedAccount, { pendingFailures: mixedSource.failures, pendingWaiting: mixedSource.waiting, ...pendingPresentation({}, mixedSource, mixedAccount, 'cloud', desktopFixture()) })
+  const limitAndSignIn = pending(1, 'cloud', 1, 'CLOUD_HISTORY_LIMIT')
+  limitAndSignIn[2] = pending(2, 'cloud', 3)[2]
+  const twoSources = pending(0, 'cloud', 1)
+  twoSources[1] = pending(1, 'cloud', 1)[1]
+  for (const row of twoSources.filter(row => row.pending)) row.receiptDestination = 'home/personal'
+  const localUndo = pending(2, 'undo', 1)
+  Object.assign(localUndo[2], pendingPresentation({ undoing: [], remote: [{ id: 'cse_one' }] }, localUndo[2], localUndo[2], 'undo'))
+  const partialSummary = { moved: 272, notMoved: Array.from({ length: 3 }, (_, i) => ({ account: 'work', org: 'personal', id: id(i + 1), title: `Remaining ${i + 1}`, error: 'Synthetic publication failure' })), groups: [], attention: [] }
+  const partial = structuredClone(base)
+  Object.assign(partial[1], { pending: 'partial', pendingState: 'partial', pendingAction: 'blocked', pendingCount: 3, pendingAutomatic: false,
+    receipt: 'synthetic-receipt', receiptSummary: partialSummary, receiptMoved: 272, receiptDestination: 'work/company' })
+  const recorded = base.map(row => ({ ...row, receipt: '/synthetic/2026-10-30T21-00-00-000.json', receiptDone: base[1].label, receiptSummary: { moved: 499, notMoved: [], groups: [], attention: [], kept: [] } }))
+  const starting = pending(0, 'cloud', 1, 'CLOUD_AUTH_PENDING', null, 2).map(row => ({ ...row, active: false, signedIn: false, identityState: 'unknown' }))
+  const unfinished = pending(2, 'cloud', 3).map(row => row.pending ? { ...row, receiptSummary: partialSummary } : row)
+  const rows = [
+    { name: '01-done', screen: 'moved', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label }, contains: ['Done. 361 sessions are now in', base[0].label], primary: null },
+    { name: '02-held', screen: 'needs a restart', accounts: held, contains: ['259 sessions moved\n102 more need Claude to restart.'], primary: 'Restart Claude and move 102' },
+    { name: '03-restart-dialog', plan, dialog: true, contains: ['Restart Claude to move 102 more sessions?', 'These open chats will stop:'], primary: 'Restart and move' },
+    { name: '04-same-login', screen: 'moved', accounts: pending(1, 'cloud', 1), contains: ['361 sessions moved\n1 old copy needs checking', 'Cleanup will retry automatically.'], primary: null },
+    { name: '05-other-login', screen: 'needs a sign-in', accounts: pending(2, 'cloud', 3), contains: ['361 sessions moved\n3 old copies need checking', 'Sign Claude in as home@example.test'], primary: 'Leave old copies and move' },
+    { name: '06-clearing', screen: 'moving', accounts: pending(1, 'cloud', 1, null, null, 1), operation: ['finish', '--json'], event: { stage: 'cloud', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['0%'], primary: null },
+    { name: '08-unproven', screen: 'moved', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label, summary: { moved: 361, notMoved: [], groups: [], attention: [], kept: [{ id: 'cse_research', title: 'Research conversation', error: `not proven to be on this Mac, kept in ${base[1].label}` }] } }, contains: ['Done. 361 sessions are now in', `Research conversation | cse_rese | not proven to be on this Mac, kept in ${base[1].label}`], primary: null, expanded: true },
+    { name: '09-open-chats', screen: 'needs a restart', accounts: pending(1, 'local', 2, null, 'worker'), contains: ['359 sessions moved\n2 open chats move after they go idle'], primary: 'Restart Claude and move 2' },
+    { name: '10-interrupted', screen: 'needs a restart', accounts: pending(1, 'recovery', 0), contains: ['361 sessions moved\nThe last move was interrupted.'], primary: 'Finish the move' },
+    { name: '11-repair', screen: "can't move", accounts: base.map(row => ({ ...row, recoveryProblem: { receipt: '/synthetic/move.json', error: 'An older version started this move and must finish it', code: 'OLDER_MOVE' } })), contains: ['The last move is paused.\nAn older version started this move and must finish it.'], primary: null },
+    { name: '12-undo-pending', screen: 'needs a sign-in', accounts: pending(2, 'undo', 1), contains: ['Undo is partly done\nSign Claude in as home@example.test.'], primary: null },
+    { name: '13-move-stopped', screen: 'needs a restart', event: { done: true, ok: false, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['Move stopped: Claude did not confirm it had closed.'], primary: 'Try again' },
+    { name: '14-background-complete', screen: 'moved', event: { swept: true, ok: true, complete: true, moved: 12, restart: true }, contains: ['Moved 12 more sessions. Restart Claude to see them.'], primary: null },
+    { name: '15-restart-cancelled', screen: 'needs a restart', accounts: held, plan, cancel: true, contains: ['Restart cancelled.', '102 sessions', base[1].label], primary: 'Restart Claude and move 102' },
+    { name: '16-approval-changed', screen: 'needs a restart', event: { done: true, ok: false, code: 'RESTART_PLAN_CHANGED', retryable: true }, contains: ['Different chats are open now.', 'review again.'], primary: 'Restart Claude and move' },
+    { name: '17-uncertain', screen: 'moved', accounts: pending(0, 'cloud', 1, 'CLOUD_ARTIFACT_UNCERTAIN'), contains: ['361 sessions moved\nWaiting to verify 1 conversation', 'The check will retry automatically.'], primary: null },
+    { name: '19-undo-complete', screen: 'moved', event: { undone: 'synthetic-receipt', restored: 3, sessions: 3, restart: true }, operation: ['undo', '--json'], contains: ['Undo complete. 3 source entries restored.'], primary: null },
+    { name: '20-stopped-here', screen: 'moved', event: { done: true, ok: true, complete: true, moved: 259, keptLocal: 1, heldCancelled: 102 }, operation: ['keep-local', '--json'], contains: ['259 moved. Stopped here.', 'Remaining work cancelled.'], primary: null },
+    { name: '21-partial', screen: "can't move", event: { done: true, ok: false, complete: true, summary: { moved: 233, notMoved: Array.from({ length: 10 }, (_, i) => ({ id: id(i), error: 'MOVE_BLOCKED' })), groups: [], attention: [] } }, contains: ['233 moved.', '10 sessions were not moved.'], primary: null },
+    { name: '25-completion-pending', screen: 'moved', event: { done: true, ok: true, complete: false, moved: 12 }, contains: ['12 moved. Remaining work is waiting.'], primary: null },
+    { name: '26-undo-ready', screen: 'needs a sign-in', accounts: pending(2, 'undo', 1, null, null, 2), contains: ['Undo is partly done\nPress Finish undo.'], primary: 'Finish undo' },
+    { name: '27-timed-open-chats', screen: 'needs a restart', accounts: pending(1, 'local', 2, null, 'worker', 0, 900), contains: ['after about 15 idle minutes'], primary: 'Restart Claude and move 2' },
+    { name: '28-mixed-held-and-cloud', screen: 'needs a restart', accounts: mixed, contains: ['259 sessions moved\n102 more need Claude to restart.', '3 old copies need checking'], primary: 'Restart Claude and move 102' },
+    { name: '29-unreadable', screen: 'moved', accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_UNREADABLE'), contains: ['Waiting to verify 1 conversation', 'The check will retry automatically.'], primary: null },
+    { name: '30-check-dismissed', screen: 'moved', operation: ['keep-local', '--json', '--leave-check', 'a'.repeat(64)], event: { done: true, ok: true, complete: true, moved: 0, keptLocal: 1, heldCancelled: 0 }, contains: ['Stopped here. Remaining source checks cancelled.'], primary: null },
+    { name: '31-mixed-unreadable-and-waiting', screen: 'needs a restart', accounts: mixedWaiting, contains: ['Waiting to verify 2 conversations'], primary: 'Restart Claude and finish cleanup', keep: true },
+    { name: '32-one-source-clearing', screen: 'moved', accounts: twoSources, background: true, event: { stage: 'cloud', live: true, text: '0/1', completed: 0, total: 1, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['Clearing 1 old copy from', base[1].label], primary: null },
+    { name: '33-background-verification', screen: 'moved', accounts: twoSources, background: true, event: { stage: 'verify', live: true, text: '1/3', completed: 1, total: 3 }, contains: ['Cleanup will retry automatically.'], primary: null },
+    { name: '34-same-login-undo', screen: 'needs a sign-in', accounts: pending(1, 'undo', 1), contains: ['Press Finish undo.'], primary: 'Finish undo' },
+    { name: '35-local-undo-recovery', screen: 'needs a restart', accounts: localUndo, contains: ['Press Finish undo.'], primary: 'Finish undo' },
+    { name: '37-reopen-failed', screen: 'needs a restart', accounts: pending(1, 'undo', 1), event: { swept: true, ok: false, code: 'REOPEN_FAILED', error: 'Synthetic reopen failure' }, contains: ['Claude could not be confirmed open.', 'Open Claude, then press Try again.'], primary: 'Try again' },
+    { name: '38-same-login-uncertain', screen: 'moved', accounts: pending(1, 'cloud', 1, 'CLOUD_ARTIFACT_UNCERTAIN'), contains: ['The check will retry automatically.'], primary: null },
+    { name: '39-capacity-dialog', dialog: true, plan: capacityPlan, event: capacityPlan, contains: ['stay closed while', 'These open chats will stop:'], primary: 'Restart and move' },
+    { name: '40-capacity-suppressed-warning', dialog: true, suppressed: true, plan: capacityPlan, event: capacityPlan, contains: ['stay closed while', 'These open chats will stop:'], primary: 'Restart and move' },
+    { name: '43-partial-quit-veto', screen: 'needs a restart', accounts: held, event: { done: true, ok: false, complete: false, receipt: 'synthetic-receipt', moved: 259, heldCount: 102, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['259 moved. Move stopped:', 'Claude did not confirm it had closed.'], primary: 'Try again' },
+    { name: '44-login-retry', screen: 'moved', accounts: pending(0, 'cloud', 1, 'CLOUD_AUTH_PENDING').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['361 sessions moved\nWaiting for Claude to finish signing in.', 'Retrying in'], primary: null },
+    { name: '45-memory-retry', screen: 'moved', accounts: pending(0, 'cloud', 1, 'CLOUD_MEMORY_PRESSURE').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['361 sessions moved\nWaiting for memory', 'Retrying in'], primary: null },
+    { name: '46-history-limit', screen: "can't move", accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_LIMIT'), contains: ['361 sessions moved\n1 conversation exceeds the history limit'], primary: null, keep: true },
+    { name: '47-budget-limit', screen: "can't move", accounts: pending(0, 'cloud', 1, 'CLOUD_BUDGET_LIMIT'), contains: ['memory budget', 'even one at a time'], primary: null, keep: true },
+    { name: '48-parser-limit', screen: "can't move", accounts: pending(0, 'cloud', 1, 'CLOUD_PARSER_LIMIT'), contains: ["history reader's limit"], primary: null, keep: true },
+    { name: '49-local-partial', screen: "can't move", accounts: partial, contains: ['272 sessions moved\n3 sessions remain', 'Keep moved sessions or undo this move.'], primary: null, keep: true },
+    { name: '50-limit-and-sign-in', screen: 'needs a sign-in', accounts: limitAndSignIn, contains: ['361 sessions moved\n3 old copies need checking', 'exceeds the history limit'], primary: null },
+    { name: '51-recorded-result', screen: 'moved', accounts: recorded, contains: [`Done. 499 sessions are now in ${base[1].label}.\nHistory verified`], primary: 'Move' },
+    { name: '52-waiting-for-claude', accounts: starting, contains: ['361 sessions moved\nWaiting for Claude.'], primary: null },
+    { name: '53-other-login-and-unfinished-local', screen: 'needs a sign-in', accounts: unfinished, contains: ['272 sessions moved\n3 old copies need checking'], primary: null }
+  ]
+  return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
+}
+
+async function swiftFixtureSource() {
+  let source = (await readFile(path.join(here, 'menubar.swift'), 'utf8')).split('@main\nstruct HandoffApp: App {')[0]
+  const start = source.indexOf('    private func run(_ args: [String]')
+  const end = source.indexOf('\nstruct RowKey: PreferenceKey', start)
+  assert.ok(start > 0 && end > start)
+  source = source.slice(0, start) + `    private func run(_ args: [String], line: @escaping (String) -> Void, done: @escaping (Int32, String) -> Void) {
+        requests.append((args, line, done))
+    }
+    private func launch(_ process: Process, timeout: Bool = false, line: @escaping (String) -> Void = { _ in }, done: @escaping (Int32, String) -> Void) {
+        launches.append((process, done))
+    }
+    private func latest(_ done: @escaping (String?) -> Void) {
+        fetches.append(done)
+    }
+}
+` + source.slice(end)
+  const promptStart = source.indexOf('    private func restartResponse(_ prompt: RestartPrompt)')
+  const promptEnd = source.indexOf('    private func cancelRestart', promptStart)
+  assert.ok(promptStart > 0 && promptEnd > promptStart)
+  source = source.slice(0, promptStart) + `    private func restartResponse(_ prompt: RestartPrompt) -> (NSApplication.ModalResponse, Bool) {
+        restartDialogs.append(prompt)
+        return restartDialogResponse
+    }
+
+` + source.slice(promptEnd)
+  return source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
+    .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)')
+    .replace('DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in', 'scheduleBadgeReset { [weak self] in')
+    .replace('if demo || snapshot { return }', 'notices.append(title)\n        if demo || snapshot { return }')
+    .replace('    private let config: Config?', '    var config: Config?')
+    .replace('static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String', 'static let version: String? = "4.2.1"')
+    .replace('probe.arguments = ["-lc", "command -v node"]', 'probe.arguments = ["-c", "echo /fixture/found/bin/node"]')
+    .replaceAll('UserDefaults.standard', 'fixtureDefaults') + String.raw`
+@MainActor final class FixtureDefaults {
+    var values: [String: Any] = [:]
+    func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
+    func string(forKey key: String) -> String? { values[key] as? String }
+    func set(_ value: Any?, forKey key: String) { values[key] = value }
+}
+@MainActor let fixtureDefaults = FixtureDefaults()
+@MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
+@MainActor var automaticRefreshFixture = false
+@MainActor var badgeResets: [() -> Void] = []
+@MainActor func scheduleBadgeReset(_ action: @escaping () -> Void) { badgeResets.append(action) }
+@MainActor var restartDialogs: [RestartPrompt] = []
+@MainActor var restartDialogResponse: (NSApplication.ModalResponse, Bool) = (.alertThirdButtonReturn, false)
+@MainActor var notices: [String] = []
+@MainActor var fetches: [(String?) -> Void] = []
+@MainActor var launches: [(Process, (Int32, String) -> Void)] = []
+extension Model {
+    func checkSweep() { sweep() }
+    func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
+    func checkOperation(_ args: [String]) { operationArgs = args }
+    func checkCancel(_ plan: Event) { cancelRestart(plan) }
+}
+`
+}
+
+test('Swift section 1 wording states render the production panel and restart prompt', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-section1-panels-'))
+  const fixtures = wordingFixtures(), file = path.join(root, 'wording.swift'), binary = path.join(root, 'wording')
+  await writeFile(path.join(root, 'fixtures.json'), JSON.stringify(fixtures))
+  const source = await swiftFixtureSource() + String.raw`
+struct WordingFixture: Decodable {
+    let name: String
+    let accounts: [Account]
+    let operation: [String]
+    let event: String?
+    let plan: Event?
+    let dialog: Bool?
+    let cancel: Bool?
+    let expanded: Bool?
+    let background: Bool?
+    let suppressed: Bool?
+    let contains: [String]
+    let primary: String?
+    let screen: String?
+    let keep: Bool?
+}
+@main
+struct WordingChecks {
+    @MainActor static func main() throws {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let root = URL(fileURLWithPath: CommandLine.arguments[1])
+        let fixtures = try JSONDecoder().decode([WordingFixture].self, from: Data(contentsOf: root.appendingPathComponent("fixtures.json")))
+        var manifest: [[String: Any]] = []
+        for fixture in fixtures {
+            requests = []
+            restartDialogs = []
+            let model = Model(demo: fixture.accounts)
+            if model.pendingAccounts.isEmpty, let target = fixture.operation.firstIndex(of: "--to"), target + 1 < fixture.operation.count {
+                model.selectTarget(fixture.operation[target + 1].replacingOccurrences(of: " ", with: "/"))
+                let selected = Set(fixture.operation.indices.filter { fixture.operation[$0] == "--from" && $0 + 1 < fixture.operation.count }.map { fixture.operation[$0 + 1].replacingOccurrences(of: " ", with: "/") })
+                for id in model.from.subtracting(selected) { model.toggle(id) }
+            }
+            model.checkOperation(fixture.operation)
+            var text: String
+            var primary: String?
+            var png: Data?
+            if fixture.dialog == true {
+                let prompt = RestartPrompt(plan: fixture.plan!)
+                text = prompt.title + "\n" + prompt.body
+                primary = prompt.confirm
+                let alert = prompt.alert()
+                precondition(alert.buttons[0].isEnabled && alert.showsSuppressionButton)
+                precondition(alert.buttons.map(\.title) == ["Restart and move", "Move the others only", "Cancel"])
+                precondition(alert.suppressionButton?.title == "Don't ask again")
+                png = Snapshot.dialogData(fixture.plan!)
+            } else {
+                if fixture.cancel == true { model.checkCancel(fixture.plan!) }
+                if let line = fixture.event {
+                    let event = try JSONDecoder().decode(Event.self, from: Data(line.utf8))
+                    if event.swept == true || fixture.background == true {
+                        model.checkSweep()
+                        requests.last!.1(line)
+                        if event.swept == true { requests.last!.2(event.ok == false ? 1 : 0, "") }
+                    } else {
+                        model.begin()
+                        model.handle(line)
+                        if event.live != true { model.checkFinish(event.ok == false ? 1 : 0) }
+                    }
+                }
+                model.detailsExpanded = fixture.expanded == true
+                text = ([model.visibleCompletion?.summary, model.visibleCompletion?.detail, model.statusHeadline, model.statusDetail].compactMap { $0 } + model.detailLines.map(\.1)).joined(separator: "\n")
+                if model.running { precondition(model.statusHeadline == model.moveProgress.detail && model.statusDetail == nil, fixture.name + ": " + text) }
+                if let screen = fixture.screen { precondition(model.screen?.rawValue == screen, fixture.name + ": " + (model.screen?.rawValue ?? "none")) }
+                if ["44-login-retry", "45-memory-retry", "46-history-limit"].contains(fixture.name) {
+                    precondition(model.statusHeadline == "361 sessions moved")
+                    precondition(model.statusDetail != nil && !model.statusDetail!.contains("361 moved"))
+                }
+                primary = model.primaryTitle
+                if fixture.keep == true { precondition(model.canKeepLocal, fixture.name) }
+                for account in model.accounts {
+                    let from = Row(account: account, radio: false, selected: false, muted: false, tag: model.sourceTag(account), action: {})
+                    let to = Row(account: account, radio: true, selected: false, muted: false, tag: model.sourceTag(account), action: {})
+                    precondition(to.tagLabels == (account.active == true ? ["active"] : []))
+                    precondition(from.tagLabels.contains("active") == (account.active == true))
+                }
+                if fixture.name == "01-done" { precondition(model.visibleCompletion?.detail == "History verified") }
+                if fixture.name == "11-repair" { precondition(model.detailLines.map(\.0) == ["receipt"]) }
+                if fixture.name == "05-other-login" {
+                    precondition(model.statusHeadline == "361 sessions moved" && model.statusDetail?.contains("Sign Claude in as home@example.test") == true)
+                    precondition(!model.directActions && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"] && !model.undoPending)
+                }
+                if fixture.name == "08-unproven" { precondition(model.detailLines.filter { $0.1.contains("Research conversation") }.count == 1 && !model.directActions && model.canMutate) }
+                if fixture.name == "50-limit-and-sign-in" { precondition(model.primaryTitle == nil && !model.directActions && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"] && !model.undoPending) }
+                if fixture.name == "46-history-limit" { precondition(model.directActions && model.canKeepLocal && !model.undoPending && model.links.isEmpty) }
+                if fixture.name == "51-recorded-result" { precondition(model.links.map(\.title) == ["Undo last move"]) }
+                if fixture.name == "52-waiting-for-claude" { precondition(!text.contains("Sign Claude in") && model.sourceTag(model.pendingAccounts[0]) == "waiting" && !model.movable && model.identityLabel == "waiting for Claude") }
+                if fixture.name == "53-other-login-and-unfinished-local" { precondition(!model.movable && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"]) }
+                if fixture.name == "12-undo-pending" || fixture.name == "26-undo-ready" {
+                    precondition(model.undoPending && !text.contains("361 moved"))
+                    let count = requests.count
+                    model.undo()
+                    precondition(requests.count == count)
+                }
+                if fixture.name == "09-open-chats" || fixture.name == "27-timed-open-chats" { precondition(model.sourceTag(model.pendingAccounts[0]) == "waiting") }
+                if fixture.name == "49-local-partial" { precondition(model.sourceTag(model.pendingAccounts[0]) == "not moved") }
+                if fixture.name == "06-clearing" {
+                    precondition(model.to == "work/company" && model.from == ["work/personal"])
+                }
+                if fixture.name == "30-check-dismissed" { precondition(model.visibleCompletion == nil) }
+                if fixture.name == "31-mixed-unreadable-and-waiting" { precondition(model.scopedChecks.isEmpty) }
+                if ["04-same-login", "05-other-login", "12-undo-pending", "34-same-login-undo", "35-local-undo-recovery", "38-same-login-uncertain"].contains(fixture.name) {
+                    precondition(!text.contains("Switch Claude") && !text.contains("select Personal"))
+                }
+                if fixture.background == true {
+                    precondition(!model.running && model.badge.isEmpty && !model.moveProgress.hasProgress && model.canMutate)
+                    precondition(model.sourceTag(model.accounts[0]) == "waiting")
+                    precondition(model.sourceTag(model.accounts[1]) == (fixture.name == "32-one-source-clearing" ? "clearing" : "waiting"))
+                }
+                if fixture.name == "46-history-limit" {
+                    let tokens = model.scopedChecks
+                    precondition(!tokens.isEmpty)
+                    model.stopHere()
+                    precondition(requests.last!.0 == ["keep-local", "--json"] + tokens.flatMap { ["--leave-check", $0] })
+                    model.running = false
+                    model.note = ""
+                    model.detailsExpanded = fixture.expanded == true
+                }
+                png = Snapshot.data(model)
+            }
+            precondition(primary == fixture.primary, fixture.name + ": " + (primary ?? "none"))
+            for fragment in fixture.contains { precondition(text.contains(fragment), fixture.name + ": " + text) }
+            precondition((!text.contains("15 idle minutes") || fixture.name == "27-timed-open-chats") && !text.contains("Nothing was lost"))
+            let output = root.appendingPathComponent(fixture.name + ".png")
+            guard let png, let bitmap = NSBitmapImageRep(data: png), bitmap.pixelsWide > 200, bitmap.pixelsHigh > 100 else { fatalError("No production snapshot for " + fixture.name) }
+            try png.write(to: output)
+            manifest.append(["name": fixture.name, "path": output.path, "text": text, "primary": primary ?? NSNull(), "width": bitmap.pixelsWide, "height": bitmap.pixelsHigh])
+        }
+        try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys]).write(to: root.appendingPathComponent("manifest.json"))
+        print("Rendered \(fixtures.count) production wording states at \(root.path)")
+    }
+}
+`
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [root], { timeout: 90_000 })
+  t.diagnostic(stdout.trim())
+  const manifest = JSON.parse(await readFile(path.join(root, 'manifest.json')))
+  assert.equal(manifest.length, fixtures.length)
+  for (const row of manifest) assert.deepEqual((await readFile(row.path)).subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+})
+
+test('Swift preserves command, progress, metadata, and completion states', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
+  const cliProgress = await cliProgressFixture()
+  const checkpointAccounts = await checkpointAccountsFixture()
+  const h = await taskFamilyFixture(true, 1)
+  await interruptTaskFamily(h, 'move', 'target')
+  const recoveryAccounts = await cli(h.root, ['accounts', '--json'])
+  assert.equal(recoveryAccounts.code, 0)
+  const transfer = await taskFamilyFixture(), selected = await transfer.selection(), mock = taskHarness(), captured = []
+  const planned = await executeMove([selected.from], selected.to, transfer.paths, { io: mock.io })
+  let closing = false
+  const moved = await executeMove([selected.from], selected.to, transfer.paths, { io: mock.io, approve: planned.plan.token, report: (stage, text, extra = {}) => {
+    if (stage === 'desktop') closing = true
+    captured.push({ preQuit: !closing, line: JSON.stringify({ stage, text, ...extra }) })
+  } })
+  assert.equal(moved.ok, true, moved.reason)
+  assert.ok(captured.some(row => row.preQuit && JSON.parse(row.line).stage === 'move' && JSON.parse(row.line).completed > 0))
+  const retryHome = await taskFamilyFixture(), retrySelection = await retryHome.selection()
+  const desktop = '500 1 Tue Sep 1 00:00:00 2026 /Applications/Claude.app/Contents/MacOS/Claude'
+  const listing = `${desktop}\n701 500 Tue Sep 1 00:00:00 2026 /tmp/claude`, commands = `${listing} --resume ${retryHome.run}`
+  const retryMock = taskHarness(parseProcesses(desktop, desktop))
+  const retryPlan = await executeMove([retrySelection.from], retrySelection.to, retryHome.paths, { io: retryMock.io })
+  let changed = false
+  const interrupted = await executeMove([retrySelection.from], retrySelection.to, retryHome.paths, { io: retryMock.io, approve: retryPlan.plan.token, report: (stage, text, extra) => {
+    if (!changed && stage === 'move' && extra?.completed === 1) { changed = true; retryMock.rows = parseProcesses(listing, commands) }
+  } })
+  assert.equal(changed, true)
+  assert.equal(interrupted.code, 'RESTART_PLAN_CHANGED')
+  assert.equal(interrupted.receipt.sessions.length, 1)
+  assert.deepEqual(retryMock.calls, [])
+  const retryAccounts = await cli(retryHome.root, ['accounts', '--json'], processSetup({ list: listing, commands }))
+  assert.equal(retryAccounts.code, 0, retryAccounts.stderr)
+  const continuation = { accounts: JSON.parse(retryAccounts.stdout), args: ['--from', retrySelection.from.label, '--to', retrySelection.to.label, '--json'],
+    event: JSON.stringify({ ...interrupted, done: true, receipt: interrupted.file, moved: interrupted.receipt.sessions.length, heldCount: interrupted.receipt.held.length, held: interrupted.receipt.held }) }
+  let source = await swiftFixtureSource()
+  source += String.raw`
+@main
+struct StateChecks {
+    @MainActor
+    static func main() {
+        let captured = try! JSONSerialization.jsonObject(with: Data(base64Encoded: "CAPTURED_RESTART_PROGRESS")!) as! [[String: Any]]
+        let replay = Model(demo: Demo.accounts)
+        replay.begin()
+        for row in captured {
+            replay.handle(row["line"] as! String)
+            if row["preQuit"] as! Bool {
+                precondition(replay.moveProgress.percent < 99)
+                precondition(!replay.moveProgress.restarting && !replay.moveProgress.skipped.contains("close") && !replay.moveProgress.skipped.contains("reopen"))
+            }
+        }
+        precondition(replay.moveProgress.restarting)
+        let menuSize = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)!.size
+        var textHeight: Int?
+        for badge in ["", "0%", "9%", "10%", "47%", "99%", "100%"] {
+            let image = MenuLabel(symbol: "arrow.left.arrow.right", badge: badge).image
+            precondition(image.size == menuSize && image.isTemplate && image.tiffRepresentation != nil)
+            if !badge.isEmpty {
+                let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
+                let rows = (0..<bitmap.pixelsHigh).filter { y in (0..<bitmap.pixelsWide).contains { x in bitmap.colorAt(x: x, y: y)!.alphaComponent > 0.4 } }.count
+                precondition(textHeight == nil || rows == textHeight)
+                textHeight = rows
+            }
+        }
+        for symbol in ["info.circle", "exclamationmark.triangle", "checkmark"] {
+            let image = MenuLabel(symbol: symbol, badge: "").image
+            precondition(image.size == menuSize && image.isTemplate && image.tiffRepresentation != nil)
+        }
+        var counts = MoveProgress(now: 0)
+        precondition(counts.detail == "0%")
+        counts.sessions(total: 498, remaining: 226)
+        counts.update("scan", completed: 0, total: 800, now: 0)
+        counts.update("scan", completed: 3, total: 800, now: 3)
+        precondition(counts.remainingSessions == 226 && counts.detail == "\(counts.percent)% · 226 sessions left")
+        counts.sessions(total: 498, remaining: 220)
+        counts.update("move", completed: 1, total: 6, now: 4)
+        counts.update("move", completed: 1, total: 6, now: 5)
+        precondition(counts.remainingSessions == 220)
+        counts.sessions(total: 498, remaining: 1)
+        precondition(counts.detail == "\(counts.percent)% · 1 session left")
+        counts.sessions(total: 498, remaining: 0)
+        counts.update("verify", completed: 1, total: 226, now: 6)
+        precondition(counts.percent < 100 && counts.detail == "\(counts.percent)%")
+        let cliProgress = try! JSONDecoder().decode([String].self, from: Data(base64Encoded: "CLI_COUNTER_EVENTS")!)
+        let continued = Model(demo: Demo.accounts)
+        continued.begin()
+        var countEvents = 0
+        for line in cliProgress {
+            let event = try! JSONDecoder().decode(Event.self, from: Data(line.utf8))
+            continued.handle(line)
+            if event.stage == "sessions" { countEvents += 1; precondition(continued.moveProgress.remainingSessions == event.remainingCount) }
+        }
+        precondition(countEvents == 2 && continued.moveProgress.remainingSessions == 0)
+        let sourceProgress = Model(demo: Demo.accounts)
+        sourceProgress.begin()
+        sourceProgress.handle(#"{"stage":"cloud","text":"0/2","live":true,"completed":0,"total":2,"sourceId":"work/personal","sourceLabel":"Source"}"#)
+        let activity = sourceProgress.sourceActivity?.sourceId
+        sourceProgress.handle(#"{"stage":"sessions","text":"Remaining sessions","live":true,"sessionTotal":5,"remainingCount":3}"#)
+        precondition(sourceProgress.moveProgress.remainingSessions == 3 && sourceProgress.sourceActivity?.sourceId == activity && sourceProgress.displaySummary == sourceProgress.moveProgress.detail)
+        for line in [#"{"stage":"sessions","text":"Invalid","live":true,"sessionTotal":2,"remainingCount":3}"#,
+                     #"{"stage":"sessions","text":"Invalid","live":true,"sessionTotal":-1,"remainingCount":0}"#] { sourceProgress.handle(line) }
+        precondition(sourceProgress.moveProgress.remainingSessions == 3)
+        var progress = MoveProgress(now: 0)
+        var previous = 0
+        for (stage, completed, total, at) in [("scan", 0, 100, 0.0), ("scan", 50, 100, 2.0), ("scan", 100, 100, 4.0), ("cloud scan", 1, 2, 5.0), ("desktop", 0, 1, 6.0), ("scan", 1, 100, 8.0), ("scan", 100, 100, 8.2), ("move", 1, 100, 8.3), ("move", 100, 100, 8.5), ("verify", 100, 100, 8.6), ("retire", 100, 100, 8.7), ("finalize", 0, 1, 8.8), ("reopen", 0, 1, 9.0), ("cloud", 1, 2, 10.0), ("cloud", 2, 2, 11.0)] {
+            progress.update(stage, completed: completed, total: total, now: at)
+            precondition(progress.percent >= previous && progress.percent <= 99)
+            previous = progress.percent
+        }
+        progress.refresh(10000)
+        precondition(progress.percent == 99)
+        for stage in ["", "undo", "keep-local", "unknown"] {
+            var idle = MoveProgress(now: 0)
+            idle.update(stage, completed: nil, total: nil, now: 1)
+            precondition(!idle.hasProgress && idle.percent == 0)
+        }
+        var local = MoveProgress(now: 0)
+        local.update("scan", completed: 100, total: 100, now: 1)
+        local.update("move", completed: 100, total: 100, now: 2)
+        precondition(!local.skipped.contains("move"))
+        local.update("finalize", completed: nil, total: nil, now: 3)
+        local.update("cloud", completed: 0, total: 0, now: 4)
+        precondition(local.skipped.contains("cloud") && local.percent > 90)
+        var mixed = MoveProgress(now: 0)
+        mixed.update("cloud", completed: 1, total: 1, preparatory: true, now: 2)
+        let checked = mixed.percent
+        precondition(checked < 99 && mixed.phase == "cloudScan")
+        mixed.update("desktop", completed: nil, total: nil, now: 3)
+        precondition(mixed.phase == "close" && mixed.percent >= checked)
+        mixed.update("reopen", completed: nil, total: nil, now: 4)
+        precondition(mixed.phase == "reopen")
+        var paused = MoveProgress(now: 0)
+        paused.update("scan", completed: 0, total: 1, now: 0)
+        paused.paused = 2
+        paused.resume(102)
+        precondition(paused.started == 100 && paused.paused == nil)
+        let progressModel = Model(demo: Demo.accounts)
+        progressModel.begin()
+        precondition(progressModel.badge == "0%")
+        progressModel.handle("{\"stage\":\"cloud\",\"text\":\"1/1\",\"live\":true,\"completed\":1,\"total\":1,\"preparatory\":true}")
+        precondition(progressModel.moveProgress.phase == "cloudScan" && progressModel.moveProgress.percent < 99)
+        progressModel.begin()
+        progressModel.handle("{\"stage\":\"scan\",\"text\":\"50/100\",\"live\":true,\"completed\":50,\"total\":100}")
+        progressModel.handle("{\"stage\":\"cloud scan\",\"text\":\"0/1\",\"live\":true,\"completed\":0,\"total\":1}")
+        let percentage = progressModel.badge
+        precondition(percentage.hasSuffix("%") && !percentage.contains("/"))
+        progressModel.handle("{\"stage\":\"sessions\",\"text\":\"Remaining sessions\",\"live\":true,\"sessionTotal\":5,\"remainingCount\":4}")
+        precondition(progressModel.displaySummary == percentage + " · 4 sessions left" && progressModel.tooltip == progressModel.displaySummary)
+        progressModel.handle("{\"stage\":\"inventory\",\"text\":\"100 sessions\"}")
+        precondition(progressModel.badge == percentage)
+        progressModel.begin(resetProgress: false)
+        progressModel.handle("{\"stage\":\"sessions\",\"text\":\"Remaining sessions\",\"live\":true,\"sessionTotal\":5,\"remainingCount\":3}")
+        precondition(progressModel.badge == percentage && progressModel.moveProgress.detail == percentage + " · 3 sessions left" && progressModel.displaySummary == progressModel.moveProgress.detail)
+        progressModel.handle("{\"done\":true,\"ok\":false,\"moved\":0,\"reason\":\"fixture rollback\"}")
+        progressModel.checkFinish(1)
+        precondition(progressModel.badge.isEmpty && !progressModel.running && progressModel.tooltip == "Claude Handoff")
+        progressModel.begin()
+        progressModel.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":100}")
+        progressModel.checkFinish(0)
+        precondition(progressModel.badge == "100%" && !progressModel.running)
+        let completed = Model(demo: Demo.accounts)
+        completed.selectTarget(Demo.accounts[2].id)
+        completed.begin()
+        completed.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167}")
+        precondition(completed.visibleCompletion == nil)
+        completed.checkFinish(0)
+        precondition(completed.visibleCompletion?.summary == "Done. 167 sessions are now in you@home.com · Personal.")
+        precondition(completed.visibleCompletion?.detail == "History verified")
+        completed.note = "A moved session has a newer title"
+        precondition(completed.visibleCompletion?.summary == "Done. 167 sessions are now in you@home.com · Personal.")
+        completed.selectTarget(Demo.accounts[3].id)
+        precondition(completed.visibleCompletion != nil && completed.note.isEmpty)
+        for event in [
+            "{\"done\":true,\"ok\":true,\"complete\":false,\"moved\":167}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167,\"pendingCloud\":1}",
+            "{\"done\":true,\"ok\":false,\"complete\":true,\"moved\":167}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":0}",
+            "{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167,\"keptLocal\":1}",
+            "{\"undone\":true,\"sessions\":167}"
+        ] {
+            completed.begin()
+            completed.handle(event)
+            completed.checkFinish(0)
+            precondition(completed.visibleCompletion == nil)
+        }
+        completed.begin()
+        completed.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167}")
+        completed.checkFinish(1)
+        precondition(completed.completion == nil)
+        requests = []
+        let model = Model(demo: Demo.accounts)
+        model.selectTarget(Demo.accounts[2].id)
+        let selected = model.to
+        model.checkSweep()
+        precondition(model.ready && !model.running)
+        model.move()
+        precondition(model.running && !model.ready && model.displaySummary == "0%")
+        model.selectTarget(Demo.accounts[3].id)
+        precondition(model.to == selected)
+        model.to = Demo.accounts[3].id
+        model.undo()
+        precondition(requests.count == 1)
+        requests[0].1("{\"swept\":true,\"ok\":true}")
+        requests[0].2(0, "")
+        precondition(requests.count == 2)
+        let command = requests[1].0
+        precondition(command[command.firstIndex(of: "--to")! + 1] == Demo.accounts[2].selector)
+        precondition(!command.contains("undo"))
+        precondition(!model.sweeping && model.running)
+        for field in ["record unavailable", "isStarred", "title", "isArchived"] {
+            requests = []
+            let item = Model(demo: Demo.accounts)
+            item.checkSweep()
+            requests[0].1("{\"swept\":true,\"ok\":true,\"changed\":[{\"id\":\"fixture\",\"title\":\"Fixture\",\"fields\":[\"" + field + "\"]}]}")
+            requests[0].2(0, "")
+            let unavailable = field == "record unavailable"
+            precondition(item.symbol == (unavailable ? "exclamationmark.triangle" : "info.circle"))
+            precondition(item.note.contains(unavailable ? "cannot be read" : ["isStarred": "starred state", "isArchived": "archive state", "title": "title"][field]!))
+            precondition(item.detailLines.contains { $0.1.contains("Fixture") })
+        }
+        func accountResponse(_ pending: Bool) -> String {
+            String(data: try! JSONSerialization.data(withJSONObject: Demo.accounts.enumerated().map { index, account -> [String: Any] in
+                var row: [String: Any] = ["account": account.account, "org": account.org, "label": account.label, "active": index == 0]
+                if pending && index == 0 { row["pending"] = "cloud"; row["pendingAction"] = "finish"; row["receipt"] = "receipt-one" }
+                return row
+            }), encoding: .utf8)!
+        }
+        requests = []
+        let picker = Model(demo: Demo.accounts)
+        picker.selectTarget(Demo.accounts[2].id)
+        picker.toggle(Demo.accounts[0].id)
+        for id in Array(picker.from) { picker.toggle(id) }
+        precondition(picker.from.isEmpty)
+        picker.selectTarget(Demo.accounts[2].id)
+        precondition(picker.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[2].id]))
+        picker.toggle(Demo.accounts[0].id)
+        picker.selectTarget(Demo.accounts[3].id)
+        precondition(!picker.from.contains(Demo.accounts[0].id))
+        picker.reset()
+        precondition(picker.from.isEmpty && picker.to == nil && !picker.ready && picker.note.isEmpty)
+        precondition(requests.count == 1 && requests[0].0 == ["accounts", "--json"])
+        requests[0].1(accountResponse(false))
+        requests[0].2(0, "")
+        precondition(picker.from.isEmpty && picker.to == nil)
+        picker.toggle(Demo.accounts[0].id)
+        precondition(picker.from == [Demo.accounts[0].id] && picker.to == nil)
+        picker.selectTarget(Demo.accounts[2].id)
+        precondition(picker.from == [Demo.accounts[0].id] && picker.ready)
+        picker.reset()
+        picker.selectTarget(Demo.accounts[3].id)
+        precondition(picker.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[3].id]))
+        picker.begin()
+        picker.reset()
+        precondition(picker.running && picker.to == Demo.accounts[3].id)
+        let pendingPicker = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        let pendingSelection = pendingPicker.to
+        pendingPicker.reset()
+        precondition(pendingPicker.to == pendingSelection && !pendingPicker.pendingAccounts.isEmpty)
+        let corruptedAccounts = String(data: Data(base64Encoded: "CORRUPTED_CHECKPOINT_ACCOUNTS")!, encoding: .utf8)!
+        let repairedAccounts = String(data: Data(base64Encoded: "REPAIRED_CHECKPOINT_ACCOUNTS")!, encoding: .utf8)!
+        let discoveredAccounts = try! JSONDecoder().decode([Account].self, from: Data(corruptedAccounts.utf8))
+        for populated in [false, true] {
+            requests = []
+            let inventory = Model(demo: populated ? Demo.accounts : [])
+            if populated {
+                inventory.note = "An earlier result"
+                inventory.lines = [("metadata", "An earlier detail")]
+                inventory.completion = ("An earlier result", "History verified")
+                inventory.symbol = "info.circle"
+                inventory.badge = "100%"
+                inventory.restartAvailable = true
+            }
+            let previousNote = inventory.note, previousLines = inventory.lines
+            let previousSymbol = inventory.symbol, previousBadge = inventory.badge
+            for _ in 0..<2 {
+                let index = requests.count
+                inventory.refresh()
+                precondition(requests[index].0 == ["accounts", "--json"])
+                requests[index].1(corruptedAccounts)
+                requests[index].2(0, "")
+                precondition(inventory.accounts.map(\.id) == discoveredAccounts.map(\.id))
+                precondition(inventory.accounts.map(\.stats) == discoveredAccounts.map(\.stats))
+                precondition(inventory.displaySummary == "The last move is paused.")
+                precondition(inventory.visibleCompletion == nil)
+                precondition(!inventory.canMutate && !inventory.ready && !inventory.pendingReady && !inventory.canKeepLocal)
+                precondition(inventory.recoveryProblem?.receipt == discoveredAccounts[0].recoveryProblem?.receipt)
+                precondition(inventory.detailLines.contains { $0.0 == "recovery" && $0.1 == "Invalid append checkpoint" })
+                precondition(inventory.detailLines.contains { $0.0 == "receipt" && $0.1 == inventory.recoveryProblem?.receipt })
+                precondition(inventory.detailLines.count == previousLines.count + 3)
+                inventory.move()
+                inventory.finishPending()
+                inventory.stopHere()
+                inventory.undo()
+                inventory.restartDesktop()
+                inventory.checkSweep()
+                precondition(requests.count == index + 1 && !inventory.running && !inventory.sweeping)
+            }
+            let index = requests.count
+            inventory.refresh()
+            requests[index].1(repairedAccounts)
+            requests[index].2(0, "")
+            precondition(inventory.recoveryProblem == nil && inventory.canMutate)
+            precondition(inventory.pendingReady && !inventory.ready && !inventory.canKeepLocal)
+            precondition(inventory.note.isEmpty && inventory.lines.elementsEqual(previousLines, by: ==))
+            precondition(inventory.symbol == "clock.arrow.circlepath" && inventory.badge.isEmpty)
+            precondition(inventory.restartAvailable == populated)
+            precondition(inventory.detailLines.elementsEqual(previousLines, by: ==))
+            precondition(inventory.displaySummary == "The last move was interrupted.")
+            inventory.finishPending()
+            precondition(requests.last!.0 == ["finish", "--json"] && inventory.running)
+        }
+        requests = []
+        let taskRecovery = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(base64Encoded: "TASK_RECOVERY_ACCOUNTS")!))
+        precondition(taskRecovery.pendingReady && !taskRecovery.ready && !taskRecovery.canKeepLocal)
+        precondition(taskRecovery.pendingButtonTitle == "Finish the move")
+        precondition(taskRecovery.pendingPrompt == "The last move was interrupted.")
+        taskRecovery.skipRestartWarning = true
+        taskRecovery.finishPending()
+        precondition(requests[0].0 == ["finish", "--json"])
+        requests[0].1(#"{"plan":true,"kind":"recover","token":"task-recovery-token","affected":[]}"#)
+        requests[0].2(0, "")
+        precondition(requests[1].0 == ["finish", "--json", "--restart-approved", "task-recovery-token"])
+        requests = []
+        let recovering = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        recovering.finishPending()
+        precondition(requests[0].0 == ["finish", "--json"])
+        requests[0].2(1, "Sign Claude Desktop into Personal")
+        requests[1].1(accountResponse(true))
+        requests[1].2(0, "")
+        precondition(recovering.note == "Move stopped: the operation did not complete." && recovering.pendingReady)
+        recovering.refresh()
+        requests[2].1(accountResponse(false))
+        requests[2].2(0, "")
+        precondition(recovering.note == "Move stopped: the operation did not complete.")
+        func sweepReply(_ model: Model, _ event: String) {
+            let index = requests.count
+            model.checkSweep()
+            requests[index].1(event)
+            requests[index].2(0, "")
+        }
+        let cleanSweep = #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one"}"#
+        let repeated = Model(demo: Demo.accounts)
+        let repeatError = #"{"swept":true,"ok":false,"error":"Repeated error","receipt":"receipt-one"}"#
+        sweepReply(repeated, repeatError)
+        sweepReply(repeated, repeatError)
+        precondition(repeated.note == "The remaining work needs attention")
+        precondition(repeated.lines.filter { $0.0 == "background" }.count == 1)
+        let retryIndex = requests.count
+        repeated.checkSweep()
+        requests[retryIndex].1(#"{"stage":"cloud scan","live":true,"completed":0,"total":1,"sourceId":"fixture","sourceLabel":"Fixture"}"#)
+        precondition(repeated.lines.filter { $0.0 == "previous check" }.count == 1)
+        precondition(repeated.lines.allSatisfy { $0.0 != "background" })
+        requests[retryIndex].1(cleanSweep)
+        requests[retryIndex].2(0, "")
+        precondition(repeated.note.isEmpty)
+        precondition(repeated.lines.allSatisfy { !["background", "previous check"].contains($0.0) })
+        sweepReply(recovering, #"{"swept":true,"ok":false,"error":"Could not check source","receipt":"receipt-one"}"#)
+        precondition(recovering.note == "The remaining work needs attention")
+        sweepReply(recovering, cleanSweep)
+        precondition(recovering.note == "No remaining work" && !recovering.pendingReady)
+        precondition(recovering.lines.isEmpty && recovering.to == nil && recovering.from.isEmpty)
+        func failedFinishModel(_ typed: Bool = false) -> Model {
+            requests = []
+            let model = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+            model.finishPending()
+            if typed { requests[0].1(#"{"done":true,"ok":false,"code":"COMMAND_FAILED","reason":"Synthetic command failure"}"#) }
+            requests[0].2(1, "Sign Claude Desktop into Personal")
+            requests[1].1(accountResponse(false))
+            requests[1].2(0, "")
+            return model
+        }
+        for typed in [false, true] {
+            let completed = failedFinishModel(typed)
+            precondition(completed.note == "Move stopped: the operation did not complete.")
+            sweepReply(completed, cleanSweep)
+            precondition(completed.note == "No remaining work" && completed.lines.isEmpty)
+            for event in [
+                #"{"swept":true,"ok":false,"receipt":"receipt-one"}"#,
+                #"{"swept":true,"ok":true,"complete":false,"receipt":"receipt-one"}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"another-receipt"}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[{"id":"fixture","error":"Unmoved history"}]}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","problems":[{"id":"fixture","check":"transcript"}]}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","changed":[{"id":"fixture","fields":["record unavailable"]}]}"#
+            ] {
+                let guarded = failedFinishModel(typed)
+                sweepReply(guarded, event)
+                precondition(guarded.note != "No remaining work")
+                sweepReply(guarded, cleanSweep)
+                precondition(guarded.note == "No remaining work")
+            }
+            let corrupt = failedFinishModel(typed)
+            sweepReply(corrupt, #"{"swept":true,"ok":false,"error":"Corrupt receipt set aside"}"#)
+            sweepReply(corrupt, #"{"swept":true,"ok":true,"complete":true,"receipt":"older-receipt"}"#)
+            precondition(corrupt.note == "The remaining work needs attention")
+            let restart = failedFinishModel(typed)
+            sweepReply(restart, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","restart":true}"#)
+            let hint = restart.note
+            sweepReply(restart, cleanSweep)
+            precondition(restart.restartAvailable && restart.note == hint)
+        }
+        for errors in ["[]", #"[{"id":"fixture","title":"Unmoved session","error":"conflicting history"}]"#] {
+            requests = []
+            let idle = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+            idle.finishPending()
+            requests[0].1("{\"nothing\":true,\"failed\":" + errors + "}")
+            requests[0].2(0, "")
+            requests[1].1(accountResponse(false))
+            requests[1].2(0, "")
+            precondition(idle.badge.isEmpty && idle.visibleCompletion == nil)
+            precondition(idle.note == (errors == "[]" ? "No remaining work" : "1 session was not moved"))
+            precondition(idle.symbol == (errors == "[]" ? "arrow.left.arrow.right" : "info.circle"))
+            precondition(errors == "[]" || idle.lines.contains { $0.1.contains("conflicting history") })
+        }
+        requests = []
+        let failed = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        failed.finishPending()
+        requests[0].1("{\"done\":true,\"ok\":false,\"complete\":true,\"failed\":[{\"id\":\"fixture\",\"title\":\"Unmoved session\",\"error\":\"conflicting history\"}]}")
+        requests[0].2(1, "")
+        requests[1].1(accountResponse(false))
+        requests[1].2(0, "")
+        precondition(failed.note == "Move stopped: the operation did not complete.")
+        precondition(failed.lines.contains { $0.1.contains("conflicting history") })
+        requests = []
+        let completedCloud = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
+        completedCloud.finishPending()
+        requests[0].1(#"{"done":true,"ok":true,"complete":true,"moved":1,"failed":[],"notMoved":[{"id":"fixture","title":"Earlier refusal","error":"task family missing"}]}"#)
+        requests[0].2(0, "")
+        requests[1].1(accountResponse(false))
+        requests[1].2(0, "")
+        precondition(!completedCloud.note.contains("attention"))
+        precondition(completedCloud.lines.contains { $0.0 == "not moved" && $0.1.contains("task family missing") })
+        let summary = #"{"moved":233,"notMoved":["# + Array(repeating: #"{"id":"fixture","error":"history refused"}"#, count: 10).joined(separator: ",") + #"],"groups":[{"cause":"history check","records":[{"id":"fixture","error":"history refused"}]},{"cause":"waiting on parent","records":[]},{"cause":"task collision","records":[]}],"attention":[]}"#
+        let refusals = Model(demo: Demo.accounts)
+        refusals.handle(#"{"done":true,"ok":false,"complete":true,"summary":"# + summary + "}")
+        precondition(refusals.note == "233 moved. 10 sessions were not moved.")
+        precondition(refusals.lines.map(\.0) == ["history check", "waiting on parent", "task collision"])
+        var receiptAccounts = Demo.accounts
+        for at in receiptAccounts.indices {
+            receiptAccounts[at].receipt = "one-receipt"
+            receiptAccounts[at].receiptSummary = try! JSONDecoder().decode(ReceiptSummary.self, from: Data(summary.utf8))
+        }
+        let refreshedRefusals = Model(demo: receiptAccounts)
+        precondition(refreshedRefusals.receiptSummaries.count == 1)
+        precondition(refreshedRefusals.pendingPrompt == "233 moved. 10 sessions were not moved.")
+        precondition(!refreshedRefusals.pendingReady)
+        sweepReply(refreshedRefusals, #"{"swept":true,"ok":true,"complete":true,"summary":"# + summary + "}")
+        precondition(refreshedRefusals.note == "233 moved. 10 sessions were not moved.")
+        let recoveredCloud = failedFinishModel()
+        sweepReply(recoveredCloud, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[],"notMoved":[{"id":"fixture","error":"task family missing"}]}"#)
+        precondition(recoveredCloud.note == "No remaining work")
+        let wording = try! JSONSerialization.jsonObject(with: Data(base64Encoded: "WORDING_FIXTURES")!) as! [[String: Any]]
+        func wordingAccounts(_ name: String) -> String {
+            String(data: try! JSONSerialization.data(withJSONObject: wording.first { $0["name"] as? String == name }!["accounts"]!), encoding: .utf8)!
+        }
+        func refreshReply(_ model: Model, _ accounts: String) {
+            let index = requests.count
+            model.refresh()
+            precondition(requests[index].0 == ["accounts", "--json"])
+            requests[index].1(accounts)
+            requests[index].2(0, "")
+        }
+        for (name, reason) in [("46-history-limit", "1,000,000 events"), ("47-budget-limit", "memory budget"), ("48-parser-limit", "history reader's limit")] {
+            let limited = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(name).utf8)))
+            precondition(limited.displaySummary.contains(reason))
+            precondition(!limited.pendingReady && limited.primaryTitle == nil && limited.canKeepLocal && limited.screen == .blocked)
+            if name == "48-parser-limit" { precondition(limited.detailLines.contains { $0.1.contains("CLOUD_PARSER_LIMIT") }) }
+        }
+        for completedReceipt in ["synthetic-receipt", "another-receipt"] {
+            requests = []
+            let resolved = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("17-uncertain").utf8)))
+            sweepReply(resolved, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true,"moved":2,"receipt":"synthetic-receipt"}"#)
+            let notice = resolved.note
+            sweepReply(resolved, #"{"swept":true,"ok":false,"complete":false,"issues":1,"error":"Synthetic cloud failure","receipt":"synthetic-receipt"}"#)
+            precondition(resolved.restartAvailable && resolved.symbol == "exclamationmark.triangle")
+            refreshReply(resolved, wordingAccounts("01-done"))
+            precondition(resolved.pendingAccounts.isEmpty)
+            sweepReply(resolved, #"{"swept":true,"ok":true,"complete":true,"issues":0,"receipt":""# + completedReceipt + #""}"#)
+            if completedReceipt == "another-receipt" {
+                precondition(resolved.symbol == "exclamationmark.triangle")
+                precondition(resolved.detailLines.contains { $0.1.contains("Synthetic cloud failure") })
+                sweepReply(resolved, #"{"swept":true,"ok":true,"complete":true,"issues":0,"receipt":"synthetic-receipt"}"#)
+            }
+            precondition(resolved.restartAvailable && resolved.symbol == "info.circle" && resolved.note == notice)
+            precondition(!resolved.detailLines.contains { $0.1.contains("Synthetic cloud failure") })
+        }
+        automaticRefreshFixture = true
+        for outcome in [
+            #"{"swept":true,"ok":true,"complete":false}"#,
+            #"{"swept":true,"ok":false,"error":"Incomplete bounded check","failed":[{"code":"CLOUD_ARTIFACT_BUDGET","error":"Incomplete bounded check"}]}"#,
+            #"{"swept":true,"ok":true,"complete":true,"moved":12,"restart":true}"#
+        ] {
+            requests = []
+            let item = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8)))
+            item.begin()
+            item.handle(#"{"done":true,"ok":true,"complete":false,"moved":361,"pendingCloud":1}"#)
+            item.checkFinish(0)
+            precondition(requests[0].0 == ["accounts", "--json"])
+            requests[0].1(wordingAccounts("17-uncertain"))
+            requests[0].2(0, "")
+            precondition(item.displaySummary.contains("will retry automatically") && item.primaryTitle == nil)
+            precondition(requests[1].0 == ["sweep", "--json"])
+            requests[1].1(outcome)
+            requests[1].2(0, "")
+            if outcome.contains("\"restart\":true") {
+                precondition(item.restartAvailable && item.note == "Moved 12 more sessions. Restart Claude to see them.")
+                precondition(item.symbol == "info.circle" && item.badge.isEmpty && !item.running)
+                refreshReply(item, wordingAccounts("01-done"))
+                precondition(item.restartAvailable && item.note.contains("Moved 12 more sessions"))
+                precondition(item.symbol == "info.circle")
+                sweepReply(item, #"{"swept":true,"ok":true,"complete":true,"issues":0}"#)
+                precondition(item.restartAvailable && item.symbol == "info.circle")
+                item.selectTarget("work/personal")
+                precondition(item.primaryTitle == "Move")
+                precondition(!item.restartAvailable && item.symbol == "arrow.left.arrow.right")
+            } else {
+                precondition(item.displaySummary.contains("will retry automatically") && item.primaryTitle == nil)
+                if outcome.contains("Incomplete bounded check") { precondition(item.detailLines.contains { $0.1.contains("Incomplete bounded check") }) }
+            }
+        }
+        for failed in [false, true] {
+            requests = []
+            let partial = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("17-uncertain").utf8)))
+            let target = partial.to, sources = partial.from
+            if failed { sweepReply(partial, #"{"swept":true,"ok":false,"error":"Synthetic pending failure"}"#) }
+            sweepReply(partial, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true,"moved":2}"#)
+            let notice = partial.note
+            precondition(partial.restartAvailable && notice.contains("Restart Claude"))
+            refreshReply(partial, wordingAccounts("17-uncertain"))
+            precondition(partial.restartAvailable && partial.note == notice && partial.to == target && partial.from == sources)
+            precondition(requests.last!.0 == ["sweep", "--json"])
+            requests.last!.1(#"{"swept":true,"ok":true,"complete":false,"issues":0}"#)
+            requests.last!.2(0, "")
+            precondition(partial.restartAvailable && partial.note == notice && partial.symbol == (failed ? "exclamationmark.triangle" : "info.circle"))
+            partial.selectTarget("work/personal")
+            precondition(!partial.restartAvailable && partial.note.isEmpty)
+            if !failed { precondition(partial.symbol == "arrow.left.arrow.right") }
+        }
+        for failed in [false, true] {
+            requests = []
+            let item = Model(demo: Demo.accounts)
+            item.selectTarget(Demo.accounts[2].id)
+            let selected = item.to, sources = item.from
+            item.panelVisibility(false)
+            if failed { item.symbol = "exclamationmark.triangle" }
+            sweepReply(item, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true,"moved":1}"#)
+            precondition(item.restartAvailable && item.symbol == (failed ? "exclamationmark.triangle" : "info.circle"))
+            precondition(item.to == selected && item.from == sources && !item.running)
+            let count = requests.count
+            sweepReply(item, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true}"#)
+            precondition(requests.count == count + 1 && requests.last!.0 == ["sweep", "--json"])
+            precondition(item.symbol == (failed ? "exclamationmark.triangle" : "info.circle"))
+            sweepReply(item, #"{"swept":true,"ok":false,"error":"Synthetic failure"}"#)
+            precondition(item.symbol == "exclamationmark.triangle")
+        }
+        for blocked in [false, true] {
+            let model = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("10-interrupted").utf8)))
+            let code = blocked ? "LOCAL_RECOVERY_BLOCKED" : ""
+            model.restartAvailable = true
+            model.handle(#"{"done":true,"ok":false,"recoveryRequired":true,"code":""# + code + #"","reconciled":{"title":"Unfinished copies","error":"interrupted finalization rolled back"}}"#)
+            if blocked {
+                precondition(!model.canMutate && !model.canKeepLocal && model.primaryTitle == nil)
+            } else {
+                precondition(model.detailLines.contains { $0.0 == "recovered" && $0.1.contains("Unfinished copies") })
+                precondition(model.note.contains("Press Finish the move to continue.") && !model.restartAvailable)
+                precondition(model.primaryTitle == "Finish the move" && model.canMutate)
+            }
+        }
+        let undoActions = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("26-undo-ready").utf8)))
+        precondition(undoActions.primaryTitle == "Finish undo" && undoActions.links.isEmpty)
+        let freshActions = Model(demo: Demo.accounts)
+        precondition(freshActions.primaryTitle == "Move" && freshActions.links.isEmpty)
+        freshActions.skipRestartWarning = true
+        precondition(freshActions.links.map(\.title) == ["Show restart warnings"])
+        freshActions.links[0].action()
+        precondition(!freshActions.skipRestartWarning && freshActions.links.isEmpty)
+        requests = []
+        let login = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("12-undo-pending").utf8)))
+        precondition(login.undoPending && !login.pendingReady && login.primaryTitle == nil)
+        precondition(login.pendingPrompt.contains("Sign Claude in as home@example.test.") && login.screen == .signIn)
+        login.finishPending()
+        login.undo()
+        precondition(requests.isEmpty)
+        refreshReply(login, wordingAccounts("26-undo-ready"))
+        precondition(login.pendingReady && login.primaryTitle == "Finish undo" && !login.pendingPrompt.contains("Sign Claude"))
+        precondition(requests[1].0 == ["sweep", "--json"])
+        requests[1].1(#"{"swept":true,"ok":true,"complete":false}"#)
+        requests[1].2(0, "")
+        precondition(login.primaryTitle == "Finish undo")
+        login.primary()
+        precondition(requests.last!.0 == ["finish", "--json"])
+        requests = []
+        let queuedLeave = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("46-history-limit").utf8)))
+        queuedLeave.checkSweep()
+        let tokens = queuedLeave.scopedChecks
+        precondition(tokens.count == 1 && queuedLeave.canKeepLocal)
+        queuedLeave.stopHere()
+        precondition(requests.count == 1 && queuedLeave.running)
+        requests[0].1(#"{"swept":true,"ok":true,"complete":false}"#)
+        requests[0].2(0, "")
+        precondition(requests[1].0 == ["keep-local", "--json"] + tokens.flatMap { ["--leave-check", $0] })
+        requests[1].1(#"{"done":true,"ok":true,"complete":false,"moved":259,"keptLocal":1,"heldCancelled":0}"#)
+        requests[1].2(0, "")
+        precondition(queuedLeave.visibleCompletion == nil)
+        requests[2].1(wordingAccounts("02-held"))
+        requests[2].2(0, "")
+        precondition(queuedLeave.primaryTitle == "Restart Claude and move 102")
+        precondition(queuedLeave.displaySummary == "259 moved. 102 more need Claude to restart.")
+        automaticRefreshFixture = false
+        for fits in [false, true, nil] as [Bool?] {
+            for response in [NSApplication.ModalResponse.alertFirstButtonReturn, .alertSecondButtonReturn, .alertThirdButtonReturn] {
+                requests = []
+                restartDialogs = []
+                restartDialogResponse = (response, false)
+                let item = Model(demo: Demo.accounts)
+                item.skipRestartWarning = true
+                item.move()
+                let args = requests[0].0
+                requests[0].1(#"{"plan":true,"kind":"move","token":"capacity-token","capacity":{"fits":"# + (fits.map { $0 ? "true" : "false" } ?? "null") + #"},"heldCount":3}"#)
+                requests[0].2(0, "")
+                precondition(restartDialogs.isEmpty)
+                precondition(requests.last!.0 == args + ["--restart-approved", "capacity-token"])
+            }
+        }
+        for refresh in [false, true] {
+            let accounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("49-local-partial").utf8))
+            let partial = Model(demo: accounts)
+            if !refresh {
+                partial.handle(#"{"done":true,"ok":false,"complete":false,"partial":true,"summary":{"moved":272,"notMoved":[{"title":"One","error":"failed"},{"title":"Two","error":"failed"},{"title":"Three","error":"failed"}],"groups":[],"attention":[]}}"#)
+            }
+            precondition(partial.primaryTitle == nil && partial.canKeepLocal && partial.screen == .blocked)
+            precondition(partial.sourceTag(partial.pendingAccounts[0]) == "not moved")
+            precondition(partial.displaySummary.contains("3 sessions remain"))
+            precondition(partial.visibleCompletion == nil)
+        }
+        for fixture in ["02-held", "31-mixed-unreadable-and-waiting"] {
+            let accounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(fixture).utf8))
+            let partial = Model(demo: accounts), primary = partial.primaryTitle
+            let event: [String: Any] = ["done": true, "ok": false, "complete": false, "partial": true, "heldCount": fixture == "02-held" ? 102 : 0,
+                "pendingCloud": fixture == "02-held" ? 0 : 3, "summary": ["moved": 272, "notMoved": [["title": "One", "error": "failed"]], "groups": [], "attention": []]]
+            partial.handle(String(data: try! JSONSerialization.data(withJSONObject: event), encoding: .utf8)!)
+            precondition(primary != nil && partial.primaryTitle == primary)
+            precondition(!partial.displaySummary.contains("Keep moved sessions or undo this move."))
+            refreshReply(partial, wordingAccounts(fixture))
+            precondition(partial.primaryTitle == primary)
+            let relaunched = Model(demo: accounts)
+            precondition(relaunched.primaryTitle == primary)
+        }
+        restartDialogResponse = (.alertThirdButtonReturn, false)
+        let moveArgs = ["--from", "work personal", "--to", "work company", "--cloud", "--json"]
+        let emptyAccounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8))
+        let heldAccounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("02-held").utf8))
+        func completedAccountResponse(_ receipt: String) -> String {
+            let rows = try! JSONSerialization.jsonObject(with: Data(wordingAccounts("01-done").utf8)) as! [[String: Any]]
+            return String(data: try! JSONSerialization.data(withJSONObject: rows.map { $0.merging(["receipt": receipt]) { _, new in new } }), encoding: .utf8)!
+        }
+        let completedAccounts = try! JSONDecoder().decode([Account].self, from: Data(completedAccountResponse("synthetic-receipt").utf8))
+        var changedAccounts = heldAccounts
+        for index in changedAccounts.indices { changedAccounts[index].receipt = "different-receipt" }
+        let routes: [(String, [String], [Account], String?, [String]?)] = [
+            ("receipt", moveArgs, heldAccounts, "synthetic-receipt", ["finish", "--json"]),
+            ("pending", moveArgs, heldAccounts, nil, ["finish", "--json"]),
+            ("fresh", moveArgs, emptyAccounts, nil, moveArgs),
+            ("completed", moveArgs, completedAccounts, "synthetic-receipt", ["finish", "--json"]),
+            ("undo", ["undo", "--json"], emptyAccounts, "synthetic-receipt", ["undo", "--json"]),
+            ("restart", ["restart", "--json"], emptyAccounts, "synthetic-receipt", ["restart", "--json"]),
+            ("changed receipt", moveArgs, changedAccounts, "synthetic-receipt", nil)
+        ]
+        for code in ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED", "REOPEN_FAILED", "QUIT_UNCONFIRMED"] {
+            for (name, args, accounts, receipt, expected) in routes {
+                requests = []
+                restartDialogs = []
+                let item = Model(demo: accounts)
+                item.skipRestartWarning = true
+                item.checkOperation(args + ["--restart-approved", "obsolete-token"])
+                item.begin()
+                var event: [String: Any] = ["done": true, "ok": false, "complete": name == "completed", "code": code, "heldCount": ["fresh", "completed"].contains(name) ? 0 : 3, "retryable": true]
+                if let receipt { event["receipt"] = receipt }
+                item.handle(String(data: try! JSONSerialization.data(withJSONObject: event), encoding: .utf8)!)
+                item.checkFinish(1)
+                let count = requests.count
+                if expected == nil {
+                    precondition(item.primaryTitle == nil, code + name)
+                    item.primary()
+                    precondition(requests.count == count)
+                } else {
+                    precondition(item.primaryTitle != nil, code + name)
+                    item.primary()
+                    precondition(requests.last!.0 == expected!, code + name)
+                    precondition(!requests.last!.0.contains("--restart-approved"))
+                    if code == "RESTART_PLAN_CHANGED" || code == "RESTART_APPROVAL_CHANGED" {
+                        let kind = args.first == "undo" ? "undo" : args.first == "restart" ? "refresh" : "move"
+                        requests.last!.1(#"{"plan":true,"kind":"# + "\"" + kind + #"","token":"fresh-token"}"#)
+                        requests.last!.2(0, "")
+                        precondition(restartDialogs.count == 1, code + name)
+                        precondition(!requests.contains { $0.0.contains("--restart-approved") })
+                    }
+                }
+            }
+        }
+        requests = []
+        let staleAccounts = try! JSONDecoder().decode([Account].self, from: Data(completedAccountResponse("old.json").utf8))
+        let refreshed = Model(demo: staleAccounts)
+        refreshed.checkOperation(moveArgs)
+        refreshed.begin()
+        refreshed.handle(#"{"done":true,"ok":false,"complete":false,"receipt":"new.json","heldCount":3,"code":"RESTART_PLAN_CHANGED"}"#)
+        refreshed.checkFinish(1)
+        precondition(refreshed.primaryTitle == nil)
+        let count = requests.count
+        refreshed.primary()
+        precondition(requests.count == count)
+        requests[0].1(completedAccountResponse("new.json"))
+        requests[0].2(0, "")
+        for event in [
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"old.json"}"#,
+            #"{"swept":true,"ok":true,"complete":false,"receipt":"new.json"}"#,
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"new.json","problems":[{"check":"transcript"}]}"#
+        ] {
+            sweepReply(refreshed, event)
+            precondition(refreshed.note.contains("Different chats are open now."))
+        }
+        sweepReply(refreshed, #"{"swept":true,"ok":true,"complete":true,"receipt":"new.json"}"#)
+        precondition(refreshed.note == "No remaining work" && refreshed.primaryTitle == nil)
+        requests = []
+        let actual = try! JSONSerialization.jsonObject(with: Data(base64Encoded: "ACTUAL_CONTINUATION")!) as! [String: Any]
+        let actualAccounts = try! JSONDecoder().decode([Account].self, from: JSONSerialization.data(withJSONObject: actual["accounts"]!))
+        let actualModel = Model(demo: actualAccounts)
+        actualModel.checkOperation(actual["args"] as! [String])
+        actualModel.begin()
+        actualModel.handle(actual["event"] as! String)
+        actualModel.checkFinish(1)
+        precondition(actualModel.primaryTitle == "Restart Claude and move")
+        actualModel.primary()
+        precondition(requests.last!.0 == ["finish", "--json"])
+        print("CONTINUATION_COMMAND " + String(data: try! JSONSerialization.data(withJSONObject: requests.last!.0), encoding: .utf8)!)
+        requests = []
+        let veto = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("02-held").utf8)))
+        veto.checkOperation(["--from", "work personal", "--to", "work company", "--json"])
+        veto.begin()
+        veto.handle(#"{"done":true,"ok":false,"complete":false,"receipt":"synthetic-receipt","moved":259,"heldCount":102,"code":"QUIT_UNCONFIRMED","retryable":true}"#)
+        veto.checkFinish(1)
+        requests[0].1(wordingAccounts("02-held"))
+        requests[0].2(0, "")
+        precondition(veto.note == "259 moved. Move stopped: Claude did not confirm it had closed.")
+        veto.primary()
+        precondition(requests.last!.0 == ["finish", "--json"])
+        for fixture in ["34-same-login-undo", "35-local-undo-recovery"] {
+            requests = []
+            let undo = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(fixture).utf8)))
+            precondition(undo.pendingReady && undo.primaryTitle == "Finish undo")
+            sweepReply(undo, #"{"swept":true,"ok":true,"complete":false}"#)
+            precondition(requests.count == 1 && undo.primaryTitle == "Finish undo")
+            undo.primary()
+            precondition(requests.last!.0 == ["finish", "--json"])
+        }
+        for background in [false, true] {
+            requests = []
+            let failed = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("34-same-login-undo").utf8)))
+            if background {
+                failed.checkOperation(["undo", "--json"])
+                sweepReply(failed, #"{"swept":true,"ok":false,"code":"REOPEN_FAILED","receipt":"synthetic-receipt","error":"Synthetic reopen failure"}"#)
+            } else {
+                failed.finishPending()
+                requests[0].1(#"{"done":true,"ok":false,"code":"REOPEN_FAILED","error":"Synthetic reopen failure"}"#)
+                requests[0].2(1, "")
+                requests[1].1(wordingAccounts("01-done"))
+                requests[1].2(0, "")
+            }
+            if background { refreshReply(failed, wordingAccounts("01-done")) }
+            for event in [
+                #"{"swept":true,"ok":true,"complete":false,"receipt":"synthetic-receipt"}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"another-receipt"}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"synthetic-receipt","problems":[{"check":"transcript"}]}"#
+            ] {
+                sweepReply(failed, event)
+                precondition(failed.note.contains("Open Claude, then press Try again."))
+            }
+            let count = requests.count
+            precondition(failed.note.contains("Open Claude, then press Try again.") && failed.primaryTitle == "Try again")
+            precondition(!failed.running && !failed.restartAvailable)
+            failed.primary()
+            precondition(requests.count == count + 1 && requests.last!.0 == ["finish", "--json"])
+        }
+        requests = []
+        let delayed = Model(demo: Demo.accounts)
+        delayed.handle(#"{"done":true,"ok":true,"complete":true,"moved":1}"#)
+        delayed.checkFinish(0)
+        sweepReply(delayed, #"{"swept":true,"ok":true,"complete":true,"issues":0,"restart":true}"#)
+        precondition(delayed.symbol == "info.circle" && delayed.badge.isEmpty)
+        let failedWithoutRestart = Model(demo: Demo.accounts)
+        failedWithoutRestart.checkFinish(1)
+        let failedWithRestart = Model(demo: Demo.accounts)
+        failedWithRestart.checkFinish(1)
+        sweepReply(failedWithRestart, #"{"swept":true,"ok":true,"complete":true,"issues":0,"restart":true}"#)
+        precondition(failedWithoutRestart.symbol == "exclamationmark.triangle" && !failedWithoutRestart.restartAvailable)
+        precondition(failedWithRestart.symbol == "exclamationmark.triangle" && failedWithRestart.restartAvailable)
+        for action in badgeResets { action() }
+        badgeResets = []
+        precondition(delayed.restartAvailable && delayed.symbol == "info.circle" && delayed.badge.isEmpty)
+        precondition(failedWithoutRestart.symbol == "arrow.left.arrow.right" && failedWithoutRestart.badge.isEmpty)
+        precondition(failedWithRestart.symbol == "exclamationmark.triangle" && failedWithRestart.badge.isEmpty)
+        fixtureDefaults.values = [:]
+        requests = []
+        let done = "Done. 499 sessions are now in work@example.test · Personal."
+        func recordedAt(_ stamp: String) -> String { wordingAccounts("51-recorded-result").replacingOccurrences(of: "2026-10-30T21-00-00-000", with: stamp) }
+        func recordedModel(_ stamp: String) -> Model { Model(demo: try! JSONDecoder().decode([Account].self, from: Data(recordedAt(stamp).utf8))) }
+        let background = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8)))
+        background.selectTarget("work/personal")
+        notices = []
+        background.begin()
+        background.handle(#"{"done":true,"ok":true,"complete":false,"moved":499,"pendingCloud":1}"#)
+        background.checkFinish(0)
+        requests[0].1(wordingAccounts("17-uncertain"))
+        requests[0].2(0, "")
+        precondition(background.visibleCompletion == nil && background.primaryTitle == nil && background.symbol == "clock.arrow.circlepath")
+        refreshReply(background, recordedAt("2026-10-30T21-00-00-000"))
+        precondition(background.visibleCompletion?.summary == done && background.visibleCompletion?.detail == "History verified" && background.screen == .moved)
+        precondition(background.from.isEmpty && background.to == nil && background.symbol == "arrow.left.arrow.right")
+        background.selectTarget("home/personal")
+        precondition(background.primaryTitle == "Move" && background.visibleCompletion?.summary == done)
+        background.panelVisibility(false)
+        background.panelVisibility(true)
+        requests.last!.1(recordedAt("2026-10-30T21-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(background.visibleCompletion?.summary == done && background.primaryTitle == "Move")
+        precondition(notices == ["499 moved. Checking the remaining source conversations.", done])
+        let relaunched = recordedModel("2026-10-30T21-00-00-000")
+        precondition(relaunched.visibleCompletion?.summary == done && relaunched.links.map(\.title) == ["Undo last move"])
+        relaunched.reset()
+        requests.last!.1(recordedAt("2026-10-30T21-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(relaunched.visibleCompletion == nil && recordedModel("2026-10-30T21-00-00-000").visibleCompletion == nil)
+        precondition(recordedModel("2026-10-31T09-00-00-000").visibleCompletion?.summary == done)
+        let undoing = recordedModel("2026-11-01T09-00-00-000")
+        undoing.links[0].action()
+        precondition(requests.last!.0 == ["undo", "--json"] && undoing.running)
+        requests.last!.1(#"{"undone":"2026-11-01T09-00-00-000","restored":1,"sessions":1}"#)
+        requests.last!.2(0, "")
+        precondition(undoing.visibleCompletion == nil && undoing.note.hasPrefix("Undo complete.") && recordedModel("2026-10-31T09-00-00-000").visibleCompletion == nil)
+        requests.last!.1(recordedAt("2026-10-31T09-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(undoing.links.isEmpty && recordedModel("2026-10-31T09-00-00-000").links.isEmpty)
+        let next = recordedModel("2026-11-02T09-00-00-000")
+        precondition(next.visibleCompletion?.summary == done && next.links.map(\.title) == ["Undo last move"])
+        next.selectTarget("home/personal")
+        next.move()
+        precondition(next.visibleCompletion == nil && requests.last!.0.contains("--from"))
+        requests.last!.2(1, "Synthetic move failure")
+        requests.last!.1(recordedAt("2026-11-02T09-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(next.visibleCompletion == nil && recordedModel("2026-11-02T09-00-00-000").visibleCompletion == nil)
+        let cleared = recordedModel("2026-11-02T09-00-00-000")
+        cleared.reset()
+        requests.last!.1(recordedAt("2026-11-02T09-00-00-000"))
+        requests.last!.2(0, "")
+        precondition(cleared.links.map(\.title) == ["Undo last move"])
+        requests = []
+        notices = []
+        let signIn = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8)))
+        signIn.selectTarget("work/personal")
+        signIn.begin()
+        signIn.handle(#"{"done":true,"ok":true,"complete":false,"moved":499,"pendingCloud":1}"#)
+        signIn.checkFinish(0)
+        requests[0].1(wordingAccounts("05-other-login"))
+        requests[0].2(0, "")
+        precondition(signIn.movable && notices.count == 1)
+        refreshReply(signIn, recordedAt("2026-11-03T09-00-00-000"))
+        precondition(notices.count == 2 && notices[1] == done)
+        let partialLeave = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
+        partialLeave.handle(#"{"done":true,"ok":false,"complete":false,"partial":true,"pendingCloud":1,"summary":{"moved":272,"notMoved":[{"id":"fixture","error":"failed"}],"groups":[],"attention":[]}}"#)
+        precondition(!partialLeave.movable && partialLeave.primaryTitle == nil)
+        requests = []
+        notices = []
+        let leaving = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
+        precondition(leaving.primaryTitle == "Leave old copies and move" && leaving.movable)
+        leaving.selectTarget("home/personal")
+        leaving.skipRestartWarning = true
+        leaving.primary()
+        precondition(requests.count == 1 && requests[0].0 == ["keep-local", "--json", "--leave-check", String(repeating: "3", count: 64)])
+        requests[0].1(#"{"done":true,"ok":true,"complete":true,"keptLocal":1,"heldCancelled":0}"#)
+        requests[0].2(0, "")
+        let leaveMove = ["--from", "work company", "--from", "work personal", "--to", "home personal", "--cloud", "--json"]
+        precondition(requests.count == 2 && requests[1].0 == leaveMove && leaving.running)
+        requests[1].1(#"{"plan":true,"kind":"move","token":"leave-token","affected":[]}"#)
+        requests[1].2(0, "")
+        precondition(requests.count == 3 && requests[2].0 == leaveMove + ["--restart-approved", "leave-token"])
+        requests[2].1(#"{"done":true,"ok":true,"complete":true,"moved":4,"destinationLabel":"home@example.test · Personal","summary":{"moved":4,"notMoved":[],"groups":[],"attention":[],"kept":[]}}"#)
+        requests[2].2(0, "")
+        precondition(leaving.visibleCompletion?.summary == "Done. 4 sessions are now in home@example.test · Personal.")
+        precondition(notices == ["Done. 4 sessions are now in home@example.test · Personal."])
+        precondition(leaving.detailLines.filter { $0.1.contains("left unarchived") }.map(\.1) == ["3 old copies left unarchived in home@example.test · Personal"])
+        requests = []
+        let refusedLeave = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
+        refusedLeave.primary()
+        requests[0].1(#"{"refused":[],"code":"PENDING_CHANGED","reason":"The pending source checks changed. Review them again."}"#)
+        requests[0].2(1, "")
+        precondition(requests.count == 2 && requests[1].0 == ["accounts", "--json"] && !refusedLeave.running && refusedLeave.note == "Remaining work could not be cancelled. Check Details.")
+        let waiting = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("52-waiting-for-claude").utf8)))
+        precondition(waiting.statusDetail == "Waiting for Claude." && waiting.primaryTitle == nil)
+        precondition(Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("52-waiting-for-claude").replacingOccurrences(of: #""identityState":"unknown""#, with: #""identityState":"logged-out""#).utf8))).identityLabel == "signed out")
+        refreshReply(waiting, wordingAccounts("44-login-retry"))
+        precondition(waiting.statusDetail?.hasPrefix("Waiting for Claude to finish signing in.") == true)
+        refreshReply(waiting, wordingAccounts("05-other-login"))
+        precondition(waiting.statusDetail?.contains("Sign Claude in as home@example.test") == true && waiting.primaryTitle == "Leave old copies and move")
+        let ghost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: false, signedIn: false, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
+        let crowded = Model(demo: Demo.accounts + [ghost])
+        precondition(crowded.visibleAccounts.map(\.id) == Demo.accounts.map(\.id))
+        crowded.selectTarget(Demo.accounts[2].id)
+        precondition(crowded.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[2].id]))
+        crowded.selectTarget(ghost.id)
+        precondition(crowded.visibleAccounts.last?.id == ghost.id)
+        let activeGhost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: true, signedIn: true, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
+        precondition(Model(demo: [activeGhost] + Demo.accounts.dropFirst()).visibleAccounts.contains { $0.id == ghost.id })
+        requests = []
+        func offered(_ accounts: [Account] = Demo.accounts) -> Model {
+            let model = Model(demo: accounts)
+            model.config = Config(node: "/bin/sh", script: "/fixture/engine.js")
+            model.checkForUpdate()
+            fetches.last!("4.10.0")
+            return model
+        }
+        let checker = offered()
+        precondition(fetches.count == 1 && checker.newer == "4.10.0" && checker.links.map(\.title) == ["Update to 4.10.0"])
+        checker.checkForUpdate()
+        fetches.last!(nil)
+        precondition(fetches.count == 2 && checker.links.map(\.title) == ["Update to 4.10.0"])
+        for version in ["4.2.1", "4.2.0", "3.99.99", "4.2", "4.2.1.0", "4.3.0-beta.1", "v4.3.0", " 4.3.0", "4.+3.0", "4..0", "", "４.３.０", "4.10.0 --registry=https://example.invalid", "latest", "../4.10.0"] {
+            checker.checkForUpdate()
+            fetches.last!("4.10.0")
+            checker.checkForUpdate()
+            fetches.last!(version)
+            checker.update()
+            precondition(checker.newer == nil && checker.links.isEmpty && launches.isEmpty, version)
+        }
+        let busy = offered()
+        busy.begin()
+        precondition(busy.links.isEmpty)
+        for name in ["17-uncertain", "10-interrupted", "11-repair"] {
+            precondition(!offered(try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(name).utf8))).links.contains { $0.title.hasPrefix("Update") }, name)
+        }
+        let blocked = offered()
+        blocked.handle(#"{"done":true,"ok":false,"complete":false,"partial":true,"summary":{"moved":2,"notMoved":[{"id":"fixture","error":"failed"}],"groups":[],"attention":[]}}"#)
+        precondition(blocked.directActions && blocked.pendingAccounts.isEmpty && !blocked.links.contains { $0.title.hasPrefix("Update") })
+        let updater = offered()
+        updater.links.last!.action()
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        precondition(launches.count == 1 && updater.note == "Updating to 4.10.0." && updater.links.isEmpty && !updater.canMutate)
+        precondition(launches[0].0.executableURL?.path == "/bin/npx" && launches[0].0.arguments == ["-y", "claude-handoff@4.10.0", "menubar"])
+        precondition(launches[0].0.environment?["PATH"] == "/bin:" + path && launches[0].0.environment?["HOME"] == ProcessInfo.processInfo.environment["HOME"])
+        updater.reset()
+        precondition(updater.note == "Updating to 4.10.0." && requests.isEmpty)
+        launches[0].1(1, "npm error 404 Not Found")
+        precondition(updater.note == "Update to 4.10.0 failed." && updater.detailLines.contains { $0 == ("reason", "npm error 404 Not Found") })
+        precondition(updater.canMutate && updater.links.map(\.title) == ["Update to 4.10.0"])
+        updater.config = Config(node: "/fixture/stale/bin/node", script: "/fixture/engine.js")
+        updater.update()
+        precondition(launches.count == 2 && launches[1].0.executableURL?.path == "/fixture/found/bin/npx" && launches[1].0.environment?["PATH"] == "/fixture/found/bin:" + path)
+        let queuedUpdate = offered()
+        queuedUpdate.checkSweep()
+        queuedUpdate.update()
+        precondition(launches.count == 2 && requests.count == 1 && queuedUpdate.note == "Updating to 4.10.0." && !queuedUpdate.canMutate)
+        requests[0].1(#"{"swept":true,"ok":true}"#)
+        requests[0].2(0, "")
+        queuedUpdate.checkSweep()
+        queuedUpdate.update()
+        precondition(launches.count == 3 && requests.count == 1 && launches[2].0.arguments == ["-y", "claude-handoff@4.10.0", "menubar"])
+        print("Swift queue and metadata states passed")
+    }
+}
+`
+  source = source.replace('TASK_RECOVERY_ACCOUNTS', Buffer.from(recoveryAccounts.stdout.trim()).toString('base64'))
+  source = source.replace('CORRUPTED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.corrupted).toString('base64'))
+  source = source.replace('REPAIRED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.repaired).toString('base64'))
+  source = source.replace('WORDING_FIXTURES', Buffer.from(JSON.stringify(wordingFixtures())).toString('base64'))
+  source = source.replace('CAPTURED_RESTART_PROGRESS', Buffer.from(JSON.stringify(captured)).toString('base64'))
+  source = source.replace('CLI_COUNTER_EVENTS', Buffer.from(JSON.stringify(cliProgress)).toString('base64'))
+  source = source.replace('ACTUAL_CONTINUATION', Buffer.from(JSON.stringify(continuation)).toString('base64'))
+  const file = path.join(root, 'checks.swift'), binary = path.join(root, 'checks')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [], { timeout: 15_000 })
+  assert.match(stdout, /Swift queue and metadata states passed/)
+  const command = JSON.parse(stdout.split('\n').find(line => line.startsWith('CONTINUATION_COMMAND ')).slice('CONTINUATION_COMMAND '.length))
+  const receiptBytes = await readFile(interrupted.file)
+  const next = await cli(retryHome.root, command, processSetup({ list: listing, commands }))
+  assert.equal(next.code, 0, next.stderr)
+  const continuationPlan = lines(next.stdout).find(row => row.plan)
+  assert.ok(continuationPlan, next.stdout)
+  assert.equal(continuationPlan.receiptFile, interrupted.file)
+  assert.equal(continuationPlan.resume, true)
+  assert.notEqual(continuationPlan.token, retryPlan.plan.token)
+  assert.deepEqual(await readFile(interrupted.file), receiptBytes)
+  const finished = await finishWorkflow(retryHome.paths, { io: retryMock.io, approve: continuationPlan.token })
+  assert.equal(finished.ok, true, finished.reason)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.file, interrupted.file)
+  assert.equal(finished.receipt.sessions.length, 4)
+})
+
+test('missing and unreadable moved records remain distinct from informational field changes', async () => {
+  const h = await home()
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE)
+  const all = await accounts(h.paths), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths), to, h.paths)
+  const file = moved.receipt.sessions[0].record
+  await unlink(file)
+  assert.deepEqual((await verifyPlaced(h.paths)).changed[0].fields, ['record unavailable'])
+  await writeFile(file, '{')
+  assert.deepEqual((await verifyPlaced(h.paths)).changed[0].fields, ['record unavailable'])
+})
+
+test('consumed queue prompts preserve exact content and command multiplicity', () => {
+  const content = '  Synthetic queued prompt\nwith exact spacing  '
+  const consumed = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', sessionId: SOURCE, commandUuid: id(8000), deliveryId: 'delivery-1', content }
+  const user = entry('user', 8000, null, SOURCE, { message: { role: 'user', content } })
+  const attachment = { type: 'attachment', uuid: id(8100), sessionId: SOURCE, attachment: { type: 'queued_command', source_uuid: id(8000), delivery_id: 'delivery-1', prompt: content } }
+  const expected = conversation([user])
+  for (const copies of [[consumed], [consumed, consumed], [user, consumed], [attachment, consumed], [user, attachment, consumed], [consumed, attachment, user]]) {
+    assert.deepEqual(conversation(copies, SOURCE), expected)
+  }
+  for (const unused of [
+    { ...consumed, operation: 'enqueue' }, { ...consumed, reason: 'cancelled' }, { ...consumed, operation: 'dequeue' },
+    { ...consumed, reason: 'unrelated' }, { ...consumed, sessionId: id(2) }, { ...consumed, sessionId: undefined },
+    { ...consumed, commandUuid: undefined, deliveryId: undefined }
+  ]) assert.deepEqual(conversation([unused], SOURCE), [])
+  for (const conflict of [
+    { ...consumed, content: `${content}!` }, { ...consumed, deliveryId: 'different-delivery' },
+    { ...consumed, commandUuid: id(8001) }, { ...consumed, reason: 'cancelled' },
+    { ...attachment, attachment: { ...attachment.attachment, prompt: 'different' } },
+    { ...user, message: { role: 'user', content: content.trim() } }
+  ]) assert.deepEqual(conversation([consumed, conflict], SOURCE), [])
+  assert.deepEqual(conversation([consumed, { ...consumed, commandUuid: id(8001), deliveryId: 'delivery-2' }], SOURCE), [...expected, ...expected])
+  assert.deepEqual(conversation([consumed, { ...consumed, commandUuid: undefined }], SOURCE), expected)
+  assert.deepEqual(conversation([consumed, { ...consumed, deliveryId: undefined }], SOURCE), expected)
+  const unidentified = { ...attachment, attachment: { prompt: content } }
+  assert.deepEqual(conversation([unidentified, consumed], SOURCE), expected)
+  assert.deepEqual(conversation([user, unidentified, consumed], SOURCE), expected)
+  assert.deepEqual(conversation([{ ...user, uuid: id(8001) }, consumed], SOURCE), [...expected, ...expected])
+  assert.deepEqual(conversation([{ ...unidentified, attachment: { prompt: content + ' different' } }, consumed], SOURCE).length, 2)
+  const blocks = [{ type: 'text', text: content }, { type: 'image', source: { type: 'base64', data: 'YWJj', media_type: 'image/png' } }]
+  assert.deepEqual(conversation([{ ...consumed, content: blocks }], SOURCE), conversation([{ ...user, message: { role: 'user', content: blocks } }]))
+  assert.deepEqual(conversation([consumed, { ...attachment, attachment: { ...attachment.attachment, prompt: blocks } }], SOURCE), expected)
+})
+
+const queuedImagePrompt = text => [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'c3ludGhldGljLWltYWdl' } }, { type: 'text', text }]
+
+test('canonical user messages keep their exact hash and order beside richer previews and consumed copies', () => {
+  const text = 'Synthetic text', blocks = [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } }, { type: 'text', text }]
+  const user = { type: 'user', uuid: id(8000), sessionId: SOURCE, message: { role: 'user', content: text } }
+  const attachment = { type: 'attachment', sessionId: SOURCE, attachment: { type: 'queued_command', source_uuid: user.uuid, delivery_id: 'delivery', prompt: blocks } }
+  const removed = { type: 'queue-operation', sessionId: SOURCE, operation: 'remove', reason: 'absorbed_mid_turn', commandUuid: user.uuid, deliveryId: 'delivery' }
+  for (const rows of [[user, attachment, removed], [removed, attachment, user], [attachment, removed, user], [user, attachment, removed, user, removed]]) {
+    const before = JSON.stringify(rows)
+    assert.deepEqual(conversation(rows, SOURCE), conversation([user]))
+    assert.equal(JSON.stringify(rows), before)
+  }
+  const preceding = entry('assistant', 8010, null, SOURCE), following = entry('assistant', 8011, null, SOURCE)
+  for (const reverse of [false, true]) {
+    const canonical = { ...user, message: { role: 'user', content: reverse ? blocks : text } }
+    const consumed = { ...removed, content: reverse ? text : blocks }
+    const expected = conversation([canonical])
+    for (const rows of [[canonical, attachment, consumed], [consumed, attachment, canonical], [attachment, consumed, canonical, consumed]]) {
+      assert.deepEqual(conversation(rows, SOURCE), expected)
+    }
+    assert.deepEqual(conversation([attachment, consumed, preceding, canonical, following], SOURCE), conversation([preceding, canonical, following]))
+    assert.deepEqual(conversation([preceding, canonical, following, attachment, consumed], SOURCE), conversation([preceding, canonical, following]))
+    const conflictingUser = { ...canonical, message: { role: 'user', content: reverse ? text : blocks } }
+    assert.deepEqual(conversation([canonical, attachment, consumed, conflictingUser], SOURCE), [])
+    assert.deepEqual(conversation([conflictingUser, attachment, consumed, canonical], SOURCE), [])
+    assert.deepEqual(conversation([canonical, attachment, consumed, { ...consumed, content: canonical.message.content }], SOURCE), [])
+    assert.deepEqual(conversation([canonical, attachment, { ...consumed, deliveryId: 'different' }], SOURCE), [])
+    assert.deepEqual(conversation([canonical, { ...attachment, attachment: { ...attachment.attachment, prompt: queuedImagePrompt(text + ' changed') } }, consumed], SOURCE), [])
+  }
+  const differentImage = [{ ...blocks[0], source: { ...blocks[0].source, data: 'ZGlmZmVyZW50' } }, blocks[1]]
+  assert.deepEqual(conversation([user, attachment, removed, { ...attachment, attachment: { ...attachment.attachment, prompt: differentImage } }], SOURCE), [])
+  const second = { ...user, uuid: id(8001) }
+  assert.deepEqual(conversation([user, attachment, removed, second, user], SOURCE), conversation([user, second]))
+})
+
+test('queued text and image copies use the exact consumed payload without losing command multiplicity', () => {
+  const text = '  Synthetic image question\nwith exact spacing  ', blocks = queuedImagePrompt(text)
+  for (const reverse of [false, true]) {
+    const payload = reverse ? blocks : text
+    const consumed = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', sessionId: SOURCE, commandUuid: id(8000), deliveryId: 'delivery-1', content: payload }
+    const attachment = { type: 'attachment', uuid: id(8100), sessionId: SOURCE, attachment: { type: 'queued_command', source_uuid: consumed.commandUuid, delivery_id: consumed.deliveryId, prompt: reverse ? text : blocks } }
+    const user = entry('user', 8000, null, SOURCE, { message: { role: 'user', content: payload } })
+    const expected = conversation([user])
+    for (const copies of [[attachment, consumed], [consumed, attachment], [attachment, attachment, consumed, consumed], [user, attachment, consumed], [attachment, user, consumed]]) {
+      const before = JSON.stringify(copies)
+      assert.deepEqual(conversation(copies, SOURCE), expected)
+      assert.equal(JSON.stringify(copies), before)
+    }
+    const second = { ...consumed, commandUuid: id(8001), deliveryId: 'delivery-2' }
+    const secondAttachment = { ...attachment, uuid: id(8101), attachment: { ...attachment.attachment, source_uuid: second.commandUuid, delivery_id: second.deliveryId } }
+    assert.deepEqual(conversation([attachment, consumed, secondAttachment, second, consumed, secondAttachment], SOURCE), [...expected, ...expected])
+    assert.deepEqual(conversation([attachment, consumed, { ...consumed, content: reverse ? text : blocks }], SOURCE), [])
+    assert.deepEqual(conversation([attachment, consumed, { ...consumed, deliveryId: 'conflicting-delivery' }], SOURCE), [])
+    const different = reverse ? text + ' changed' : queuedImagePrompt(text + ' changed')
+    assert.deepEqual(conversation([{ ...attachment, attachment: { ...attachment.attachment, prompt: different } }, consumed], SOURCE), [])
+    assert.deepEqual(conversation([attachment, { ...consumed, sessionId: id(2) }], SOURCE), reverse ? conversation([{ ...user, message: { role: 'user', content: text } }]) : [])
+  }
+  const consumed = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', sessionId: SOURCE, commandUuid: id(8000), deliveryId: 'delivery-1', content: text }
+  const attachment = { type: 'attachment', uuid: id(8100), sessionId: SOURCE, attachment: { type: 'queued_command', source_uuid: id(8000), delivery_id: 'delivery-1', prompt: blocks } }
+  const differentImage = [{ ...blocks[0], source: { ...blocks[0].source, data: 'ZGlmZmVyZW50' } }, blocks[1]]
+  assert.deepEqual(conversation([attachment, consumed, { ...attachment, uuid: id(8101), attachment: { ...attachment.attachment, prompt: differentImage } }], SOURCE), [])
+  for (const incompatible of [
+    [...blocks, { type: 'text', text: '' }], [{ type: 'document', source: blocks[0].source }, blocks[1]],
+    [blocks[0], { ...blocks[1], otherFilledValue: 'different representation' }]
+  ]) assert.deepEqual(conversation([consumed, { ...attachment, attachment: { ...attachment.attachment, prompt: incompatible } }], SOURCE), [])
+  assert.deepEqual(conversation([attachment, { ...attachment, uuid: id(8101), attachment: { ...attachment.attachment, prompt: text } }], SOURCE), [])
+})
+
+test('consumed queue-only messages prove cloud containment without changing transcript semantics', async () => {
+  for (const operation of ['consumed', 'enqueue', 'cancelled']) {
+    const h = await home(), entries = branchEntries(4, SOURCE, 1), prompt = entry('user', 8000, 4, SOURCE)
+    const queue = { type: 'queue-operation', sessionId: SOURCE, commandUuid: prompt.uuid, deliveryId: 'delivery', content: prompt.message.content,
+      operation: operation === 'enqueue' ? 'enqueue' : 'remove', reason: operation === 'cancelled' ? 'cancelled' : 'absorbed_mid_turn' }
+    await h.write(SOURCE, [...entries, queue, queue])
+    await h.record('Z', SOURCE, rehomeRecord({ title: 'Local synthetic title' }))
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const cloud = cloudFixture(h, { list: async () => [remoteSession({ id: 'cse_queue', title: 'Different remote title' })], eventRows: async () => remoteRows([...entries, prompt]) })
+    const inv = await inventory([from], to, h.paths, () => {}, { cloud, processes: [] })
+    assert.equal(inv.cloud.matches.length, operation === 'consumed' ? 1 : 0, operation)
+    if (operation === 'consumed') assert.equal(inv.cloud.matches[0].target.matchMode, 'ordered')
+    assert.equal(semantic([...entries, queue, queue], SOURCE), semantic(entries, SOURCE))
+  }
+})
+
+test('bounded near-order matching agrees with reference LCS and exact multiplicities', () => {
+  const reference = (source, target) => {
+    if (!source.length) return null
+    const counts = new Map()
+    for (const value of target) counts.set(value, (counts.get(value) ?? 0) + 1)
+    for (const value of source) {
+      if (!counts.get(value)) return null
+      counts.set(value, counts.get(value) - 1)
+    }
+    let previous = Array(target.length + 1).fill(0)
+    for (const value of source) {
+      const next = [0]
+      for (let at = 1; at <= target.length; at++) next[at] = value === target[at - 1] ? previous[at - 1] + 1 : Math.max(previous[at], next[at - 1])
+      previous = next
+    }
+    const missing = source.length - previous[target.length]
+    return !missing ? 'ordered' : missing <= Math.min(8, Math.floor(source.length / 100)) ? 'equivalent' : null
+  }
+  for (const length of [0, 1, 99, 100, 199, 200, 799, 800, 1000]) {
+    const source = Array.from({ length }, (_, i) => i)
+    for (let swaps = 0; swaps <= 9 && swaps * 2 <= length; swaps++) {
+      const target = [...source]
+      for (let i = 0; i < swaps * 2; i += 2) [target[i], target[i + 1]] = [target[i + 1], target[i]]
+      assert.equal(conversationMatch(source, target), reference(source, target), `${length}/${swaps}`)
+    }
+  }
+  let seed = 123456
+  const random = limit => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % limit }
+  for (let trial = 0; trial < 350; trial++) {
+    const source = Array.from({ length: random(230) + 1 }, () => random(7)), target = [...source]
+    for (let swaps = random(10); swaps > 0; swaps--) {
+      const a = random(target.length), b = random(target.length)
+      ;[target[a], target[b]] = [target[b], target[a]]
+    }
+    if (trial % 3 === 0) target.splice(random(target.length), 1)
+    if (trial % 5 === 0) target.splice(random(target.length), 0, random(7))
+    assert.equal(conversationMatch(source, target), reference(source, target), `random case ${trial}`)
+  }
+  assert.equal(conversationMatch(Array(100).fill('same'), [...Array(99).fill('same'), 'other']), null)
+})
+
+test('bounded near-order matching handles large histories without quadratic work or counter overflow', async t => {
+  const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict'
+    import { conversationMatch } from ${JSON.stringify(path.join(here, 'engine.js'))}
+    const started = performance.now(), source = Array.from({ length: 100_000 }, (_, i) => i), target = [...source]
+    for (let i = 0; i < 16; i += 2) [target[i], target[i + 1]] = [target[i + 1], target[i]]
+    assert.equal(conversationMatch(source, target), 'equivalent')
+    ;[target[16], target[17]] = [target[17], target[16]]
+    assert.equal(conversationMatch(source, target), null)
+    assert.equal(conversationMatch(source, [...source.slice(1), source[0]]), 'equivalent')
+    assert.equal(conversationMatch([...source, source[0]], target), null)
+    console.log(Math.ceil(performance.now() - started))
+  `], { timeout: 15_000 })
+  t.diagnostic(`Four 100k-message comparisons completed in ${stdout.trim()}ms`)
+})
+
+async function nativePriorFixture(scenario = 'valid') {
+  const h = await home(), prior = id(8200), other = id(8201), remote = branchEntries(200, prior, 1000)
+  const local = structuredClone(remote)
+  for (const at of [80, 180]) local[at] = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', sessionId: prior,
+    commandUuid: remote[at].uuid, deliveryId: `delivery-${at}`, content: remote[at].message.content }
+  ;[local[20], local[21]] = [local[21], local[20]]
+  const bridge = { type: 'bridge-session', sessionId: prior, bridgeSessionId: 'session_native_prior', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
+  if (scenario === 'wrong owner') bridge.ownerAccountUuid = h.acct.T
+  if (scenario === 'wrong org') bridge.ownerOrganizationUuid = h.org.T
+  if (scenario === 'wrong session') bridge.sessionId = SOURCE
+  if (scenario === 'wrong mirror') bridge.bridgeSessionId = 'session_foreign'
+  await h.write(SOURCE, branchEntries(4, SOURCE, 5000))
+  await h.write(prior, [...local, bridge, ...(scenario === 'conflicting bridge' ? [{ ...bridge, ownerAccountUuid: h.acct.T }] : [])])
+  const priorFile = path.join(h.project, `${prior}.jsonl`)
+  if (scenario === 'symlink') {
+    await rename(priorFile, `${priorFile}.saved`)
+    await symlink(`${priorFile}.saved`, priorFile)
+  }
+  if (scenario === 'other project') {
+    const project = path.join(h.paths.pool, '-tmp-other')
+    await mkdir(project)
+    await rename(priorFile, path.join(project, `${prior}.jsonl`))
+  }
+  if (scenario === 'split priors') {
+    await h.write(prior, [...local.slice(0, 100), bridge])
+    await h.write(other, [...local.slice(100).map(row => ({ ...row, sessionId: other })), { ...bridge, sessionId: other }])
+  }
+  if (scenario === 'invalid prior') await appendFile(priorFile, '{broken}\n')
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Current generation', priorCliSessionIds: scenario === 'unrecorded' ? [] : scenario === 'split priors' ? [prior, other] : [prior] }))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const f = { h, from, to, prior, priorFile, status: 'active', archives: 0, reads: 0, remote }
+  f.cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_native_prior', title: 'Old generation', status: f.status, ...(scenario === 'after cutoff' ? { created_at: '2099-01-01T00:00:00.000Z' } : {}) })],
+    eventRows: async () => { f.reads++; return remoteRows(remote) }, session: async () => remoteState(f.status),
+    archive: async () => { f.archives++; f.status = 'archived' }, unarchive: async () => { f.status = 'active' }
+  })
+  return f
+}
+
+test('native bridge retained history covers immediate and deferred moves without a prior receipt target', async () => {
+  for (const deferred of [false, true]) {
+    const f = await nativePriorFixture(), { h } = f
+    const before = await Promise.all([readFile(f.priorFile), readFile(path.join(h.project, `${SOURCE}.jsonl`))])
+    const inv = await inventory([f.from], f.to, h.paths, () => {}, { cloudRequested: true, cloud: deferred ? null : f.cloud, processes: [], writeCache: true })
+    assert.equal(inv.move[0].retainedHistories.length, 1)
+    if (!deferred) assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
+    const moved = await move(inv, f.to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    assert.deepEqual(moved.receipt.cloudLinks.map(row => row.targetId), [SOURCE])
+    if (deferred) {
+      assert.equal(moved.pendingCloud, 1)
+      const finished = await finishPending(h.paths, { cloud: f.cloud, processes: [] })
+      assert.equal(finished.ok, true, JSON.stringify(finished.failed))
+      assert.equal(finished.complete, true)
+      assert.equal(finished.receipt.remote[0].matchMode, 'equivalent')
+    }
+    assert.equal(f.archives, 1)
+    assert.deepEqual(await Promise.all([readFile(f.priorFile), readFile(path.join(h.project, `${SOURCE}.jsonl`))]), before)
+    assert.ok((await undo(h.paths, { cloud: f.cloud, processes: [] })).dest)
+    assert.equal(f.status, 'active')
+  }
+})
+
+test('native bridge retained history refuses foreign, ambiguous and incomplete generations', async () => {
+  for (const scenario of ['wrong owner', 'wrong org', 'wrong session', 'wrong mirror', 'conflicting bridge', 'unrecorded', 'symlink', 'other project', 'split priors', 'invalid prior', 'after cutoff']) {
+    const f = await nativePriorFixture(scenario)
+    const inv = await inventory([f.from], f.to, f.h.paths, () => {}, { cloud: f.cloud, processes: [] })
+    assert.deepEqual(inv.cloud.matches, [], scenario)
+    assert.equal(f.archives, 0)
+  }
+})
+
+test('native bridge retained history rechecks post-plan content and respects cancelled deferred checks', async () => {
+  for (const scenario of ['changed', 'replaced link', 'deferred changed', 'cancelled']) {
+    const f = await nativePriorFixture(), { h } = f
+    const deferred = scenario.startsWith('deferred') || scenario === 'cancelled'
+    const inv = await inventory([f.from], f.to, h.paths, () => {}, { cloudRequested: true, cloud: deferred ? null : f.cloud, processes: [] })
+    if (scenario === 'changed') await appendFile(f.priorFile, '{}\n')
+    if (scenario === 'replaced link') {
+      await rename(f.priorFile, `${f.priorFile}.saved`)
+      await symlink(`${f.priorFile}.saved`, f.priorFile)
+    }
+    const moved = await move(inv, f.to, h.paths)
+    if (!deferred) assert.equal(moved.ok, false)
+    else if (scenario === 'cancelled') {
+      await keepLocal(h.paths)
+      const finished = await finishPending(h.paths, { cloud: f.cloud, processes: [] })
+      assert.equal(finished.receipt.cloudChecks[0].status, 'cancelled')
+      assert.equal(f.reads, 0)
+    } else {
+      f.cloud.eventRows = async () => { if (++f.reads === 3) await appendFile(f.priorFile, '{}\n'); return remoteRows(f.remote) }
+      const finished = await finishPending(h.paths, { cloud: f.cloud, processes: [] })
+      assert.equal(finished.ok, false)
+    }
+    assert.equal(f.archives, 0, scenario)
+  }
+})
+
+test('receipt snapshots omit tool metadata while Desktop records, drift and Undo retain their safeguards', async () => {
+  const h = await home(), metadata = { servers: [{ name: 'synthetic-mcp', tools: [{ name: 'synthetic-tool', schema: 'x'.repeat(1_000_000) }] }] }
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ toolSurfaceSnapshot: metadata, mcpServers: metadata, isStarred: true }))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [] }), to, h.paths)
+  assert.equal(moved.ok, true)
+  const row = moved.receipt.sessions[0], record = JSON.parse(await readFile(row.record))
+  assert.deepEqual(record.toolSurfaceSnapshot, metadata)
+  assert.deepEqual(record.mcpServers, metadata)
+  assert.deepEqual(Object.keys(row.recordSnapshot).sort(), ['sessionId', 'cliSessionId', 'cwd', 'originCwd', 'title', 'isArchived', 'isStarred'].sort())
+  assert.ok(JSON.stringify(row.recordSnapshot).length < 600)
+  assert.equal(row.recordSha, createHash('sha256').update(await readFile(row.record)).digest('hex'))
+  const changed = { ...record, title: 'Changed title', isStarred: false }
+  await writeFile(row.record, JSON.stringify(changed))
+  assert.deepEqual((await verifyPlaced(h.paths)).changed[0].fields, ['title', 'isStarred'])
+  assert.match((await undo(h.paths)).changed[0], /desktop record/)
+  await writeFile(row.record, JSON.stringify(record))
+  assert.ok((await undo(h.paths)).dest)
+  assert.deepEqual(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))).mcpServers, metadata)
+})
+
+test('incremental receipt journals preserve UTF-8, sequence and corruption rules', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-journal-')), file = path.join(root, 'receipt.json')
+  const snapshot = { sessionId: `local_${SOURCE}`, cliSessionId: SOURCE, cwd: '/tmp/fixture', originCwd: '/tmp/fixture', title: 'Synthetic \u96ea\ud83c\udf0b', isArchived: false, isStarred: true, mcp: 'x'.repeat(200_000) }
+  const row = { recordSnapshot: snapshot, recordSha: 'hash', recordSemantic: 'semantic', rollback: { bytes: 'keep' }, task: { prompt: 'keep task' } }
+  const base = { journalSequence: 1, sessions: [row], failed: [], retained: [], pending: { ...row }, futureField: { value: 'keep unknown' } }
+  const patch = { sequence: 2, sessions: [row], failed: [], retained: [{ ...row }], pending: row }
+  await writeFile(file, JSON.stringify(base))
+  const skipped = JSON.stringify({ sequence: 1, sessions: 'already applied' }) + '\n'
+  const padding = ' '.repeat(65535 - Buffer.byteLength(skipped) - 65536 * Math.floor((65535 - Buffer.byteLength(skipped)) / 65536))
+  await writeFile(`${file}.journal`, skipped + padding + JSON.stringify(patch) + '\n' + JSON.stringify({ sequence: 3 }) + '\u96ea')
+  const receipt = await readReceipt(file)
+  assert.equal(receipt.journalSequence, 2)
+  assert.equal(receipt.sessions.length, 2)
+  assert.deepEqual(receipt.futureField, base.futureField)
+  for (const saved of [...receipt.sessions, ...receipt.retained, receipt.pending]) {
+    assert.equal(saved.recordSnapshot.title, snapshot.title)
+    assert.equal(saved.recordSha, 'hash')
+    assert.deepEqual(saved.task, row.task)
+    assert.deepEqual(saved.rollback, row.rollback)
+  }
+  assert.equal(JSON.parse(await readFile(file)).sessions[0].recordSnapshot.mcp.length, 200_000)
+  const encoded = Buffer.from(JSON.stringify(patch) + '\n'), unicodeAt = encoded.indexOf(Buffer.from('\u96ea'))
+  for (const split of [1, 2, 3]) {
+    await writeFile(`${file}.journal`, Buffer.concat([Buffer.from(' '.repeat(65536 - unicodeAt - split)), encoded]))
+    assert.equal((await readReceipt(file)).sessions[1].recordSnapshot.title, snapshot.title)
+  }
+  for (const [text, error] of [
+    ['{broken}\n', /JSON|property|Expected/], ['\n', /JSON/], [JSON.stringify({ ...patch, sequence: 3 }) + '\n', /Incomplete move journal/],
+    [JSON.stringify({ ...patch, sequence: 0 }) + '\n', /Invalid move journal sequence/], [JSON.stringify({ ...patch, sessions: {} }) + '\n', /Invalid move journal entries/]
+  ]) {
+    await writeFile(`${file}.journal`, text)
+    await assert.rejects(readReceipt(file), error)
+  }
+})
+
+test('incremental receipt journal replay stays within a small heap for a large synthetic journal', { timeout: 30_000 }, async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-journal-heap-')), file = path.join(root, 'receipt.json')
+  await writeFile(file, JSON.stringify({ sessions: [], failed: [], retained: [] }))
+  for (let sequence = 1; sequence <= 256; sequence++) await appendFile(`${file}.journal`, JSON.stringify({ sequence, pending: { strategy: 'rehome', padding: 'x'.repeat(512 * 1024) }, failed: [], retained: [],
+    sessions: [{ recordSha: `sha-${sequence}`, recordSnapshot: { sessionId: `local_${SOURCE}`, cliSessionId: SOURCE, title: `Synthetic ${sequence}` } }] }) + '\n')
+  const bytes = (await stat(`${file}.journal`)).size
+  const { stdout } = await promisify(execFile)(process.execPath, ['--max-old-space-size=48', '--input-type=module', '-e', `
+    import assert from 'node:assert/strict'
+    import fs from 'node:fs/promises'
+    import { syncBuiltinESMExports } from 'node:module'
+    const original = fs.readFile
+    fs.readFile = (file, ...args) => { assert.ok(!String(file).endsWith('.journal')); return original(file, ...args) }
+    syncBuiltinESMExports()
+    const { readReceipt } = await import(${JSON.stringify(path.join(here, 'engine.js'))})
+    const receipt = await readReceipt(${JSON.stringify(file)})
+    assert.equal(receipt.sessions.length, 256)
+    assert.equal(receipt.journalSequence, 256)
+    assert.equal(receipt.pending.padding.length, 512 * 1024)
+    console.log(JSON.stringify({ records: receipt.sessions.length, heapUsed: process.memoryUsage().heapUsed }))
+  `], { timeout: 25_000, env: { ...process.env, HOME: root } })
+  const result = JSON.parse(stdout)
+  assert.equal(result.records, 256)
+  assert.ok(bytes > 128 * 1024 * 1024)
+  t.diagnostic(`Replayed ${bytes} journal bytes with a 48 MiB heap limit, final heap ${result.heapUsed} bytes`)
+})
+
+test('sidecar link leaves survive parent and child moves and Undo without reading their targets', async () => {
+  const h = await home(), child = id(8300), external = path.join(h.root, 'external')
+  await mkdir(external)
+  await writeFile(path.join(external, 'secret'), 'synthetic unread target')
+  const links = []
+  for (const sid of [SOURCE, child]) {
+    await h.write(sid, [entry('user', sid === SOURCE ? 1 : 2, null, sid)])
+    await h.record('P', sid, rehomeRecord(sid === child ? { forkedFromSessionId: `local_${SOURCE}` } : {}))
+    const dir = path.join(h.project, sid, 'workflow')
+    await mkdir(dir, { recursive: true })
+    for (const [name, destination] of [['dangling', '../missing'], ['external', external], ['cycle', 'cycle'], ['regular-target', path.join(external, 'secret')]]) {
+      const file = path.join(dir, name)
+      await symlink(destination, file)
+      links.push({ file, destination, inode: (await lstat(file)).ino })
+    }
+  }
+  const physicalExternal = await fs.realpath(external)
+  const physicalLinks = await Promise.all(links.map(async item => path.join(await fs.realpath(path.dirname(item.file)), path.basename(item.file))))
+  const originals = { readFile: fs.readFile, open: fs.open, readdir: fs.readdir }
+  for (const key of Object.keys(originals)) fs[key] = (file, ...args) => {
+    assert.ok(!String(file).startsWith(external), `external target ${key}`)
+    assert.ok(!links.some(link => link.file === String(file)) && !physicalLinks.includes(String(file)), `link target ${key}`)
+    assert.ok(!String(file).startsWith(physicalExternal), `physical external target ${key}`)
+    return originals[key](file, ...args)
+  }
+  syncBuiltinESMExports()
+  try {
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true }), to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    assert.deepEqual(moved.receipt.sessions.map(row => row.id), [SOURCE, child])
+    assert.ok((await undo(h.paths)).dest)
+  } finally { Object.assign(fs, originals); syncBuiltinESMExports() }
+  for (const link of links) {
+    assert.equal(await readlink(link.file), link.destination)
+    assert.equal((await lstat(link.file)).ino, link.inode)
+  }
+})
+
+test('sidecar link changes invalidate plans and link targets cannot masquerade as regular sidecars', async () => {
+  for (const scenario of ['changed link', 'link replaced by file', 'relative roots', 'link vs file']) {
+    const h = await home(), other = id(8301), entries = branchEntries(4, SOURCE, 1)
+    await h.write(SOURCE, entries)
+    await h.record('P', SOURCE, rehomeRecord())
+    const dir = path.join(h.project, SOURCE), file = path.join(dir, 'snapshot')
+    await mkdir(dir)
+    await symlink('relative-destination', file)
+    if (['relative roots', 'link vs file'].includes(scenario)) {
+      await h.write(other, fork(entries, SOURCE, other, 'Synthetic other'))
+      await h.record('Z', other, rehomeRecord())
+      const second = path.join(h.project, other)
+      await mkdir(second)
+      if (scenario === 'relative roots') await symlink('relative-destination', path.join(second, 'snapshot'))
+      else await writeFile(path.join(second, 'snapshot'), 'relative-destination')
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true })
+    assert.equal(inv.move.length, 1)
+    assert.equal(inv.there.length, 0)
+    if (scenario.startsWith('changed') || scenario === 'link replaced by file') {
+      await unlink(file)
+      if (scenario === 'changed link') await symlink('different', file)
+      else await writeFile(file, 'relative-destination')
+      const reports = [], moved = await move(inv, to, h.paths, stage => reports.push(stage))
+      assert.ok(reports.includes('recovery'), scenario)
+      assert.equal(moved.ok, true, scenario)
+    }
+  }
+})
+
+test('synthetic menubar installation reports the package version without invoking app actions', async () => {
+  const h = await home()
+  const setup = `
+    import { writeFileSync } from 'node:fs'
+    const syntheticSpawn = childProcess.spawnSync, syntheticAsync = childProcess.spawn
+    childProcess.spawnSync = (file, args, ...rest) => {
+      if (['launchctl', 'pkill'].includes(file)) return { status: 0, stdout: '', stderr: '' }
+      if (file === 'swiftc') { writeFileSync(args[args.indexOf('-o') + 1], 'synthetic binary'); return { status: 0, stdout: '', stderr: '' } }
+      if (String(file).includes('.app/') || ['/usr/bin/open', '/usr/bin/osascript'].includes(file)) throw new Error('unexpected app action')
+      return syntheticSpawn(file, args, ...rest)
+    }
+    childProcess.spawn = (file, ...args) => {
+      if (String(file).includes('.app/') || ['launchctl', 'pkill', '/bin/launchctl', '/usr/bin/open', '/usr/bin/osascript'].includes(file)) throw new Error('unexpected app spawn')
+      return syntheticAsync(file, ...args)
+    }
+  `
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await cli(h.root, ['menubar'], setup)
+    assert.equal(result.code, 0, result.stderr)
+    const script = path.join(h.paths.state, 'Claude Handoff.app/Contents/Resources/engine.js')
+    const { stdout } = await promisify(execFile)(process.execPath, [script, '--version'], { env: { ...process.env, HOME: h.root } })
+    assert.equal(stdout.trim(), JSON.parse(await readFile(path.join(here, 'package.json'))).version)
+    assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'menubar.json'))).nodeArgs, [`--max-old-space-size=${menubarHeapMiB()}`])
+  }
+})
+
+test('regular sidecar hashes and fingerprints retain the existing receipt format', async () => {
+  const h = await home(), data = Buffer.from('unchanged synthetic sidecar\n'), dir = path.join(h.project, SOURCE), file = path.join(dir, 'snapshot')
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  await mkdir(dir)
+  await writeFile(file, data)
+  const digest = value => createHash('sha256').update(value).digest('hex')
+  const detail = await stat(file, { bigint: true }), signature = [detail.dev, detail.ino, detail.size, detail.mtimeNs, detail.ctimeNs].join(':')
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  assert.equal(inv.move[0].sidecar.sha, digest(JSON.stringify([{ bytes: data.length, rel: 'snapshot', sha: digest(data) }])))
+  assert.equal(inv.move[0].sidecar.fingerprint, digest(JSON.stringify([{ fingerprint: signature, rel: 'snapshot' }])))
+})
+
+test('sidecar link replacements are refused during regular reads and warm cache verification', async () => {
+  for (const warm of [false, true]) {
+    const h = await home(), dir = path.join(h.project, SOURCE), file = path.join(dir, 'snapshot'), external = path.join(h.root, 'synthetic-target')
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    await mkdir(dir)
+    await writeFile(file, 'original')
+    await writeFile(external, 'never read this synthetic target')
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    if (warm) await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true })
+    const physicalFile = await fs.realpath(file), physicalExternal = await fs.realpath(external)
+    const originalOpen = fs.open, originalLstat = fs.lstat
+    let replaced = false
+    const replace = async () => { replaced = true; await unlink(file); await symlink(external, file) }
+    fs.open = async (name, flags, ...args) => {
+      assert.notEqual(name, physicalExternal)
+      if (name === physicalFile && !warm && !replaced) {
+        assert.ok(flags & fsSync.constants.O_NOFOLLOW)
+        await replace()
+      }
+      return originalOpen(name, flags, ...args)
+    }
+    fs.lstat = async (name, ...args) => {
+      const detail = await originalLstat(name, ...args)
+      if (name === physicalFile && warm && !replaced) await replace()
+      return detail
+    }
+    syncBuiltinESMExports()
+    let inv
+    try { inv = await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true }) }
+    finally { fs.open = originalOpen; fs.lstat = originalLstat; syncBuiltinESMExports() }
+    assert.equal(replaced, true)
+    assert.equal(inv.move.length, 0)
+    assert.equal(inv.rejected.length, 1)
+  }
+})
+
+test('sidecar root links refuse inventory without traversing targets or changing accounts', async () => {
+  for (const scenario of ['dangling root', 'live root']) {
+    const h = await home(), dir = path.join(h.project, SOURCE), external = path.join(h.root, 'unrelated'), other = id(8302)
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(other, [entry('user', 2, null, other)])
+    await h.record('Z', other, rehomeRecord())
+    if (scenario === 'live root') {
+      await mkdir(external)
+      await writeFile(path.join(external, 'unrelated.txt'), 'Synthetic target that the walker must not read')
+    }
+    await symlink(external, dir)
+    const link = dir, inode = (await lstat(link)).ino
+    const physicalDir = path.join(await fs.realpath(h.project), SOURCE), physicalExternal = path.join(await fs.realpath(h.root), 'unrelated')
+    const before = await fixtureSnapshot(h, [h.dir('P'), h.dir('Z')])
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const originals = { readdir: fs.readdir, readFile: fs.readFile, open: fs.open }
+    for (const key of Object.keys(originals)) fs[key] = (file, ...args) => {
+      const name = String(file)
+      assert.ok(name !== dir && !name.startsWith(dir + path.sep), `sidecar root target ${key}`)
+      assert.ok(name !== external && !name.startsWith(external + path.sep), `external target ${key}`)
+      assert.ok(name !== physicalDir && !name.startsWith(physicalDir + path.sep), `physical sidecar target ${key}`)
+      assert.ok(name !== physicalExternal && !name.startsWith(physicalExternal + path.sep), `physical external target ${key}`)
+      return originals[key](file, ...args)
+    }
+    syncBuiltinESMExports()
+    let inv
+    try { inv = await inventory([from], to, h.paths, () => {}, { processes: [] }) }
+    finally { Object.assign(fs, originals); syncBuiltinESMExports() }
+    assert.equal(inv.move.length, 0, scenario)
+    assert.equal(inv.there.length, 0, scenario)
+    assert.equal(inv.rejected.length, 1, scenario)
+    assert.equal(inv.rejected[0].error, `unsupported entry ${dir}`, scenario)
+    assert.deepEqual(await fixtureSnapshot(h, [h.dir('P'), h.dir('Z')]), before, scenario)
+    assert.equal(await readlink(link), external)
+    assert.equal((await lstat(link)).ino, inode)
+    assert.equal(await lstat(h.paths.state).catch(() => null), null)
+  }
+})
+
+test('native prior bindings stay scoped to the source login when several accounts move together', async () => {
+  const f = await nativePriorFixture(), { h } = f
+  const secondRecord = path.join(h.dir('T'), `local_${SOURCE}.json`)
+  await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), secondRecord)
+  const rows = lines(await readFile(f.priorFile, 'utf8'))
+  rows.find(row => row.type === 'bridge-session').ownerAccountUuid = h.acct.T
+  rows.find(row => row.type === 'bridge-session').ownerOrganizationUuid = h.org.T
+  await h.write(f.prior, rows)
+  const all = await accounts(h.paths, []), other = all.find(row => row.account === h.acct.T)
+  const inv = await inventory([all.find(row => row.account === h.acct.P), other], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [] })
+  assert.ok(inv.move[0].retainedHistories.length)
+  assert.ok(inv.cloud.matches.every(match => !match.target.retained))
+  assert.equal(f.archives, 0)
+})
+
+test('retained image attachments and consumed text match existing targets immediately and after deferred cleanup', async () => {
+  for (const deferred of [false, true]) for (const reverse of [false, true]) {
+    const f = await nativePriorFixture(), { h } = f
+    const rows = lines(await readFile(f.priorFile, 'utf8'))
+    const enriched = rows.flatMap((row, index) => {
+      if (row.type !== 'queue-operation') return [row]
+      const text = row.content, blocks = queuedImagePrompt(text), consumed = { ...row, content: reverse ? blocks : text }
+      f.remote.find(event => event.uuid === row.commandUuid).message.content = consumed.content
+      const attachment = { type: 'attachment', uuid: id(90000 + index), sessionId: f.prior,
+        attachment: { type: 'queued_command', source_uuid: row.commandUuid, delivery_id: row.deliveryId, prompt: reverse ? text : blocks } }
+      return [attachment, consumed, { ...attachment, uuid: id(91000 + index) }, { ...consumed }]
+    })
+    await h.write(f.prior, enriched)
+    const files = [f.priorFile, path.join(h.project, `${SOURCE}.jsonl`)], before = await Promise.all(files.map(file => readFile(file)))
+    const expectedHash = createHash('sha256').update(JSON.stringify(conversation(f.remote))).digest('hex')
+    if (!deferred) await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('Z'), `local_${SOURCE}.json`))
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloud: deferred ? null : f.cloud, processes: [], writeCache: true })
+    const prior = (deferred ? inv.move[0] : inv.targets[0]).retainedHistories[0]
+    assert.equal(prior.conversation.length, f.remote.length)
+    if (!deferred) {
+      assert.equal(inv.cloud.matches.length, 1)
+      assert.equal(inv.cloud.matches[0].target.kind, 'existing')
+      assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
+      assert.equal(inv.cloud.matches[0].conversationSha, expectedHash)
+    }
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    const result = deferred ? await finishPending(h.paths, { cloud: f.cloud, processes: [] }) : moved
+    assert.equal(result.ok, true, JSON.stringify(result.failed))
+    assert.equal(result.complete, true)
+    assert.equal(result.receipt.remote.length, 1)
+    assert.equal(result.receipt.remote[0].targetKind, 'existing')
+    assert.equal(result.receipt.remote[0].matchMode, 'equivalent')
+    assert.equal(result.receipt.remote[0].conversationSha, expectedHash)
+    assert.equal(result.receipt.sessions.some(row => row.strategy === 'remote'), false)
+    assert.equal(f.archives, 1)
+    assert.deepEqual(await Promise.all(files.map(file => readFile(file))), before)
+  }
+})
+
+test('retained image attachments with different text do not prove cloud containment', async () => {
+  const f = await nativePriorFixture(), { h } = f
+  const rows = lines(await readFile(f.priorFile, 'utf8')).flatMap((row, index) => row.type !== 'queue-operation' ? [row] : [
+    { type: 'attachment', uuid: id(90000 + index), sessionId: f.prior,
+      attachment: { type: 'queued_command', source_uuid: row.commandUuid, delivery_id: row.deliveryId, prompt: queuedImagePrompt(row.content + ' different text') } }, row
+  ])
+  await h.write(f.prior, rows)
+  const before = await readFile(f.priorFile)
+  const inv = await inventory([f.from], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [] })
+  assert.deepEqual(inv.cloud.matches, [])
+  assert.equal(f.archives, 0)
+  assert.deepEqual(await readFile(f.priorFile), before)
+})
+
+test('supplemental queued text and image coverage keeps the consumed representation and rejects conflicting copies', async () => {
+  for (const scenario of ['consumed string', 'consumed array', 'conflicting consumed', 'conflicting image', 'different text']) {
+    const f = await artifactFixture(), text = 'Synthetic supplemental image question', blocks = queuedImagePrompt(text)
+    const reverse = scenario === 'consumed array'
+    f.queued.attachment.prompt = reverse ? text : blocks
+    f.removal.content = reverse ? blocks : text
+    f.remote.at(-1).message.content = f.removal.content
+    if (scenario === 'conflicting consumed') f.extra.push({ ...f.removal, content: blocks })
+    if (scenario === 'conflicting image') f.extra.push({ ...f.removal, operation: 'enqueue', content: [{ ...blocks[0], source: { ...blocks[0].source, data: 'ZGlmZmVyZW50' } }, blocks[1]] })
+    if (scenario === 'different text') f.queued.attachment.prompt = queuedImagePrompt(text + ' different')
+    await f.write()
+    const inv = await f.inventory()
+    if (scenario.startsWith('consumed')) {
+      assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+      assert.deepEqual(inv.cloud.matches[0].target.artifactCounts, { main: 365, subagent: 104, queued: 1 })
+    } else {
+      assert.deepEqual(inv.cloud.matches, [])
+      assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    }
+  }
+})
+
+test('retained bridge bindings deduplicate exact repeats and keep a conflicting owner untrusted', async () => {
+  for (const conflict of [false, true]) {
+    const f = await nativePriorFixture(), { h } = f, rows = lines(await readFile(f.priorFile, 'utf8'))
+    const bridge = rows.find(row => row.type === 'bridge-session')
+    const repeated = Array.from({ length: 1104 }, () => ({ ...bridge }))
+    if (conflict) repeated.splice(552, 0, { ...bridge, ownerAccountUuid: h.acct.T })
+    await h.write(f.prior, [...rows.filter(row => row.type !== 'bridge-session'), ...repeated])
+    const before = await readFile(f.priorFile)
+    const inspect = inv => {
+      if (conflict) {
+        assert.equal(inv.move[0].retainedHistories, undefined)
+        assert.ok(inv.cloud.matches.every(match => !match.target.retained))
+      } else {
+        assert.equal(inv.move[0].retainedHistories.length, 1)
+        assert.equal(inv.move[0].retainedHistories[0].bindings.length, 1)
+        assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
+      }
+    }
+    inspect(await inventory([f.from], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [], writeCache: true }))
+    const file = path.join(h.paths.state, 'cache.json'), cache = JSON.parse(await readFile(file))
+    const stored = Object.values(cache.histories).find(item => item.value.dependencies.some(([file]) => file === f.priorFile)).value.result
+    assert.equal(stored.bridgeOwners.length, conflict ? 2 : 1)
+    const first = stored.bridgeOwners[0], other = stored.bridgeOwners[1]
+    stored.bridgeOwners = Array.from({ length: 1104 }, () => first)
+    if (other) stored.bridgeOwners.splice(552, 0, other)
+    await writeFile(file, JSON.stringify(cache))
+    const warm = await inventory([f.from], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [] })
+    assert.equal(warm.cacheStats.historyMisses, 0)
+    inspect(warm)
+    assert.deepEqual(await readFile(f.priorFile), before)
+  }
+})
+
+test('Darwin pressure uses dispatch flags and samples at a bounded cadence without capping healthy free pages', () => {
+  let now = 0, level = 1, probes = 0
+  const budget = memoryBudget({ platform: 'darwin', total: 48 * 2 ** 30, heap: 8 * 2 ** 30, usage: () => ({ rss: 2 ** 30, heapUsed: 2 ** 30 }),
+    available: () => 2.4 * 2 ** 30, now: () => now, pressure: () => { probes++; return level } })
+  for (let i = 0; i < 100; i++) { budget.check(3 * 2 ** 30); assert.equal(budget.parallel(), 8) }
+  assert.equal(probes, 1)
+  level = 4; now = 999
+  assert.doesNotThrow(() => budget.check(3 * 2 ** 30))
+  now = 1000
+  assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+  assert.equal(probes, 2)
+  level = 2; now = 2000
+  assert.doesNotThrow(() => budget.check(3 * 2 ** 30))
+  assert.equal(budget.parallel(), 1)
+  for (const invalid of [null, 0, 3, '1', NaN]) {
+    level = invalid; now += 1000
+    assert.equal(budget.parallel(), 1)
+    assert.throws(() => budget.check(3 * 2 ** 30), { code: 'CLOUD_MEMORY_PRESSURE' })
+    assert.doesNotThrow(() => budget.check(1024))
+  }
+  level = 1; now += 1000
+  assert.equal(budget.parallel(), 8)
+})
+
+test('Darwin pressure probes the read-only sysctl and falls back conservatively when unavailable', t => {
+  let result = { status: 0, stdout: '2\n' }, calls = 0, now = 0
+  const mock = t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
+    assert.equal(command, '/usr/sbin/sysctl')
+    assert.deepEqual(args, ['-n', 'kern.memorystatus_vm_pressure_level'])
+    assert.ok(options.timeout <= 1000)
+    calls++
+    return result
+  })
+  syncBuiltinESMExports()
+  try {
+    const budget = memoryBudget({ platform: 'darwin', total: 16 * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 0, now: () => now })
+    assert.doesNotThrow(() => budget.check(1024))
+    assert.equal(budget.parallel(), 1)
+    assert.equal(calls, 1)
+    result = { status: 1, stdout: '' }; now = 1000
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+    assert.equal(calls, 2)
+  } finally { mock.mock.restore(); syncBuiltinESMExports() }
+})
+
+test('pressure and deterministic parser failures release shared parsing reservations', async () => {
+  let now = 0, level = 1
+  const budget = memoryBudget({ platform: 'darwin', total: 10000, heap: 10000, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 0, now: () => now, pressure: () => level })
+  let resume, entered
+  const started = new Promise(resolve => { entered = resolve }), paused = new Promise(resolve => { resume = resolve })
+  const first = budget.read({ body: (async function* () { yield Buffer.from('"' + 'x'.repeat(150)); entered(); await paused; yield Buffer.from('"') })() })
+  await started
+  level = 4; now = 1000
+  await assert.rejects(budget.read(Response.json('x')), { code: 'CLOUD_MEMORY_PRESSURE' })
+  level = 1; now = 2000
+  resume()
+  assert.equal(await first, 'x'.repeat(150))
+  await assert.rejects(budget.read({ body: (async function* () { yield Buffer.from('"' + 'x'.repeat(150)); throw Object.assign(new RangeError('synthetic string limit'), { code: 'ERR_STRING_TOO_LONG' }) })() }), { code: 'CLOUD_PARSER_LIMIT' })
+  assert.equal(await budget.read(Response.json('x'.repeat(300))), 'x'.repeat(300))
+})
+
+test('menubar heap calculations never reduce the installing Node heap on 8, 16 or 48 GiB Macs', () => {
+  const heap = 4 * 2 ** 30 + 48 * 1024 * 1024
+  for (const gib of [8, 16, 48]) {
+    const setting = menubarHeapMiB(gib * 2 ** 30, heap)
+    assert.ok(setting * 1024 * 1024 >= heap)
+    assert.equal(setting, Math.max(Math.ceil(heap / 1024 / 1024), Math.floor(gib * 2 ** 30 * 0.2 * 0.65 / 1024 / 1024)))
+  }
+  assert.ok(menubarHeapMiB(48 * 2 ** 30, heap) > menubarHeapMiB(8 * 2 ** 30, heap))
+})
+
+test('trusted project aliases preserve logical move and Undo paths including legacy receipts', async () => {
+  for (const legacy of [false, true]) {
+    const h = await home(), physical = path.join(h.root, 'physical-project'), data = Buffer.from('Synthetic ordinary sidecar')
+    if (process.env.CT_REQUIRE_ALIAS) assert.notEqual(await fs.realpath(os.tmpdir()), os.tmpdir())
+    await h.write(SOURCE, branchEntries(4, SOURCE, 1))
+    await h.record('P', SOURCE, rehomeRecord())
+    await mkdir(path.join(h.project, SOURCE))
+    await writeFile(path.join(h.project, SOURCE, 'ordinary'), data)
+    await symlink('absent', path.join(h.project, SOURCE, 'dangling'))
+    await rename(h.project, physical)
+    await symlink(physical, h.project)
+    const transcript = path.join(h.project, `${SOURCE}.jsonl`), before = await readFile(transcript)
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [] }), to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    assert.equal(moved.receipt.sessions[0].targetTranscript, transcript)
+    assert.equal(moved.receipt.sessions[0].record, path.join(h.dir('Z'), `local_${SOURCE}.json`))
+    assert.equal(moved.receipt.sessions[0].sidecars.canonicalRoot, path.join(await fs.realpath(physical), SOURCE))
+    if (legacy) { delete moved.receipt.sessions[0].sidecars.canonicalRoot; await writeFile(moved.file, JSON.stringify(moved.receipt)) }
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(await readFile(transcript), before)
+    assert.deepEqual(await readFile(path.join(h.project, SOURCE, 'ordinary')), data)
+    assert.equal(await readlink(path.join(h.project, SOURCE, 'dangling')), 'absent')
+  }
+})
+
+async function mappedProjectFixture(h) {
+  const original = path.join(h.root, 'original-project'), replacement = path.join(h.root, 'replacement-project')
+  await rename(h.project, original)
+  await symlink(original, h.project)
+  await mkdir(replacement)
+  for (const name of await readdir(original)) {
+    const source = path.join(original, name), target = path.join(replacement, name)
+    if ((await lstat(source)).isFile()) await fs.link(source, target)
+    else if ((await lstat(source)).isDirectory()) {
+      await mkdir(target)
+      for (const child of await readdir(source)) await fs.link(path.join(source, child), path.join(target, child))
+    }
+  }
+  return async () => { await unlink(h.project); await symlink(replacement, h.project) }
+}
+
+test('a changed trusted project alias cannot authorize a move through identical file inodes', async () => {
+  const h = await home()
+  await h.write(SOURCE, branchEntries(4, SOURCE, 1))
+  await h.record('P', SOURCE, rehomeRecord())
+  await mkdir(path.join(h.project, SOURCE))
+  await writeFile(path.join(h.project, SOURCE, 'ordinary'), 'Synthetic sidecar')
+  const change = await mappedProjectFixture(h)
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  await change()
+  const reports = [], moved = await move(inv, to, h.paths, stage => reports.push(stage))
+  assert.ok(reports.includes('recovery'))
+  assert.equal(moved.ok, true)
+  assert.deepEqual(await readdir(h.dir('P')), [])
+})
+
+test('retained native proof pins a trusted project alias before archival', async () => {
+  for (const deferred of [false, true]) {
+    const f = await nativePriorFixture(), { h } = f, change = await mappedProjectFixture(h)
+    const inv = await inventory([f.from], f.to, h.paths, () => {}, { cloudRequested: true, cloud: deferred ? null : f.cloud, processes: [] })
+    if (!deferred) await change()
+    const moved = await move(inv, f.to, h.paths)
+    if (deferred) {
+      f.cloud.eventRows = async () => { if (++f.reads === 3) await change(); return remoteRows(f.remote) }
+      const finished = await finishPending(h.paths, { cloud: f.cloud, processes: [] })
+      assert.equal(finished.ok, false)
+    } else assert.equal(moved.ok, false)
+    assert.equal(f.archives, 0)
+  }
+})
+
+async function limitRetryFixture(modes) {
+  const h = await home(), rows = modes.map((mode, index) => ({ mode, id: `cse_limit${index}`, sid: id(8700 + index), title: `Synthetic limit ${index}`, entries: branchEntries(4, id(8700 + index), 8800 + index * 10), status: 'active', reads: 0 }))
+  for (const row of rows) {
+    await h.write(row.sid, row.entries)
+    await h.record('P', row.sid, rehomeRecord({ title: row.title, bridgeSessionIds: [row.id.replace('cse_', 'session_')] }))
+  }
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, processes: [] }), to, h.paths)
+  const memory = { ...memoryBudget(), check: () => {}, parallel: () => 8 }
+  const f = { h, rows, moved, from, to, memory, inflight: 0, peak: 0 }
+  const lookup = id => { const row = rows.find(row => row.id === id); assert.ok(row, id); return row }
+  const cloud = cloudFixture(h, { memory,
+    list: async () => rows.map(row => remoteSession({ id: row.id, title: row.title, status: row.status })),
+    session: async id => { const row = lookup(id); return remoteState(row.status, row.mode === 'connected' ? { connection_status: 'connected' } : {}) },
+    eventRows: async id => {
+      const row = lookup(id)
+      row.reads++
+      f.peak = Math.max(f.peak, ++f.inflight)
+      try {
+        await new Promise(resolve => setImmediate(resolve))
+        const code = { event: 'CLOUD_HISTORY_LIMIT', budget: 'CLOUD_MEMORY_BUDGET', pressure: 'CLOUD_MEMORY_PRESSURE', parser: 'ERR_STRING_TOO_LONG' }[row.mode]
+        if (code) throw Object.assign(new Error(`Synthetic ${row.mode} refusal`), { code })
+        assert.equal(cloud.memory, memory)
+        return remoteRows(row.entries)
+      } finally { f.inflight-- }
+    },
+    archive: async id => { lookup(id).status = 'archived' }, unarchive: async id => { lookup(id).status = 'active' }
+  })
+  return { ...f, cloud, state: f, options: { cloud, memory, active: { state: 'known', account: h.acct.P, org: h.org.P }, processes: [], automatic: true } }
+}
+
+test('event-limited mirrors stay excluded while connected work clears and keep their failure afterward', async t => {
+  const f = await limitRetryFixture(['event', 'connected'])
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const first = await finishPending(f.h.paths, f.options), source = first.receipt.cloudChecks[0]
+  assert.equal(source.waiting.length, 1)
+  assert.equal(pendingPresentation(first.receipt, source, { signedIn: true }, 'cloud').pendingAutomatic, true)
+  assert.equal(f.rows[0].reads, 1)
+  assert.equal(f.rows[1].reads, 0)
+  now += 60000
+  const stillWaiting = await finishPending(f.h.paths, f.options)
+  assert.equal(stillWaiting.receipt.failed[0].code, 'CLOUD_HISTORY_LIMIT')
+  assert.equal(f.rows[0].reads, 1)
+  f.rows[1].mode = 'ok'; now += 60000
+  const cleared = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(f.rows[0].reads, 1)
+  assert.equal(cleared.complete, false)
+  assert.equal(cleared.receipt.failed.length, 1)
+  assert.equal(cleared.receipt.cloudChecks[0].failures[0].code, 'CLOUD_HISTORY_LIMIT')
+  assert.equal(pendingPresentation(cleared.receipt, cleared.receipt.cloudChecks[0], { signedIn: true }, 'cloud').pendingState, 'limit')
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, 1)
+  f.rows[0].mode = 'ok'
+  const manual = await finishPending(f.h.paths, { ...f.options, automatic: false })
+  assert.equal(manual.complete, true)
+  assert.equal(manual.receipt.failed.length, 0)
+})
+
+test('operation budget failures get one shared-budget serial retry that clears state on success', async t => {
+  const f = await limitRetryFixture(['budget', 'budget'])
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const first = await finishPending(f.h.paths, f.options)
+  assert.equal(first.receipt.failed.length, 2)
+  assert.ok(first.receipt.failed.every(row => row.code === 'CLOUD_MEMORY_BUDGET'))
+  assert.equal(f.state.peak, 2)
+  f.rows.forEach(row => { row.mode = 'ok' })
+  f.state.peak = 0
+  now += 60000
+  const retried = await finishPending(f.h.paths, f.options)
+  assert.equal(f.state.peak, 1)
+  assert.equal(retried.complete, false)
+  assert.equal(retried.receipt.failed.length, 0)
+  assert.equal(retried.receipt.cloudChecks[0].failures, undefined)
+  assert.equal(retried.receipt.cloudChecks[0].attemptBudget, f.memory.signature)
+  assert.equal(retried.receipt.cloudChecks[0].waiting.length, 1)
+  now += 60000
+  const completed = await finishPending(f.h.paths, f.options)
+  assert.equal(completed.complete, true)
+  assert.equal(completed.receipt.failed.length, 0)
+  assert.equal(completed.receipt.cloudChecks[0].waiting.length, 0)
+  assert.equal(f.state.peak, 1)
+  assert.ok(f.rows.every(row => row.status === 'archived'))
+})
+
+test('serial budget limits pause unchanged work but manual, engine and budget changes permit another attempt', async t => {
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  for (const reset of ['manual', 'engine', 'budget']) {
+    const f = await limitRetryFixture(['budget'])
+    await finishPending(f.h.paths, f.options)
+    now += 60000
+    const limited = await finishPending(f.h.paths, f.options)
+    assert.equal(limited.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT')
+    const presentation = pendingPresentation(limited.receipt, limited.receipt.cloudChecks[0], { signedIn: true }, 'cloud')
+    assert.equal(presentation.pendingState, 'budget-limit')
+    assert.equal(presentation.pendingAction, 'blocked')
+    assert.equal(presentation.pendingAutomatic, false)
+    const reads = f.rows[0].reads
+    now += 120000
+    assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+    assert.equal(f.rows[0].reads, reads)
+    f.rows[0].mode = 'ok'
+    if (reset === 'engine') {
+      limited.receipt.cloudChecks[0].attemptEngine = 'synthetic-previous-engine'
+      await writeFile(f.moved.file, JSON.stringify(limited.receipt))
+    }
+    if (reset === 'budget') f.memory.signature += ':increased'
+    const recovered = await finishPending(f.h.paths, { ...f.options, automatic: reset !== 'manual' })
+    assert.equal(recovered.complete, true, reset)
+    assert.equal(recovered.receipt.failed.length, 0)
+    assert.ok(f.rows[0].reads > reads)
+  }
+})
+
+test('transient pressure recovers while deterministic parser limits remain scoped to their mirror', async t => {
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const f = await limitRetryFixture(['parser', 'pressure'])
+  const first = await finishPending(f.h.paths, f.options)
+  assert.deepEqual(first.receipt.failed.map(row => row.code).sort(), ['CLOUD_MEMORY_PRESSURE', 'CLOUD_PARSER_LIMIT'])
+  const parserReads = f.rows[0].reads
+  now += 60000
+  f.rows[1].mode = 'ok'
+  const recovered = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[0].reads, parserReads)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(recovered.receipt.failed.length, 1)
+  assert.equal(recovered.receipt.failed[0].code, 'CLOUD_PARSER_LIMIT')
+  assert.equal(pendingPresentation(recovered.receipt, recovered.receipt.cloudChecks[0], { signedIn: true }, 'cloud').pendingState, 'parser-limit')
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, parserReads)
+})
+
+test('limited budget work does not starve other source organizations or revive cancelled checks', async t => {
+  const f = await pendingOrganizations({ orgs: ['P', 'T', 'Q'] })
+  let now = Date.now(), failures = 0
+  t.mock.method(Date, 'now', () => now)
+  const receipt = JSON.parse(await readFile(f.moved.file))
+  receipt.cloudChecks[2].status = 'cancelled'
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  const options = { ...f.options, cloud: source => {
+    if (source.org === f.rows[0].org) { failures++; throw Object.assign(new Error('Synthetic budget exhausted'), { code: 'CLOUD_MEMORY_BUDGET' }) }
+    return f.client(source)
+  } }
+  await sweep(f.h.paths, options)
+  const other = await sweep(f.h.paths, options)
+  assert.equal(other.result.receipt.remote[0].org, f.rows[1].org)
+  assert.equal(f.rows[1].status, 'archived')
+  now += 60000
+  const limited = await sweep(f.h.paths, options)
+  assert.equal(limited.result.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT')
+  now += 120000
+  assert.equal((await sweep(f.h.paths, options)).pending, true)
+  assert.equal(failures, 2)
+  assert.equal(JSON.parse(await readFile(f.moved.file)).cloudChecks[2].status, 'cancelled')
+  assert.equal(f.rows[2].status, 'active')
+})
+
+test('a serial budget limit stays excluded while a connected mirror clears', async t => {
+  const f = await limitRetryFixture(['budget', 'connected'])
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  await finishPending(f.h.paths, f.options)
+  now += 60000
+  const limited = await finishPending(f.h.paths, f.options)
+  assert.equal(limited.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT')
+  assert.equal(limited.receipt.cloudChecks[0].waiting.length, 1)
+  assert.equal(pendingPresentation(limited.receipt, limited.receipt.cloudChecks[0], { signedIn: true }, 'cloud').pendingAutomatic, true)
+  const reads = f.rows[0].reads
+  f.rows[1].mode = 'ok'; now += 60000
+  const cleared = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[0].reads, reads)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(cleared.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT')
+  assert.equal(cleared.receipt.cloudChecks[0].waiting.length, 0)
+  assert.equal(cleared.complete, false)
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, reads)
+})
+
+test('budget fairness isolates a previously failed history through archival while another mirror becomes idle', async t => {
+  const f = await limitRetryFixture(['connected', 'budget'])
+  let now = Date.now(), competingHistory = false, retrying = false
+  t.mock.method(Date, 'now', () => now)
+  const read = f.cloud.eventRows, trace = []
+  f.cloud.eventRows = async id => {
+    trace.push(id)
+    if (retrying && id === f.rows[0].id) competingHistory = true
+    if (retrying && id === f.rows[1].id && competingHistory) throw Object.assign(new Error('Synthetic earlier history used this operation budget'), { code: 'CLOUD_MEMORY_BUDGET' })
+    return read(id)
+  }
+  const first = await finishPending(f.h.paths, f.options), scope = first.receipt.cloudChecks[0].sessionIds
+  assert.equal(first.receipt.cloudChecks[0].waiting[0].id, f.rows[0].id)
+  assert.equal(first.receipt.failed[0].id, f.rows[1].id)
+  f.rows.forEach(row => { row.mode = 'ok' })
+  retrying = true; trace.length = 0; now += 60000
+  const second = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[1].status, 'archived', JSON.stringify(second.receipt.failed))
+  assert.ok(trace.every(id => id === f.rows[1].id), 'the selected history must keep the pass through its final rechecks')
+  assert.equal(second.complete, false)
+  assert.equal(second.receipt.cloudChecks[0].waiting[0].id, f.rows[0].id)
+  assert.deepEqual(second.receipt.cloudChecks[0].sessionIds, scope)
+  competingHistory = false; now += 60000
+  const third = await finishPending(f.h.paths, f.options)
+  assert.equal(third.complete, true)
+  assert.ok(f.rows.every(row => row.status === 'archived'))
+  assert.equal(third.receipt.failed.length, 0)
+})
+
+test('budget fairness stops an oversized history while a second initial budget failure gets a fresh pass', async t => {
+  const f = await limitRetryFixture(['budget', 'budget'])
+  let now = Date.now(), spent = false, retrying = false
+  t.mock.method(Date, 'now', () => now)
+  const read = f.cloud.eventRows
+  f.cloud.eventRows = async id => {
+    if (retrying && id === f.rows[0].id) spent = true
+    if (retrying && id === f.rows[1].id && spent) throw Object.assign(new Error('Synthetic budget was already consumed'), { code: 'CLOUD_MEMORY_BUDGET' })
+    return read(id)
+  }
+  await finishPending(f.h.paths, f.options)
+  retrying = true; f.rows[1].mode = 'ok'; now += 60000
+  const second = await finishPending(f.h.paths, f.options)
+  assert.deepEqual(second.receipt.failed.map(row => [row.id, row.code]), [[f.rows[0].id, 'CLOUD_BUDGET_LIMIT']])
+  assert.equal(second.receipt.cloudChecks[0].waiting[0].id, f.rows[1].id)
+  const oversizedReads = f.rows[0].reads
+  spent = false; now += 60000
+  const third = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(f.rows[0].reads, oversizedReads)
+  assert.equal(third.complete, false)
+  assert.deepEqual(third.receipt.failed.map(row => [row.id, row.code]), [[f.rows[0].id, 'CLOUD_BUDGET_LIMIT']])
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, oversizedReads)
+})
+
+test('budget fairness discovers remaining work without narrowing scope or dropping permanent failures', async t => {
+  const f = await limitRetryFixture(['event', 'parser', 'budget', 'budget', 'connected'])
+  const receipt = JSON.parse(await readFile(f.moved.file))
+  delete receipt.cloudChecks[0].sessionIds
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const first = await finishPending(f.h.paths, f.options)
+  assert.equal(first.receipt.cloudChecks[0].sessionIds, undefined)
+  const extra = { mode: 'ok', id: 'cse_discovered', sid: id(8799), title: 'Discovered synthetic history', entries: branchEntries(4, id(8799), 8990), status: 'active', reads: 0 }
+  f.rows.push(extra)
+  await f.h.write(extra.sid, extra.entries)
+  await f.h.record('Z', extra.sid, rehomeRecord({ title: extra.title }))
+  f.rows[3].mode = 'ok'
+  let latest
+  for (let pass = 0; pass < 5; pass++) {
+    now += 60000
+    if (pass === 4) f.rows[4].mode = 'ok'
+    latest = await finishPending(f.h.paths, f.options)
+    assert.equal(latest.receipt.cloudChecks[0].sessionIds, undefined)
+    assert.equal(latest.complete, false)
+    assert.deepEqual(latest.receipt.failed.map(row => row.code).sort(), ['CLOUD_BUDGET_LIMIT', 'CLOUD_HISTORY_LIMIT', 'CLOUD_PARSER_LIMIT'])
+    if (pass === 0) assert.deepEqual(new Set(latest.receipt.cloudChecks[0].waiting.map(row => row.id)), new Set([f.rows[3].id, f.rows[4].id, extra.id]))
+  }
+  assert.ok(f.rows.slice(3).every(row => row.status === 'archived'))
+  assert.equal(latest.receipt.cloudChecks[0].waiting.length, 0)
+  assert.deepEqual(f.rows.slice(0, 3).map(row => row.reads), [1, 1, 2])
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  const reads = f.rows.map(row => row.reads)
+  assert.equal((await keepLocal(f.h.paths)).ok, true)
+  await finishPending(f.h.paths, f.options)
+  assert.deepEqual(f.rows.map(row => row.reads), reads)
+  assert.equal(JSON.parse(await readFile(f.moved.file)).cloudChecks[0].status, 'cancelled')
+})
+
+test('budget fairness preserves deferred work when an isolated history exhausts memory after analysis', async t => {
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  for (const mode of ['ok', 'budget']) {
+    const f = await limitRetryFixture(['budget', 'connected'])
+    let exhausted = false, retrying = false
+    const first = await finishPending(f.h.paths, f.options), scope = first.receipt.cloudChecks[0].sessionIds
+    f.rows[0].mode = mode
+    const read = f.cloud.eventRows
+    f.cloud.eventRows = async id => {
+      try { return await read(id) }
+      finally { if (retrying && id === f.rows[0].id) exhausted = true }
+    }
+    f.memory.check = () => { if (exhausted) throw Object.assign(new Error('Synthetic post-analysis budget exhaustion'), { code: 'CLOUD_MEMORY_BUDGET' }) }
+    retrying = true; now += 60000
+    const limited = await finishPending(f.h.paths, f.options)
+    assert.equal(limited.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT', mode)
+    assert.equal(limited.receipt.failed[0].id.replace('session_', 'cse_'), f.rows[0].id, mode)
+    assert.deepEqual(limited.receipt.cloudChecks[0].waiting.map(row => row.id), [f.rows[1].id], mode)
+    assert.deepEqual(limited.receipt.cloudChecks[0].sessionIds, scope, mode)
+    assert.equal(limited.receipt.remote.length, 0, mode)
+    exhausted = false; retrying = false; f.rows[1].mode = 'ok'; now += 60000
+    const completed = await finishPending(f.h.paths, f.options)
+    assert.equal(completed.complete, false, mode)
+    assert.equal(f.rows[1].status, 'archived', mode)
+    assert.equal(completed.receipt.failed.length, 1, mode)
+    assert.deepEqual(completed.receipt.cloudChecks[0].sessionIds, scope, mode)
+  }
+})
+
+test('native string-size errors during final verification become scoped parser limits', async t => {
+  const f = await limitRetryFixture(['ok', 'connected'])
+  let now = Date.now(), ready = false, thrown = 0
+  t.mock.method(Date, 'now', () => now)
+  const before = await fixtureSnapshot(f.h, [f.h.paths.records, f.h.paths.pool])
+  const stringify = JSON.stringify
+  const mock = t.mock.method(JSON, 'stringify', (value, ...args) => {
+    if (ready && !thrown && value?.event_type === 'user' && value.payload?.uuid === f.rows[0].entries[0].uuid && f.rows[0].reads === 3) {
+      thrown++
+      const error = new RangeError('Invalid string length')
+      assert.equal(error.code, undefined)
+      throw error
+    }
+    return stringify(value, ...args)
+  })
+  let failed
+  try {
+    failed = await finishPending(f.h.paths, { ...f.options, report: (stage, text, extra) => {
+      if (stage === 'cloud' && extra?.completed === 0 && extra?.total > 0) ready = true
+    } })
+  } finally { mock.mock.restore() }
+  assert.equal(ready, true)
+  assert.equal(thrown, 1)
+  assert.equal(failed.ok, false)
+  assert.equal(failed.receipt.failed[0].id, f.rows[0].id)
+  assert.equal(failed.receipt.failed[0].code, 'CLOUD_PARSER_LIMIT')
+  assert.equal(failed.receipt.failed[0].localId, f.rows[0].sid)
+  assert.equal(f.rows[0].status, 'active')
+  assert.equal(failed.receipt.remote.length, 0)
+  assert.equal(failed.receipt.sessions.length, f.moved.receipt.sessions.length)
+  for (const key of ['pending', 'remotePending', 'finalizing', 'retiring', 'undoing']) assert.ok(!failed.receipt[key], key)
+  assert.deepEqual(await fixtureSnapshot(f.h, [f.h.paths.records, f.h.paths.pool]), before)
+  const reads = f.rows[0].reads
+  now += 60000
+  const waiting = await finishPending(f.h.paths, f.options)
+  assert.equal(waiting.receipt.failed[0].code, 'CLOUD_PARSER_LIMIT')
+  assert.equal(f.rows[0].reads, reads)
+  f.rows[1].mode = 'ok'; now += 60000
+  const independent = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(f.rows[0].status, 'active')
+  assert.equal(f.rows[0].reads, reads)
+  assert.equal(independent.complete, false)
+  assert.equal(independent.receipt.failed[0].code, 'CLOUD_PARSER_LIMIT')
+  now += 60000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, reads)
+})
