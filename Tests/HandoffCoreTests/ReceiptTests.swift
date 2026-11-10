@@ -8,15 +8,14 @@ extension Engine {
         // A callback argument, undefined when the engine passed fewer.
         static func arg(_ args: [Value], _ i: Int) -> Value { i < args.count ? args[i] : .undefined }
 
-        // accounts() rows keyed by account uuid (Object.fromEntries(accounts.map(a => [a.account, a]))).
+        // accounts() rows keyed by account uuid.
         static func byAccount(_ h: Home) throws -> [String: Value] {
             var out: [String: Value] = [:]
             for row in try accounts(h.paths).elements { out[row.account.str] = row }
             return out
         }
 
-        // The Node suite (duringSecondRead) turned `file` into a FIFO and ran `action` while the engine was blocked
-        // on its second read of it. Here the engine's second read or open of `file` runs `action` first.
+        // Runs `action` just before the engine's second read or open of `file`.
         static func duringSecondRead(_ file: String, _ action: @escaping () throws -> Void) -> Box<Bool> {
             let ran = Box(false), readFile = fs.readFile, open = fs.open
             var reads = 0
@@ -171,8 +170,6 @@ extension Engine {
             eq(try normalize([parent, producerOnly, contentOnly]).conflicts, 1)
         }
 
-        // The Swift engine holds the lock with flock(2) itself; the Node suite's lockf-less fallback has no
-        // Swift counterpart, so this runs once against the single lock implementation.
         @Test("fallback lock releases after an interrupted move so recovery can run")
         func fallbackLockReleases() throws {
             let h = try home()
@@ -433,12 +430,11 @@ extension Engine {
             let before = try readData(transcript), desktop = try readData(record)
             let result = try undo(h.paths, ["processes": []])
             eq(result.dest.truthy, !recordChanged)
-            #expect(try readData(transcript) == before)
-            if recordChanged { #expect(try readData(record) == desktop) }
+            do { let actual = try readData(transcript); let expected = before; #expect(actual == expected) }
+            if recordChanged { do { let actual = try readData(record); let expected = desktop; #expect(actual == expected) } }
             else { deq(try readJSON(h.recordFile("P", SOURCE)).bridgeSessionIds, ["session_prior"]) }
         }
 
-        // Node also watched handle.truncate; the Swift engine never truncates (FileHandle.truncate has no table hook).
         @Test("bridge review Undo cannot discard a message arriving immediately before mutation")
         func bridgeReviewArrivingMessage() throws {
             let h = try bridgeFixture(), transcript = h.transcriptPath
@@ -485,7 +481,7 @@ extension Engine {
             }
             let first = try moveOnce()
             eq(first.ok, true)
-            #expect(try readData(transcript) == cleared)
+            do { let actual = try readData(transcript); let expected = cleared; #expect(actual == expected) }
             deq(try readJSON(path.join(targetDir, "local_\(SOURCE).json")).bridgeSessionIds, [])
             ok(try undo(h.paths).dest)
             deq(.strings(try readdir(targetDir)), [])
@@ -507,9 +503,9 @@ extension Engine {
             eq(moved.ok, true)
             let placed = try readJSON(h.recordFile("T", SOURCE))
             for key in saved.ownKeys { eq(placed.hasOwn(key), false, key) }
-            #expect(try readData(moved.receipt.superseded.find { $0.source.truthy }.moved[0][1].str) == original)
+            do { let actual = try readData(moved.receipt.superseded.find { $0.source.truthy }.moved[0][1].str); let expected = original; #expect(actual == expected) }
             ok(try undo(h.paths).dest)
-            #expect(try readData(source) == original)
+            do { let actual = try readData(source); let expected = original; #expect(actual == expected) }
             deq(.strings(try readdir(h.dir("T"))), [])
         }
 
@@ -567,7 +563,7 @@ extension Engine {
             let recovered = try undo(h.paths, ["processes": []])
             if checkpoint == "unacknowledged newer bridge" {
                 match(recovered.reconciled.error, "transcript restoration witness changed")
-                #expect(try readData(transcript) == beforeRecovery)
+                do { let actual = try readData(transcript); let expected = beforeRecovery; #expect(actual == expected) }
                 ok(exists(h.recordFile("Z", SOURCE)))
                 return
             }
@@ -582,7 +578,7 @@ extension Engine {
             ok(exists(h.recordFile("P", SOURCE)))
             deq(.strings(try readdir(h.dir("Z"))), [])
             _ = try undo(h.paths, ["processes": []])
-            #expect(try readData(transcript) == after)
+            do { let actual = try readData(transcript); let expected = after; #expect(actual == expected) }
         }
 
         @Test("bridge Undo preserves later messages, newer bridges and replaced transcripts", arguments: ["later messages", "newer bridge", "rewritten prefix", "replacement"])
@@ -609,31 +605,43 @@ extension Engine {
             deq(.strings(try readdir(h.dir("Z"))), [])
         }
 
-        static let corruptions: [String: (phase: String, corrupt: (Value) -> Void)] = [
-            "missing original": ("undo", { $0.bridgeAppend.removeKey("original") }),
-            "null original": ("undo", { $0.bridgeAppend.original = nil }),
-            "wrong-session original": ("undo", { $0.bridgeAppend.original.sessionId = Value(id(799)) }),
-            "message original": ("undo", { $0.bridgeAppend.original = entry("user", 4, 3, SOURCE) }),
-            "substituted original owner": ("undo", { $0.bridgeAppend.original.ownerAccountUuid = Value(id(999)) }),
-            "invalid appended metadata": ("undo", { $0.bridgeAppend.bytes = "undefined\n" }),
-            "missing original during retirement": ("retirement", { $0.bridgeAppend.removeKey("original") }),
-            "invalid length during retirement": ("retirement", { $0.bridgeAppend["length"] = -1 }),
-            "missing original during placement": ("pending", { $0.bridgeAppend.removeKey("original") }),
-            "message append during placement": ("pending", { $0.bridgeAppend.bytes = Value("\(JSON.text(entry("user", 4, 3, SOURCE)))\n") }),
-            "wrong-session append during placement": ("pending", { row in
-                let bytes = row.bridgeAppend.bytes.str
-                if let range = bytes.range(of: SOURCE) { row.bridgeAppend.bytes = Value(bytes.replacingCharacters(in: range, with: id(799))) }
-            }),
-            "malformed content hash": ("undo", { $0.bridgeAppend.sha = nil }),
-            "inconsistent append hash": ("undo", { $0.bridgeAppend.afterSha = Value(String(repeating: "0", count: 64)) }),
-            "missing identity witness": ("undo", { $0.bridgeAppend.removeKey("fingerprint") }),
-            "missing worker aliases": ("undo", { $0.bridgeAppend.removeKey("recordIds") }),
-            "invalid worker alias": ("undo", { $0.bridgeAppend.recordIds = ["not-a-record"] }),
-            "missing owning record alias": ("undo", { $0.bridgeAppend.recordIds = [Value("local_\(id(799))")] }),
-            "missing shared record alias": ("shared", { $0.bridgeAppend.recordIds = [Value("local_\(SOURCE)")] }),
-            "invalid Undo append": ("interrupted undo", { $0.bridgeUndo.bytes = "undefined\n" }),
-            "wrong-session Undo original": ("interrupted undo", { $0.bridgeUndo.original.sessionId = Value(id(799)) }),
-        ]
+        // The receipt phase a corruption case runs in.
+        static func corruptionPhase(_ name: String) -> String {
+            switch name {
+            case "missing original during retirement", "invalid length during retirement": return "retirement"
+            case "missing original during placement", "message append during placement", "wrong-session append during placement": return "pending"
+            case "missing shared record alias": return "shared"
+            case "invalid Undo append", "wrong-session Undo original": return "interrupted undo"
+            default: return "undo"
+            }
+        }
+
+        static func corrupt(_ name: String, _ row: Value) {
+            let append: Value = row.bridgeAppend
+            switch name {
+            case "missing original", "missing original during retirement", "missing original during placement": append.removeKey("original")
+            case "null original": append.original = nil
+            case "wrong-session original": append.original.sessionId = Value(id(799))
+            case "message original": append.original = entry("user", 4, 3, SOURCE)
+            case "substituted original owner": append.original.ownerAccountUuid = Value(id(999))
+            case "invalid appended metadata": append.bytes = "undefined\n"
+            case "invalid length during retirement": append["length"] = -1
+            case "message append during placement": append.bytes = Value(JSON.text(entry("user", 4, 3, SOURCE)) + "\n")
+            case "wrong-session append during placement":
+                let bytes: String = append.bytes.str
+                if let range = bytes.range(of: SOURCE) { append.bytes = Value(bytes.replacingCharacters(in: range, with: id(799))) }
+            case "malformed content hash": append.sha = nil
+            case "inconsistent append hash": append.afterSha = Value(String(repeating: "0", count: 64))
+            case "missing identity witness": append.removeKey("fingerprint")
+            case "missing worker aliases": append.removeKey("recordIds")
+            case "invalid worker alias": append.recordIds = ["not-a-record"]
+            case "missing owning record alias": append.recordIds = [Value("local_" + id(799))]
+            case "missing shared record alias": append.recordIds = [Value("local_" + SOURCE)]
+            case "invalid Undo append": row.bridgeUndo.bytes = "undefined\n"
+            case "wrong-session Undo original": row.bridgeUndo.original.sessionId = Value(id(799))
+            default: Issue.record("unknown corruption \(name)")
+            }
+        }
 
         @Test("bridge recovery refuses corrupt receipt metadata before changing transcripts or records", arguments: [
             "missing original", "null original", "wrong-session original", "message original", "substituted original owner", "invalid appended metadata",
@@ -642,7 +650,7 @@ extension Engine {
             "invalid worker alias", "missing owning record alias", "missing shared record alias", "invalid Undo append", "wrong-session Undo original",
         ])
         func corruptBridgeMetadata(name: String) throws {
-            let (phase, corrupt) = Receipts.corruptions[name]!
+            let phase = Receipts.corruptionPhase(name)
             let h = try bridgeFixture(), transcriptPath = h.transcriptPath
             var from = h.from
             if phase == "shared" {
@@ -665,7 +673,7 @@ extension Engine {
                 fs = NodeFS()
             }
             let receipt = try readReceipt(moved.file), row = receipt.sessions[0]
-            corrupt(row)
+            Receipts.corrupt(name, row)
             if phase == "retirement" {
                 receipt.finalizing = true
                 receipt.retiring = receipt.superseded
@@ -682,7 +690,7 @@ extension Engine {
             let result = try undo(h.paths, ["processes": []])
             eq(result.dest.truthy, false)
             ok(result.restoreProblems.length > 0 || result.changed.length > 0 || result.reconciled.error.truthy)
-            #expect(try readData(transcriptPath) == transcript)
+            do { let actual = try readData(transcriptPath); let expected = transcript; #expect(actual == expected) }
             deq(try fixtureSnapshot(h, roots), before)
         }
 
@@ -729,7 +737,7 @@ extension Engine {
                 throwsError("Synthetic continuation interruption") { try undo(h.paths, ["processes": []]) }
                 fs = NodeFS()
                 #expect(repeated)
-                #expect(try readData(transcript).prefix(partial.count) == partial)
+                do { let actual = try readData(transcript).prefix(partial.count); let expected = partial; #expect(actual == expected) }
             }
             if checkpoint == "synced" || checkpoint == "restored" { try appendText(transcript, "\(JSON.text(entry("assistant", 4, 3, SOURCE)))\n") }
             let recovered = try undo(h.paths, ["processes": []])
@@ -742,7 +750,7 @@ extension Engine {
             deq(.strings(try readdir(h.dir("Z"))), [])
             ok(exists(h.recordFile("P", SOURCE)))
             _ = try undo(h.paths, ["processes": []])
-            #expect(try readData(transcript) == after)
+            do { let actual = try readData(transcript); let expected = after; #expect(actual == expected) }
         }
     }
 }

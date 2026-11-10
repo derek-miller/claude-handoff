@@ -37,7 +37,7 @@ extension Engine.Receipts {
                 deq(try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str]), before)
             } else {
                 ok(kept.refused.length > 0, scenario)
-                #expect(try readData(moved.file.str) == receiptBefore, "\(scenario)")
+                do { let actual = try readData(moved.file.str); let expected = receiptBefore; #expect(actual == expected, "\(scenario)") }
             }
         }
     }
@@ -88,10 +88,10 @@ extension Engine.Receipts {
             eq(placed.isArchived, false)
             eq(placed.forkedFromSessionId, Value("local_\(SOURCE)"))
             deq(placed.bridgeSessionIds, location == "P" ? [] : ["session_linked_fork"])
-            #expect(try readData(parentFile) == originalParent)
+            do { let actual = try readData(parentFile); let expected = originalParent; #expect(actual == expected) }
             ok(try undo(h.paths, ["cloud": cloud]).dest)
             eq(status, "active")
-            #expect(try readData(parentFile) == originalParent)
+            do { let actual = try readData(parentFile); let expected = originalParent; #expect(actual == expected) }
             deq(try readJSON(h.recordFile(location, child)), originalFork)
         }
     }
@@ -249,7 +249,7 @@ extension Engine.Receipts {
         try writeJSON(moved.file.str, receipt)
         ok(try finishWorkflow(h.paths, ["processes": []]).dest)
         deq(try readJSON(h.sourceFile), h.sourceRegistry)
-        #expect(try h.sessions.map { try readData(h.recordFile("P", $0)) } == h.originalRecords)
+        do { let actual = try h.sessions.map { try readData(h.recordFile("P", $0)) }; let expected = h.originalRecords; #expect(actual == expected) }
         ok(!exists(h.targetFile))
         deq(.strings(try readdir(h.dir("T"))), [])
     }
@@ -266,7 +266,7 @@ extension Engine.Receipts {
             eq(moved.receipt.sessions.length, 4)
             deq(try readJSON(h.sourceFile), h.sourceAfter)
             deq(try readJSON(h.targetFile), h.targetAfter)
-            #expect(try h.tasks.elements.map { try readData($0.filePath.str) } == prompts)
+            do { let actual = try h.tasks.elements.map { try readData($0.filePath.str) }; let expected = prompts; #expect(actual == expected) }
             deq(moved.receipt.taskTransfers[0].state, [
                 "recordedSkips": ["task_0": h.sourceRegistry.recordedSkips.task_0, "task_1": h.sourceRegistry.recordedSkips.task_1],
                 "runRetries": ["task_0": h.sourceRegistry.runRetries.task_0],
@@ -286,7 +286,7 @@ extension Engine.Receipts {
             ok(undone.dest)
             deq(try readJSON(h.sourceFile), h.sourceRegistry)
             deq(try readJSON(h.targetFile), h.targetRegistry)
-            #expect(try h.tasks.elements.map { try readData($0.filePath.str) } == prompts)
+            do { let actual = try h.tasks.elements.map { try readData($0.filePath.str) }; let expected = prompts; #expect(actual == expected) }
             for sid in [SOURCE, h.run, h.second, h.cold] { ok(exists(h.recordFile("P", sid))) }
         }
     }
@@ -304,7 +304,7 @@ extension Engine.Receipts {
         let result = try move(inv, fresh.to, h.paths)
         eq(result.ok, false)
         ne(result.file, first.file)
-        #expect(try readData(first.file.str) == before)
+        do { let actual = try readData(first.file.str); let expected = before; #expect(actual == expected) }
         eq(result.receipt.sessions.length, 0)
         eq(result.added ?? 0, 0)
         eq(result.targetChanged ?? false, false)
@@ -393,7 +393,7 @@ extension Engine.Receipts {
                 let problems = result.reconciled.problems.nullish ? (result.restoreProblems.nullish ? result.changed : result.restoreProblems) : result.reconciled.problems
                 match(Value(problems.join(" ")), source ? "scheduled task state changed" : "scheduled task")
                 deq(try readJSON(file), changed, label)
-                if source { #expect(try readData(h.targetFile) == target, "\(label)") }
+                if source { do { let actual = try readData(h.targetFile); let expected = target; #expect(actual == expected, "\(label)") } }
                 ok(exists(h.recordFile("T", SOURCE)), label)
                 try writeData(file, before)
                 let retried = recovery ? try finishWorkflow(h.paths, ["processes": []]) : try undo(h.paths, ["processes": []])
@@ -426,89 +426,93 @@ extension Engine.Receipts {
         for family in [false, true] {
             for transient in [true, false] {
                 for resume in [false, true] {
-                    let label = "family \(family) transient \(transient) resume \(resume)"
-                    let tf: TaskFamily? = family ? try taskFamilyFixture() : nil
-                    let h: Home = try tf ?? home()
-                    let other = id(710), healthy = id(711)
-                    let ids = tf.map { [SOURCE, $0.run, $0.second, $0.cold, other, healthy] } ?? [SOURCE, other, healthy]
-                    for (index, sid) in (family ? [other, healthy] : ids).enumerated() {
-                        try h.write(sid, [entry("user", 810 + index, nil, sid)])
-                        try h.record("P", sid, rehomeRecord(family ? ["scheduledTaskId": Value("independent_\(index)")] : [:]))
-                    }
-                    if let tf {
-                        tf.sourceRegistry.scheduledTasks = tf.tasks.concat([["id": "independent_0", "enabled": true], ["id": "independent_1", "enabled": true]])
-                        try writeJSON(tf.sourceFile, tf.sourceRegistry)
-                    }
-                    try h.record("P", id(799), rehomeRecord())
-                    let mock = taskHarness(family ? [desktopFixture()[0]] : desktopFixture())
-                    if !family { mock.rows[1].ids = .strings(ids) }
-                    let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
-                    let before = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
-                    let first: Value = resume ? try executeMove([from], to, h.paths, ["io": mock.io, "moveOnly": true]) : nil
-                    let run = { (options: Value) throws -> Value in resume ? try finishWorkflow(h.paths, options) : try executeMove([from], to, h.paths, options) }
-                    let planned = try run(["io": mock.io])
-                    var reports: [Value] = [], attempts: [String: Int] = [:], order: [String] = []
-                    let failedIds = [tf?.run ?? SOURCE, other]
-                    let link = fs.link
-                    fs.link = { a, b in
-                        if path.dirname(b) == h.dir("T") {
-                            let name = path.basename(b), sid = String(name.dropFirst(6).dropLast(5)), count = (attempts[sid] ?? 0) + 1
-                            if attempts[sid] == nil { order.append(sid) }
-                            attempts[sid] = count
-                            if sid == failedIds[0] && (!transient || count == 1) || !transient && sid == other { throw JSError("Synthetic publication failure \(sid)") }
-                        }
-                        try link(a, b)
-                    }
-                    let result = try run(["io": mock.io, "approve": planned.plan.token, "report": fn { args in reports.append(.spread(["stage": Engine.Receipts.arg(args, 0)], Engine.Receipts.arg(args, 2))); return .undefined }])
-                    fs = NodeFS()
-                    eq(result.recoveryRequired, .undefined, "\(label) \(result.reason)")
-                    eq(result.ok, Value(transient), "\(label) \(JSON.text(result.summary))")
-                    eq(result.complete, Value(transient), label)
-                    eq(attempts[failedIds[0]], 2, label)
-                    eq(attempts[other], transient && !family ? 1 : 2, label)
-                    eq(reports.filter { $0.stage == "recovery" }.count, 1, label)
-                    eq(result.receipt.finalizing, false)
-                    eq(result.receipt.pending, nil)
-                    eq(result.receipt.held.length, 0)
-                    ok(!exists("\(result.file.str).journal"), label)
-                    let unmoved: [String] = transient ? [] : tf.map { [SOURCE, $0.run, $0.second, other] } ?? [SOURCE, other]
-                    deq(result.receipt.sessions.map { $0.id }.sorted(), .strings(ids.filter { !unmoved.contains($0) }.sorted(by: utf16Less)), label)
-                    deq(result.summary.notMoved.map { $0.id }.sorted(), .strings(unmoved.sorted(by: utf16Less)), label)
-                    if transient { deq(result.receipt.failed, [], label); ok(!result.receipt.localStopped.truthy, label) }
-                    let counts = reports.filter { $0.stage == "sessions" }
-                    let total = ids.count - (resume && family ? 1 : 0)
-                    eq(planned.plan.remainingCount, Value(total), label)
-                    ok(!counts.isEmpty && counts.allSatisfy { $0.sessionTotal == Value(total) }, JSON.text(Value(counts)))
-                    eq(counts.last?.remainingCount ?? .undefined, Value(result.summary.notMoved.length), label)
-                    #expect(mock.calls == ["/usr/bin/osascript", "/usr/bin/open"], "\(label)")
-                    if resume { eq(result.file, first.file, label) }
-                    if !transient {
-                        let snapshot = try fixtureSnapshot(h), published = attempts
-                        for _ in 0..<2 {
-                            let output = cli(h.root, ["accounts", "--json"]) { processSetup(list: "", commands: "") }
-                            let rows = lines(output.stdout)[0].filter { $0.pending.truthy }
-                            deq(rows.map { [$0.account, $0.pending, $0.pendingCount, $0.pendingAction] }, [[Value(h.acct.P), "partial", Value(unmoved.count), "blocked"]], label)
-                            let pending = try finishWorkflow(h.paths, ["processes": []])
-                            eq(pending.summary.notMoved.length, unmoved.count, label)
-                            deq(try fixtureSnapshot(h), snapshot, label)
-                        }
-                        #expect(attempts == published)
-                        let kept = try keepLocal(h.paths)
-                        eq(kept.ok, true, label)
-                        eq(kept.complete, true, label)
-                        eq(kept.summary.notMoved.length, unmoved.count, label)
-                    }
-                    ok(try undo(h.paths, ["processes": []]).dest, label)
-                    let after = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
-                    if let tf {
-                        for file in [tf.sourceFile, tf.targetFile] { before.removeKey(file); after.removeKey(file) }
-                        deq(try readJSON(tf.sourceFile), tf.sourceRegistry, label)
-                        deq(try readJSON(tf.targetFile), tf.targetRegistry, label)
-                    }
-                    deq(after, before, label)
+                    try publicationCase(family: family, transient: transient, resume: resume)
                 }
             }
         }
+    }
+
+    func publicationCase(family: Bool, transient: Bool, resume: Bool) throws {
+        let label = "family \(family) transient \(transient) resume \(resume)"
+        let tf: TaskFamily? = family ? try taskFamilyFixture() : nil
+        let h: Home = try tf ?? home()
+        let other = id(710), healthy = id(711)
+        let ids = tf.map { [SOURCE, $0.run, $0.second, $0.cold, other, healthy] } ?? [SOURCE, other, healthy]
+        for (index, sid) in (family ? [other, healthy] : ids).enumerated() {
+            try h.write(sid, [entry("user", 810 + index, nil, sid)])
+            try h.record("P", sid, rehomeRecord(family ? ["scheduledTaskId": Value("independent_\(index)")] : [:]))
+        }
+        if let tf {
+            tf.sourceRegistry.scheduledTasks = tf.tasks.concat([["id": "independent_0", "enabled": true], ["id": "independent_1", "enabled": true]])
+            try writeJSON(tf.sourceFile, tf.sourceRegistry)
+        }
+        try h.record("P", id(799), rehomeRecord())
+        let mock = taskHarness(family ? [desktopFixture()[0]] : desktopFixture())
+        if !family { mock.rows[1].ids = .strings(ids) }
+        let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
+        let before = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
+        let first: Value = resume ? try executeMove([from], to, h.paths, ["io": mock.io, "moveOnly": true]) : nil
+        let run = { (options: Value) throws -> Value in resume ? try finishWorkflow(h.paths, options) : try executeMove([from], to, h.paths, options) }
+        let planned = try run(["io": mock.io])
+        var reports: [Value] = [], attempts: [String: Int] = [:], order: [String] = []
+        let failedIds = [tf?.run ?? SOURCE, other]
+        let link = fs.link
+        fs.link = { a, b in
+            if path.dirname(b) == h.dir("T") {
+                let name = path.basename(b), sid = String(name.dropFirst(6).dropLast(5)), count = (attempts[sid] ?? 0) + 1
+                if attempts[sid] == nil { order.append(sid) }
+                attempts[sid] = count
+                if sid == failedIds[0] && (!transient || count == 1) || !transient && sid == other { throw JSError("Synthetic publication failure \(sid)") }
+            }
+            try link(a, b)
+        }
+        let result = try run(["io": mock.io, "approve": planned.plan.token, "report": fn { args in reports.append(.spread(["stage": Engine.Receipts.arg(args, 0)], Engine.Receipts.arg(args, 2))); return .undefined }])
+        fs = NodeFS()
+        eq(result.recoveryRequired, .undefined, "\(label) \(result.reason)")
+        eq(result.ok, Value(transient), "\(label) \(JSON.text(result.summary))")
+        eq(result.complete, Value(transient), label)
+        eq(attempts[failedIds[0]], 2, label)
+        eq(attempts[other], transient && !family ? 1 : 2, label)
+        eq(reports.filter { $0.stage == "recovery" }.count, 1, label)
+        eq(result.receipt.finalizing, false)
+        eq(result.receipt.pending, nil)
+        eq(result.receipt.held.length, 0)
+        ok(!exists("\(result.file.str).journal"), label)
+        let unmoved: [String] = transient ? [] : tf.map { [SOURCE, $0.run, $0.second, other] } ?? [SOURCE, other]
+        deq(result.receipt.sessions.map { $0.id }.sorted(), .strings(ids.filter { !unmoved.contains($0) }.sorted(by: utf16Less)), label)
+        deq(result.summary.notMoved.map { $0.id }.sorted(), .strings(unmoved.sorted(by: utf16Less)), label)
+        if transient { deq(result.receipt.failed, [], label); ok(!result.receipt.localStopped.truthy, label) }
+        let counts = reports.filter { $0.stage == "sessions" }
+        let total = ids.count - (resume && family ? 1 : 0)
+        eq(planned.plan.remainingCount, Value(total), label)
+        ok(!counts.isEmpty && counts.allSatisfy { $0.sessionTotal == Value(total) }, JSON.text(Value(counts)))
+        eq(counts.last?.remainingCount ?? .undefined, Value(result.summary.notMoved.length), label)
+        #expect(mock.calls == ["/usr/bin/osascript", "/usr/bin/open"], "\(label)")
+        if resume { eq(result.file, first.file, label) }
+        if !transient {
+            let snapshot = try fixtureSnapshot(h), published = attempts
+            for _ in 0..<2 {
+                let output = cli(h.root, ["accounts", "--json"]) { processSetup(list: "", commands: "") }
+                let rows = lines(output.stdout)[0].filter { $0.pending.truthy }
+                deq(rows.map { [$0.account, $0.pending, $0.pendingCount, $0.pendingAction] }, [[Value(h.acct.P), "partial", Value(unmoved.count), "blocked"]], label)
+                let pending = try finishWorkflow(h.paths, ["processes": []])
+                eq(pending.summary.notMoved.length, unmoved.count, label)
+                deq(try fixtureSnapshot(h), snapshot, label)
+            }
+            #expect(attempts == published)
+            let kept = try keepLocal(h.paths)
+            eq(kept.ok, true, label)
+            eq(kept.complete, true, label)
+            eq(kept.summary.notMoved.length, unmoved.count, label)
+        }
+        ok(try undo(h.paths, ["processes": []]).dest, label)
+        let after = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
+        if let tf {
+            for file in [tf.sourceFile, tf.targetFile] { before.removeKey(file); after.removeKey(file) }
+            deq(try readJSON(tf.sourceFile), tf.sourceRegistry, label)
+            deq(try readJSON(tf.targetFile), tf.targetRegistry, label)
+        }
+        deq(after, before, label)
     }
 
     @Test("retirement recovery unwinds unfinished copies and isolates the exact dependency unit")
@@ -516,86 +520,90 @@ extension Engine.Receipts {
         for shape in ["ordinary", "parent", "task", "boundary"] {
             for resume in [false, true] {
                 for transient in shape == "boundary" ? [true] : [true, false] {
-                    let label = "\(shape)/\(resume)/\(transient)"
-                    let family = shape == "task" || shape == "boundary"
-                    let tf: TaskFamily? = family ? try taskFamilyFixture() : nil
-                    let h: Home = try tf ?? home()
-                    let other = id(710), child = id(711), cold = id(720)
-                    let failed: String? = shape == "task" ? tf!.run : shape == "boundary" ? nil : other
-                    var ids: [String]
-                    if let tf {
-                        try h.write(other, [entry("user", 810, nil, other)])
-                        try h.record("P", other, rehomeRecord(shape == "task" ? ["scheduledTaskId": "independent"] : [:]))
-                        if shape == "task" {
-                            tf.sourceRegistry.scheduledTasks = tf.tasks.concat([["id": "independent", "enabled": true]])
-                            try writeJSON(tf.sourceFile, tf.sourceRegistry)
-                        }
-                        ids = [SOURCE, tf.run, tf.second, tf.cold, other]
-                    } else {
-                        ids = [SOURCE, other] + (shape == "parent" ? [child] : []) + (resume ? [cold] : [])
-                        for (index, sid) in ids.enumerated() {
-                            try h.write(sid, [entry("user", 810 + index, nil, sid)])
-                            try h.record("P", sid, rehomeRecord(sid == child ? ["forkedFromSessionId": Value("local_\(other)")] : [:]))
-                        }
-                    }
-                    let mock = taskHarness(shape == "task" ? [desktopFixture()[0]] : desktopFixture(other))
-                    if !family { mock.rows[1].ids = .strings(ids.filter { $0 != cold }) }
-                    let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
-                    let before = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
-                    let seed: Value = resume ? try executeMove([from], to, h.paths, ["io": mock.io, "moveOnly": true]) : nil
-                    let run = { (options: Value) throws -> Value in resume ? try finishWorkflow(h.paths, options) : try executeMove([from], to, h.paths, options) }
-                    let planned = try run(["io": mock.io])
-                    var reports: [Value] = [], refusals = 0, stalled = false
-                    let inspect = mock.io.inspect
-                    mock.io.inspect = fn { _ in
-                        if shape == "boundary" && !stalled && reports.last?.stage == "sessions" && reports.contains(where: { $0.stage == "move" && $0.completed.truthy && !$0.preparatory.truthy }) {
-                            stalled = true
-                            mock.time += 61_000
-                        }
-                        return try inspect.call()
-                    }
-                    let rename = fs.rename
-                    fs.rename = { a, b in
-                        if let failed, a == h.recordFile("P", failed) {
-                            refusals += 1
-                            if refusals == 1 || !transient { throw JSError("Synthetic retirement refusal \(failed)") }
-                        }
-                        try rename(a, b)
-                    }
-                    let result = try run(["io": mock.io, "approve": planned.plan.token, "report": fn { args in reports.append(.spread(["stage": Engine.Receipts.arg(args, 0)], Engine.Receipts.arg(args, 2))); return .undefined }])
-                    fs = NodeFS()
-                    eq(result.recoveryRequired, .undefined, "\(label) \(result.reason)")
-                    eq(result.ok, Value(transient), "\(label) \(JSON.text(result.summary))")
-                    eq(result.complete, Value(transient), label)
-                    #expect(refusals == (shape == "boundary" ? 0 : 2), "\(label)")
-                    #expect(stalled == (shape == "boundary"), "\(label)")
-                    eq(reports.filter { $0.stage == "recovery" }.count, 1, label)
-                    let notMoved: [String] = transient ? [] : shape == "task" ? [SOURCE, tf!.run, tf!.second] : shape == "parent" ? [other, child] : [other]
-                    eq(result.summary.moved, Value(ids.count - notMoved.count), label)
-                    deq(result.summary.notMoved.map { $0.id }.sorted(), .strings(notMoved.sorted(by: utf16Less)), label)
-                    deq(result.receipt.sessions.map { $0.id }.sorted(), .strings(ids.filter { !notMoved.contains($0) }.sorted(by: utf16Less)), label)
-                    eq(result.receipt.finalizing, false)
-                    eq(result.receipt.retiring, nil)
-                    eq(result.receipt.held.length, 0)
-                    if resume { eq(result.file, seed.file, label) }
-                    for sid in ids {
-                        eq(exists(h.recordFile("P", sid)), notMoved.contains(sid), "\(label)/\(sid)")
-                        eq(exists(h.recordFile("T", sid)), !notMoved.contains(sid), "\(label)/\(sid)")
-                    }
-                    eq(reports.filter { $0.stage == "sessions" }.last?.remainingCount ?? .undefined, Value(notMoved.count), label)
-                    #expect(mock.calls == ["/usr/bin/osascript", "/usr/bin/open"], "\(label)")
-                    if !transient { eq(try keepLocal(h.paths).complete, true, label) }
-                    ok(try undo(h.paths, ["processes": []]).dest, label)
-                    let after = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
-                    if let tf {
-                        for file in [tf.sourceFile, tf.targetFile] { before.removeKey(file); after.removeKey(file) }
-                        deq(try readJSON(tf.sourceFile), tf.sourceRegistry, label)
-                        deq(try readJSON(tf.targetFile), tf.targetRegistry, label)
-                    }
-                    deq(after, before, label)
+                    try retirementCase(shape: shape, resume: resume, transient: transient)
                 }
             }
         }
+    }
+
+    func retirementCase(shape: String, resume: Bool, transient: Bool) throws {
+        let label = "\(shape)/\(resume)/\(transient)"
+        let family = shape == "task" || shape == "boundary"
+        let tf: TaskFamily? = family ? try taskFamilyFixture() : nil
+        let h: Home = try tf ?? home()
+        let other = id(710), child = id(711), cold = id(720)
+        let failed: String? = shape == "task" ? tf!.run : shape == "boundary" ? nil : other
+        var ids: [String]
+        if let tf {
+            try h.write(other, [entry("user", 810, nil, other)])
+            try h.record("P", other, rehomeRecord(shape == "task" ? ["scheduledTaskId": "independent"] : [:]))
+            if shape == "task" {
+                tf.sourceRegistry.scheduledTasks = tf.tasks.concat([["id": "independent", "enabled": true]])
+                try writeJSON(tf.sourceFile, tf.sourceRegistry)
+            }
+            ids = [SOURCE, tf.run, tf.second, tf.cold, other]
+        } else {
+            ids = [SOURCE, other] + (shape == "parent" ? [child] : []) + (resume ? [cold] : [])
+            for (index, sid) in ids.enumerated() {
+                try h.write(sid, [entry("user", 810 + index, nil, sid)])
+                try h.record("P", sid, rehomeRecord(sid == child ? ["forkedFromSessionId": Value("local_\(other)")] : [:]))
+            }
+        }
+        let mock = taskHarness(shape == "task" ? [desktopFixture()[0]] : desktopFixture(other))
+        if !family { mock.rows[1].ids = .strings(ids.filter { $0 != cold }) }
+        let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
+        let before = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
+        let seed: Value = resume ? try executeMove([from], to, h.paths, ["io": mock.io, "moveOnly": true]) : nil
+        let run = { (options: Value) throws -> Value in resume ? try finishWorkflow(h.paths, options) : try executeMove([from], to, h.paths, options) }
+        let planned = try run(["io": mock.io])
+        var reports: [Value] = [], refusals = 0, stalled = false
+        let inspect = mock.io.inspect
+        mock.io.inspect = fn { _ in
+            if shape == "boundary" && !stalled && reports.last?.stage == "sessions" && reports.contains(where: { $0.stage == "move" && $0.completed.truthy && !$0.preparatory.truthy }) {
+                stalled = true
+                mock.time += 61_000
+            }
+            return try inspect.call()
+        }
+        let rename = fs.rename
+        fs.rename = { a, b in
+            if let failed, a == h.recordFile("P", failed) {
+                refusals += 1
+                if refusals == 1 || !transient { throw JSError("Synthetic retirement refusal \(failed)") }
+            }
+            try rename(a, b)
+        }
+        let result = try run(["io": mock.io, "approve": planned.plan.token, "report": fn { args in reports.append(.spread(["stage": Engine.Receipts.arg(args, 0)], Engine.Receipts.arg(args, 2))); return .undefined }])
+        fs = NodeFS()
+        eq(result.recoveryRequired, .undefined, "\(label) \(result.reason)")
+        eq(result.ok, Value(transient), "\(label) \(JSON.text(result.summary))")
+        eq(result.complete, Value(transient), label)
+        #expect(refusals == (shape == "boundary" ? 0 : 2), "\(label)")
+        #expect(stalled == (shape == "boundary"), "\(label)")
+        eq(reports.filter { $0.stage == "recovery" }.count, 1, label)
+        let notMoved: [String] = transient ? [] : shape == "task" ? [SOURCE, tf!.run, tf!.second] : shape == "parent" ? [other, child] : [other]
+        eq(result.summary.moved, Value(ids.count - notMoved.count), label)
+        deq(result.summary.notMoved.map { $0.id }.sorted(), .strings(notMoved.sorted(by: utf16Less)), label)
+        deq(result.receipt.sessions.map { $0.id }.sorted(), .strings(ids.filter { !notMoved.contains($0) }.sorted(by: utf16Less)), label)
+        eq(result.receipt.finalizing, false)
+        eq(result.receipt.retiring, nil)
+        eq(result.receipt.held.length, 0)
+        if resume { eq(result.file, seed.file, label) }
+        for sid in ids {
+            eq(exists(h.recordFile("P", sid)), notMoved.contains(sid), "\(label)/\(sid)")
+            eq(exists(h.recordFile("T", sid)), !notMoved.contains(sid), "\(label)/\(sid)")
+        }
+        eq(reports.filter { $0.stage == "sessions" }.last?.remainingCount ?? .undefined, Value(notMoved.count), label)
+        #expect(mock.calls == ["/usr/bin/osascript", "/usr/bin/open"], "\(label)")
+        if !transient { eq(try keepLocal(h.paths).complete, true, label) }
+        ok(try undo(h.paths, ["processes": []]).dest, label)
+        let after = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
+        if let tf {
+            for file in [tf.sourceFile, tf.targetFile] { before.removeKey(file); after.removeKey(file) }
+            deq(try readJSON(tf.sourceFile), tf.sourceRegistry, label)
+            deq(try readJSON(tf.targetFile), tf.targetRegistry, label)
+        }
+        deq(after, before, label)
     }
 
     @Test("failed retirement restoration retains its journal and cannot continue independent writes")
