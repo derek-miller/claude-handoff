@@ -318,6 +318,7 @@ final class Model: ObservableObject {
     @Published var detailsExpanded = false
     @Published var note = ""
     @Published var tidying = false
+    @Published var removing: String?
     @Published var completion: (summary: String, detail: String)?
     @Published var badge = ""
     @Published var symbol = "arrow.left.arrow.right"
@@ -340,6 +341,7 @@ final class Model: ObservableObject {
     let demo: Bool
     private let config: Config?
     private var refreshing = false
+    private var refreshAgain = false
     private var pendingResult = false
     private var pendingPlan: Event?
     private var operationArgs: [String] = []
@@ -378,7 +380,7 @@ final class Model: ObservableObject {
         refresh()
         poller = Timer.publish(every: 15, on: .main, in: .common).autoconnect().sink { [weak self] _ in
             guard let self, !self.running, !self.sweeping else { return }
-            self.refresh()
+            self.refresh(queue: false)
         }
         progressTimer = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect().sink { [weak self] _ in
             guard let self, self.running else { return }
@@ -695,13 +697,16 @@ final class Model: ObservableObject {
         recoveryBlocked = false
     }
 
-    func refresh() {
-        guard !refreshing, !running, !sweeping else { return }
+    func refresh(queue: Bool = true) {
+        if refreshing || sweeping { refreshAgain = refreshAgain || queue; return }
+        guard !running else { return }
         refreshing = true
         var text = ""
         run(["accounts", "--json"], line: { text += $0 }) { [weak self] status, _ in
             guard let self else { return }
             refreshing = false
+            // A scan that started before a change reports the old state, so a refresh asked for meanwhile runs again.
+            if refreshAgain { refreshAgain = false; refresh(); return }
             guard status == 0, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             recoveryBlocked = list.contains { $0.recoveryProblem != nil }
@@ -770,10 +775,14 @@ final class Model: ObservableObject {
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn, canRemove(account) else { return }
         tidying = true
+        removing = account.id
+        note = "Removing \(account.label)…"
         var text = ""
         run(["tidy", "--pair", "\(account.account)/\(account.org)", "--json"], line: { text += $0 }) { [weak self] status, error in
             guard let self else { return }
             tidying = false
+            removing = nil
+            if status == 0 { accounts.removeAll { $0.id == account.id } }
             note = status == 0 ? "Removed \(account.label)." : error.isEmpty ? "Could not remove \(account.label)." : error
             from.remove(account.id)
             if to == account.id { to = nil }
@@ -1081,6 +1090,7 @@ final class Model: ObservableObject {
                     queued = nil
                     next()
                 }
+                if refreshAgain { refreshAgain = false; refresh() }
             }
             if result?.code == "LOCK_BUSY" { return }
             let problem = result?.error.flatMap { $0.isEmpty ? nil : $0 } ?? (status != 0 || result?.ok != true ? (error.isEmpty ? "Background check did not complete" : error) : nil)
@@ -1256,47 +1266,94 @@ final class Model: ObservableObject {
     }
 }
 
-// MenuBarExtra keeps a resized window's bottom edge, so a panel whose content changes height slides away from the
-// menu bar, even while it is closed, and reopens wherever it was left. This keeps the top edge a fixed gap below the
-// status item. The gap is learned from the system's own placement: drift only ever widens it, so the smallest seen wins.
-struct MenuBarPin: NSViewRepresentable {
-    final class Pin: NSView {
-        private static var gap: CGFloat?
-        private var observers: [NSObjectProtocol] = []
+// The panel is our own window rather than MenuBarExtra's: MenuBarExtra keeps a resized window's bottom edge, so the
+// panel slid away from the menu bar whenever its content changed height, and pinning its top fought its own sizing.
+@MainActor
+final class StatusPanel: NSObject {
+    static let shared = StatusPanel()
 
-        private static func menuBarBottom(for window: NSWindow) -> CGFloat? {
-            NSApp.windows.first { $0.className.contains("StatusBarWindow") && $0.isVisible }?.frame.minY ?? window.screen?.visibleFrame.maxY
+    private final class Window: NSPanel {
+        var top: CGFloat?
+        override var canBecomeKey: Bool { true }
+        override func cancelOperation(_ sender: Any?) { StatusPanel.shared.hide() }
+        override func setFrame(_ frameRect: NSRect, display flag: Bool) {
+            var frame = frameRect
+            if let top { frame.origin.y = top - frame.height }
+            super.setFrame(frame, display: flag)
         }
-
-        private static func place(_ window: NSWindow, learn: Bool) {
-            guard let bottom = menuBarBottom(for: window) else { return }
-            let observed = bottom - window.frame.maxY
-            if learn, observed >= 0 { gap = min(gap ?? observed, observed) }
-            guard let gap, abs(observed - gap) > 0.5 else { return }
-            window.setFrameTopLeftPoint(NSPoint(x: window.frame.minX, y: bottom - gap))
-        }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            observers.forEach { NotificationCenter.default.removeObserver($0) }
-            observers = []
-            guard let window else { return }
-            let center = NotificationCenter.default
-            observers.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { _ in
-                Pin.place(window, learn: true)
-            })
-            for name in [NSWindow.didResizeNotification, NSWindow.didMoveNotification] {
-                observers.append(center.addObserver(forName: name, object: window, queue: .main) { _ in
-                    Pin.place(window, learn: false)
-                })
-            }
-        }
-
-        deinit { observers.forEach { NotificationCenter.default.removeObserver($0) } }
     }
 
-    func makeNSView(context: Context) -> NSView { Pin() }
-    func updateNSView(_ nsView: NSView, context: Context) {}
+    private var item: NSStatusItem?
+    private var window: Window?
+    private var model: Model?
+    private var watch: AnyCancellable?
+
+    func install(_ model: Model) {
+        self.model = model
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.target = self
+        item.button?.action = #selector(toggle)
+        self.item = item
+        let host = NSHostingController(rootView: AnyView(Panel().environmentObject(model)
+            .environment(\.controlActiveState, .key).environment(\.colorScheme, .dark)))
+        host.sizingOptions = [.preferredContentSize]
+        host.view.wantsLayer = true
+        host.view.layer?.cornerRadius = 10
+        host.view.layer?.masksToBounds = true
+        let window = Window(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        window.contentViewController = host
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.level = .popUpMenu
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isReleasedWhenClosed = false
+        self.window = window
+        NotificationCenter.default.addObserver(self, selector: #selector(resigned), name: NSWindow.didResignKeyNotification, object: window)
+        watch = model.objectWillChange.sink { [weak self] _ in DispatchQueue.main.async { self?.label() } }
+        label()
+    }
+
+    private func label() {
+        guard let model, let button = item?.button else { return }
+        let view = MenuLabel(symbol: model.recoveryProblem == nil ? model.symbol : "exclamationmark.triangle", badge: model.recoveryProblem == nil ? model.badge : "")
+        button.image = view.image
+        button.toolTip = model.tooltip
+        button.setAccessibilityLabel(view.badge.isEmpty ? "Claude Handoff" : view.badge + " complete")
+    }
+
+    @objc private func toggle() {
+        if window?.isVisible == true { hide() } else { show() }
+    }
+
+    private func show() {
+        guard let window, let button = item?.button, let host = button.window else { return }
+        let anchor = host.convertToScreen(button.convert(button.bounds, to: nil))
+        let visible = (host.screen ?? NSScreen.main)?.visibleFrame ?? anchor
+        let size = window.contentViewController?.view.fittingSize ?? window.frame.size
+        let x = min(max(anchor.midX - size.width / 2, visible.minX + 8), visible.maxX - size.width - 8)
+        window.top = anchor.minY - 4
+        window.setFrame(NSRect(x: x, y: 0, width: size.width, height: size.height), display: true)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        button.highlight(true)
+        model?.panelVisibility(true)
+    }
+
+    func hide() {
+        guard let window, window.isVisible else { return }
+        window.orderOut(nil)
+        item?.button?.highlight(false)
+        model?.panelVisibility(false)
+    }
+
+    // An alert the panel opens takes key without the user leaving, so only hide once focus has gone elsewhere.
+    @objc private func resigned() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window, !window.isKeyWindow else { return }
+            if !NSApp.isActive || NSApp.keyWindow == nil { self.hide() }
+        }
+    }
 }
 
 extension View {
@@ -1319,6 +1376,7 @@ struct Row: View {
     let muted: Bool
     var tag: String? = nil
     var onRemove: (() -> Void)? = nil
+    var removing = false
     let action: () -> Void
     var tagLabels: [String] { [account.active == true ? "active" : nil, radio ? nil : tag].compactMap { $0 } }
 
@@ -1343,7 +1401,9 @@ struct Row: View {
         .buttonStyle(.plain)
         .opacity(muted ? 0.35 : 1)
         .overlay(alignment: .trailing) {
-            if let onRemove {
+            if removing {
+                ProgressView().controlSize(.small).help("Removing this account")
+            } else if let onRemove {
                 Button(action: onRemove) { Image(systemName: "xmark.circle").font(.system(size: 13)) }
                     .buttonStyle(.plain).foregroundStyle(.secondary).focusable(false)
                     .help("Remove this account; it holds no sessions")
@@ -1568,14 +1628,8 @@ struct Panel: View {
         .padding(16)
         .frame(width: panelWidth)
         .background(Color(white: 0.11))
-        .background(MenuBarPin())
         .withoutFocusRings()
         .animation(.easeOut(duration: 0.18), value: model.visibleCompletion?.summary)
-        .onAppear { if !model.snapshot { model.panelVisibility(true) } }
-        .onDisappear { if !model.snapshot { model.panelVisibility(false) } }
-        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didChangeOcclusionStateNotification)) { note in
-            if !model.snapshot, let window = note.object as? NSWindow { model.panelVisibility(window.occlusionState.contains(.visible)) }
-        }
     }
 
     @ViewBuilder private var accountBoard: some View {
@@ -1593,7 +1647,7 @@ struct Panel: View {
             column("From") {
                 ForEach(model.visibleAccounts) { account in
                     Row(account: account, radio: false, selected: model.from.contains(account.id), muted: !model.canSource(account), tag: model.sourceTag(account),
-                        onRemove: model.canRemove(account) ? { model.remove(account) } : nil) { model.toggle(account.id) }
+                        onRemove: model.canRemove(account) ? { model.remove(account) } : nil, removing: model.removing == account.id) { model.toggle(account.id) }
                 }
             }
             .frame(width: width, alignment: .leading)
@@ -1791,38 +1845,39 @@ struct MenuLabel: View {
 }
 
 @main
-struct HandoffApp: App {
-    @StateObject private var model: Model
+enum Main {
+    @MainActor static func main() {
+        let app = NSApplication.shared
+        let delegate = HandoffApp()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        withExtendedLifetime(delegate) { app.run() }
+    }
+}
 
-    init() {
+@MainActor
+final class HandoffApp: NSObject, NSApplicationDelegate {
+    private var model: Model?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
         let args = CommandLine.arguments
         if let index = args.firstIndex(of: "--demo"), index + 1 < args.count {
             let model = Model(demo: Demo.accounts)
-            _model = StateObject(wrappedValue: model)
+            self.model = model
             let directory = args[index + 1]
             DispatchQueue.main.async { Demo.play(model, into: directory) }
         } else if let index = args.firstIndex(of: "--snapshot"), index + 1 < args.count {
             let value = { (flag: String) in args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
-            let supplied = value("--engine").map { Config(engine: $0) }
-            let model = Model(snapshot: true, config: supplied)
-            _model = StateObject(wrappedValue: model)
+            let model = Model(snapshot: true, config: value("--engine").map { Config(engine: $0) })
+            self.model = model
             let file = args[index + 1]
             DispatchQueue.main.async { Snapshot.write(model, to: file) }
         } else {
             Installation.prepare()
             let model = Model()
+            self.model = model
             Updates.shared.start(busy: { [weak model] in model?.updatesBlocked ?? false })
-            _model = StateObject(wrappedValue: model)
+            StatusPanel.shared.install(model)
         }
-    }
-
-    var body: some Scene {
-        MenuBarExtra {
-            Panel().environmentObject(model).environment(\.controlActiveState, .key).environment(\.colorScheme, .dark)
-        } label: {
-            MenuLabel(symbol: model.recoveryProblem == nil ? model.symbol : "exclamationmark.triangle", badge: model.recoveryProblem == nil ? model.badge : "")
-                .help(model.tooltip)
-        }
-        .menuBarExtraStyle(.window)
     }
 }
