@@ -1369,16 +1369,26 @@ public func tidy(_ paths: Value = .undefined, _ pair: Value = .null) throws -> V
         if !dirs.allSatisfy(holdsNothing) { throw JSError("\(row["label"]) still holds scheduled tasks or other files", code: "ACCOUNT_NOT_EMPTY") }
         rows = [row]
     }
+    let claude = path.dirname(paths["records"].description)
+    // A session moved to another account keeps working in the scratch folder it started in.
+    let working = all.elements.flatMap { row in row["sessions"].elements.flatMap { [$0["cwd"], $0["record"]["originCwd"]] } }
+        .compactMap { $0.asString }.filter { !$0.isEmpty }
     var moved: [Value] = []
     for row in rows {
         let account = row["account"].description, org = row["org"].description
         let dirs = [("claude-code-sessions", paths["records"]), ("local-agent-mode-sessions", paths["agentSessions"])].map { ($0.0, path.join($0.1.description, account, org)) }
         if !dirs.allSatisfy({ holdsNothing($0.1) }) { continue }
-        for (tree, dir) in dirs where fs.exists(dir) {
-            try fs.mkdirp(path.join(dest, tree, account))
-            try fs.rename(dir, path.join(dest, tree, account, org))
+        let scratch = path.join(claude, "scratch-workspaces", account, org)
+        let scratchKept = working.contains { $0 == scratch || $0.hasPrefix(scratch + path.sep) } && fs.exists(scratch)
+        let caches = [("plugin-list", path.join(claude, "plugin-list", account, org)), ("skills-plugin", path.join(paths["agentSessions"].description, "skills-plugin", org, account))]
+        for (tree, dir) in dirs + caches + (scratchKept ? [] : [("scratch-workspaces", scratch)]) where fs.exists(dir) {
+            let parent = path.basename(path.dirname(dir))
+            try fs.mkdirp(path.join(dest, tree, parent))
+            try fs.rename(dir, path.join(dest, tree, parent, path.basename(dir)))
         }
-        moved.append(["account": row["account"], "org": row["org"], "label": row["label"]])
+        var entry: Value = ["account": row["account"], "org": row["org"], "label": row["label"]]
+        if scratchKept { entry = Value.spread(entry, ["scratchKept": .string(scratch)]) }
+        moved.append(entry)
     }
     return ["ok": true, "moved": Value(moved), "dest": moved.isEmpty ? .null : .string(dest)]
 }

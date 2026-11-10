@@ -1431,16 +1431,22 @@ export async function tidy(paths, pair = null) {
     if (!(await Promise.all(dirs.map(holdsNothing))).every(Boolean)) fail(`${row.label} still holds scheduled tasks or other files`, 'ACCOUNT_NOT_EMPTY')
     rows = [row]
   }
+  const claude = path.dirname(paths.records)
+  // A session moved to another account keeps working in the scratch folder it started in.
+  const working = all.flatMap((row) => row.sessions.flatMap((s) => [s.cwd, s.record.originCwd])).filter((cwd) => typeof cwd === 'string' && cwd)
   const moved = []
   for (const row of rows) {
     const dirs = [['claude-code-sessions', paths.records], ['local-agent-mode-sessions', paths.agentSessions]].map(([tree, root]) => [tree, path.join(root, row.account, row.org)])
     if (!(await Promise.all(dirs.map(([, dir]) => holdsNothing(dir)))).every(Boolean)) continue
-    for (const [tree, dir] of dirs) {
+    const scratch = path.join(claude, 'scratch-workspaces', row.account, row.org)
+    const scratchKept = working.some((cwd) => cwd === scratch || cwd.startsWith(scratch + path.sep)) && await exists(scratch)
+    const caches = [['plugin-list', path.join(claude, 'plugin-list', row.account, row.org)], ['skills-plugin', path.join(paths.agentSessions, 'skills-plugin', row.org, row.account)]]
+    for (const [tree, dir] of [...dirs, ...caches, ...scratchKept ? [] : [['scratch-workspaces', scratch]]]) {
       if (!await exists(dir)) continue
-      await mkdir(path.join(dest, tree, row.account), { recursive: true })
-      await rename(dir, path.join(dest, tree, row.account, row.org))
+      await mkdir(path.join(dest, tree, path.basename(path.dirname(dir))), { recursive: true })
+      await rename(dir, path.join(dest, tree, path.basename(path.dirname(dir)), path.basename(dir)))
     }
-    moved.push({ account: row.account, org: row.org, label: row.label })
+    moved.push({ account: row.account, org: row.org, label: row.label, ...scratchKept && { scratchKept: scratch } })
   }
   return { ok: true, moved, dest: moved.length ? dest : null }
 }
@@ -5467,7 +5473,9 @@ async function main(argv) {
   if (args.cmd === 'tidy') {
     const result = await locked(paths, () => tidy(paths, args.pair))
     if (args.json) return emit(result)
-    return out.write(result.moved.length ? `${quantity(result.moved.length, 'leftover folder', 'leftover folders')} set aside | ${result.dest}\n` : 'no leftover folders\n')
+    out.write(result.moved.length ? `${quantity(result.moved.length, 'leftover folder', 'leftover folders')} set aside | ${result.dest}\n` : 'no leftover folders\n')
+    for (const row of result.moved) if (row.scratchKept) out.write(`kept ${row.scratchKept} | a session still works there\n`)
+    return
   }
   if (args.cmd === 'sweep') {
     const result = await sweep(paths, { report: args.json ? reporter(true) : undefined })
