@@ -20,9 +20,10 @@ jobs:
       - name: Version from tag
         run: |
           v="${GITHUB_REF_NAME#v}"
-          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must look like v1.2.3"; exit 1; }
+          [[ "$v" =~ ^([0-9]+)\.([0-9]{1,2})\.([0-9]{1,2})$ ]] || { echo "tag must look like v1.2.3, minor and patch under 100"; exit 1; }
           echo "VERSION=$v" >> "$GITHUB_ENV"
-          echo "BUILD=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+          # Sparkle orders updates by this number, so it must rise with every release.
+          echo "BUILD=$(( BASH_REMATCH[1] * 10000 + 10#${BASH_REMATCH[2]} * 100 + 10#${BASH_REMATCH[3]} ))" >> "$GITHUB_ENV"
       - name: Tests
         run: swift test
       - name: Import Developer ID certificate
