@@ -70,19 +70,22 @@ jobs:
       - name: Appcast
         env:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          gh api "repos/${{ github.repository }}/releases/generate-notes" -f tag_name="$GITHUB_REF_NAME" --jq .body > dist/notes.md
           dmg="dist/Claude-Handoff-$VERSION.dmg"
           sign_update="$(find .build/artifacts -name sign_update -type f -perm +111 | head -1)"
           signature="$(echo "$SPARKLE_ED_PRIVATE_KEY" | "$sign_update" --ed-key-file - "$dmg")"
           url="https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/$(basename "$dmg")"
-          scripts/appcast.sh "$VERSION" "$BUILD" "$url" "$signature" > dist/appcast.xml
+          release="https://github.com/${{ github.repository }}/releases/tag/$GITHUB_REF_NAME"
+          scripts/appcast.sh "$VERSION" "$BUILD" "$url" "$signature" dist/notes.md "$release" > dist/appcast.xml
           cat dist/appcast.xml
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" "dist/Claude-Handoff-$VERSION.dmg" dist/appcast.xml \
-            --title "Claude Handoff $VERSION" --generate-notes --verify-tag
+            --title "Claude Handoff $VERSION" --notes-file dist/notes.md --verify-tag
       - name: Clean up keychain
         if: always()
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
