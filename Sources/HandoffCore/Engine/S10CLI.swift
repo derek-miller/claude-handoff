@@ -164,7 +164,9 @@ public func main(_ argv: [String]) throws {
     if args.cmd === "tidy" {
         let result = try locked(paths, Value { _ in try tidy(paths, args.pair) })
         if args.json.truthy { return emit(result) }
-        return write(result.moved.length > 0 ? "\(quantity(result.moved.length, "leftover folder", "leftover folders")) set aside | \(result.dest)\n" : "no leftover folders\n")
+        write(result.moved.length > 0 ? "\(quantity(result.moved.length, "leftover folder", "leftover folders")) set aside | \(result.dest)\n" : "no leftover folders\n")
+        for row in result.moved.elements where row["scratchKept"].truthy { write("kept \(row["scratchKept"]) | a session still works there\n") }
+        return
     }
     if args.cmd === "sweep" {
         let result = try sweep(paths, ["report": args.json.truthy ? try reporter(true) : .undefined])

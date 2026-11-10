@@ -2781,6 +2781,35 @@ test('tidy sets aside only empty folders Desktop left for another login personal
   assert.equal(await exists(path.join(h.paths.records, guest, team)), true)
 })
 
+test('tidy clears an emptied account from every Desktop folder but a scratch folder a session still uses', async () => {
+  const h = await home()
+  const exists = (file) => stat(file).then(() => true, () => false)
+  const claude = path.dirname(h.paths.records)
+  const [owner, gone, moved] = [id(960), id(961), id(962)]
+  const [ownerOrg, goneOrg, movedOrg] = [id(970), id(971), id(972)]
+  const folders = (account, org) => [path.join(h.paths.records, account, org), path.join(h.paths.agentSessions, account, org), path.join(claude, 'plugin-list', account, org),
+    path.join(h.paths.agentSessions, 'skills-plugin', org, account), path.join(claude, 'scratch-workspaces', account, org, 'scratch-1')]
+  for (const [account, org] of [[gone, goneOrg], [moved, movedOrg]]) {
+    for (const dir of folders(account, org)) await mkdir(dir, { recursive: true })
+    await writeFile(path.join(claude, 'plugin-list', account, org, 'plugins.json'), '[]')
+  }
+  const used = path.join(claude, 'scratch-workspaces', moved, movedOrg, 'scratch-1')
+  await mkdir(path.join(h.paths.records, owner, ownerOrg), { recursive: true })
+  await writeFile(path.join(h.paths.records, owner, ownerOrg, `local_${id(980)}.json`), JSON.stringify({ sessionId: `local_${id(980)}`, cliSessionId: id(980), cwd: used, title: 'Moved', lastActivityAt: 2 }))
+
+  const first = await tidy(h.paths, { account: gone, org: goneOrg })
+  assert.equal(first.moved[0].scratchKept, undefined)
+  for (const dir of folders(gone, goneOrg)) assert.equal(await exists(dir), false)
+  assert.equal(await exists(path.join(first.dest, 'plugin-list', gone, goneOrg, 'plugins.json')), true)
+  assert.equal(await exists(path.join(first.dest, 'skills-plugin', goneOrg, gone)), true)
+  assert.equal(await exists(path.join(first.dest, 'scratch-workspaces', gone, goneOrg, 'scratch-1')), true)
+
+  const second = await tidy(h.paths, { account: moved, org: movedOrg })
+  assert.equal(second.moved[0].scratchKept, path.join(claude, 'scratch-workspaces', moved, movedOrg))
+  assert.equal(await exists(used), true)
+  for (const dir of folders(moved, movedOrg).slice(0, 4)) assert.equal(await exists(dir), false)
+})
+
 test('accounts labels a login held in a claude-acc account directory', async () => {
   const h = await home()
   const account = id(922)
