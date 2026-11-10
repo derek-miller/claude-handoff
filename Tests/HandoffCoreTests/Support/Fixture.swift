@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import HandoffCore
 
-// The synthetic HOME and builders shared by the behaviour suite (the Node suite's home(), id(), entry()...).
+// The synthetic HOME and the record, transcript and cloud builders the behaviour suite shares.
 
 let SOURCE = "00000000-0000-4000-8000-000000000001"
 let MESSAGES: Set<String> = ["user", "assistant", "attachment", "system"]
