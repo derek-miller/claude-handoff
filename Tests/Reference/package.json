@@ -1,7 +1,7 @@
 {
   "name": "claude-handoff-reference",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Node reference engine that the Swift port is checked against.",
   "type": "module",
   "engines": { "node": ">=22" },
