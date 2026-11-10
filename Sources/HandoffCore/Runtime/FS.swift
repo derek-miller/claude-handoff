@@ -96,13 +96,14 @@ public final class FileHandle {
     public func readFile() throws -> Data { try fs.handleReadFile(self) }
     // handle.read(buffer, 0, length, position) → bytes actually read.
     public func read(length: Int, position: Int64?) throws -> Data {
-        var buf = [UInt8](repeating: 0, count: length)
-        let n = buf.withUnsafeMutableBytes { raw -> Int in
-            if let position { return pread(fd, raw.baseAddress, length, off_t(position)) }
-            return Darwin.read(fd, raw.baseAddress, length)
+        var n = 0, failure: Int32 = 0
+        let buf = [UInt8](unsafeUninitializedCapacity: length) { raw, count in
+            n = position.map { pread(fd, raw.baseAddress, length, off_t($0)) } ?? Darwin.read(fd, raw.baseAddress, length)
+            failure = errno
+            count = max(n, 0)
         }
-        if n < 0 { throw fsError(errno, "read") }
-        return Data(buf[0..<n])
+        if n < 0 { throw fsError(failure, "read") }
+        return Data(buf)
     }
     public func writeFile(_ data: Data) throws { try fs.handleWrite(self, data) }
     public func writeFile(_ text: String) throws { try writeFile(Data(text.utf8)) }
