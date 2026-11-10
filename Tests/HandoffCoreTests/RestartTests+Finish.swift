@@ -108,7 +108,7 @@ extension Engine.Restarts {
         }
         let cloud = try cloudClient(h.paths, nil, [
             "active": ["account": Value(h.acct.P), "org": Value(h.org.P), "state": "known"],
-            "cookies": .newMap([("sessionKey", "fixture"), ("lastActiveOrg", Value(h.org.T))]),
+            "cookies": .newMap([(Value("sessionKey"), Value("fixture")), (Value("lastActiveOrg"), Value(h.org.T))]),
             "userAgent": "fixture",
         ])
         let finished = try finishPending(h.paths, ["cloud": cloud])

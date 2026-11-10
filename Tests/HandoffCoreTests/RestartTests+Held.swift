@@ -3,16 +3,14 @@ import Testing
 @testable import HandoffCore
 
 extension Engine.Restarts {
-    // A callback argument, undefined when the engine passes fewer, as in JS.
+    // A callback argument, undefined when the engine passes fewer.
     static func arg(_ args: [Value], _ i: Int) -> Value { i < args.count ? args[i] : .undefined }
 
-    // all.find(row => row.account === h.acct[a]) for the source and target accounts.
     static func pair(_ h: Home, _ a: String = "P", _ b: String = "T", _ processes: Value = .undefined) throws -> (from: Value, to: Value) {
         let all = try accounts(h.paths, processes)
         return (all.find { $0.account.str == h.acct[a] }, all.find { $0.account.str == h.acct[b] })
     }
 
-    // A source session and an unrelated cold session in P.
     static func sourceAndCold(_ h: Home, _ cold: String = id(300)) throws {
         for session in [SOURCE, cold] {
             try h.write(session, [entry("user", session == SOURCE ? 1 : 300, nil, session)])

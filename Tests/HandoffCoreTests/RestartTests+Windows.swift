@@ -70,8 +70,7 @@ extension Engine.Restarts {
         }
     }
 
-    // History reads advance the clock when a transcript is opened for reading: the Swift FileHandle reads
-    // directly, so there is no per-read hook like the Node suite's handle.read patch.
+    // History reads advance the clock when a transcript is opened for reading: FileHandle.read bypasses the fs table.
     @Test("productive reads and awaited mutations can exceed both old restart windows")
     func productiveReadsAndMutations() throws {
         for phase in ["history", "publication", "retirement", "durability"] {

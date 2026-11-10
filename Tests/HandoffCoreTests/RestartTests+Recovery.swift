@@ -102,7 +102,7 @@ extension Engine.Restarts {
             var writes: [String] = []
             let saved = (fs.writeFile, fs.open, fs.rename, fs.link, fs.unlink, fs.rm)
             fs.writeFile = { p, d, flag, m in writes.append(flag.hasPrefix("a") ? "appendFile" : "writeFile"); try saved.0(p, d, flag, m) }
-            // The Swift engine opens state/lock itself to flock it; the Node engine held it in a child process.
+            // The engine opens state/lock itself to flock it.
             let lock = path.join(h.paths.state.str, "lock")
             fs.open = { p, flags, m in if Self.mutatingOpen(flags) && p != lock { writes.append("open \(p)") }; return try saved.1(p, flags, m) }
             fs.rename = { a, b in writes.append("rename"); try saved.2(a, b) }

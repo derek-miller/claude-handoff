@@ -33,7 +33,6 @@ extension Engine.Restarts {
         deq(try readJSON(h.sourceFile), h.sourceRegistry)
     }
 
-    // Not run against Swift by the parity harness: the work closure calls check synchronously.
     @Test("polling without productive work stalls without racing unfinished mutations")
     func pollingWithoutProductiveWork() throws {
         let h = try home(), mock = taskHarness(desktopFixture())
