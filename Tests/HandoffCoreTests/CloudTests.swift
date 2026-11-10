@@ -5,6 +5,19 @@ import Testing
 extension Engine {
     @Suite("cloud")
     struct Cloud {
+        // A callback argument the engine may not pass.
+        static func arg(_ args: [Value], _ i: Int) -> Value { i < args.count ? args[i] : .undefined }
+
+        // Object.fromEntries(accounts.map(a => [a.account, a])): the last row per account wins.
+        static func byAccount(_ all: Value) -> Value {
+            let out = Value.newObject()
+            for row in all.elements { out[row.account.str] = row }
+            return out
+        }
+
+        // Response.json(value) as the memory budget reads it.
+        static func json(_ value: Value) -> Value { ["body": [Value(Data(JSON.text(value).utf8))]] }
+
         // A /bin/ps line for the identity fixture's Desktop: lstart is "Fri Sep 04 18:00:00 2026".
         static func desktopListing(_ identity: IdentityFixture) -> String {
             let lstart = re(#"^(\w+ \w+ \d+) (\d+) ([\d:]+).*$"#).replace(dateString(identity.started), "$1 $3 $2")
