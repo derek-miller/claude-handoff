@@ -814,19 +814,13 @@ func logins(_ paths: Value = .undefined) throws -> Value {
     let remembered = (try? readJson(paths["labels"])) ?? Value.newObject()
     let seen = try desktopProfiles(paths["webCache"])
     let rememberedEmails = try member(remembered, "emails"), rememberedOrgs = remembered["orgs"]
+    // Live login files and Desktop's profile override what earlier runs remembered.
+    let entries = { (map: Value) in Value.fromEntries(map.asMap!.entries.map { ($0.0.description, $0.1) }) }
     let saved: Value = [
-        "emails": Value.spread(rememberedEmails, .fromEntries(seen["emails"].asMap!.entries.map { ($0.0.description, $0.1) })),
-        "orgs": Value.spread(rememberedOrgs, .fromEntries(seen["orgs"].asMap!.entries.map { ($0.0.description, $0.1) })),
+        "emails": Value.spread(rememberedEmails, entries(emails), entries(seen["emails"])),
+        "orgs": Value.spread(rememberedOrgs, entries(orgs), entries(seen["orgs"])),
     ]
     let previous: Value = ["emails": rememberedEmails ?? Value.newObject(), "orgs": rememberedOrgs ?? Value.newObject()]
-    if JSON.text(saved) != JSON.text(previous) {
-        let labels = paths["labels"].description
-        let tmp = "\(labels).\(process.pid).tmp"
-        do {
-            try fs.write(tmp, JSON.text(saved, space: 2) + "\n")
-            try fs.rename(tmp, labels)
-        } catch { try? fs.unlink(tmp) }
-    }
     for (account, email) in saved["emails"].ownEntries where UUID.test(account) { emails.put(Value(account), email) }
     for (org, name) in saved["orgs"].ownEntries where UUID.test(org) { orgs.put(Value(org), name) }
     for row in try records(paths["agentSessions"]).elements {
@@ -862,6 +856,19 @@ func logins(_ paths: Value = .undefined) throws -> Value {
             if who.contains("@") && !emails.has(account) { emails.put(Value(account), Value(who)) }
             if let team, !team.isEmpty, team != short(org), !orgs.has(org) { orgs.put(Value(org), Value(team)) }
         }
+    }
+    // Login files, agent records and receipts come and go, so keep any name they taught us.
+    for (name, learned) in [("emails", emails), ("orgs", orgs)] {
+        let kept = saved[name].asObject!
+        for (key, label) in learned.asMap!.entries where UUID.test(key.description) && !kept.has(key.description) { kept[key.description] = label }
+    }
+    if JSON.text(saved) != JSON.text(previous) {
+        let labels = paths["labels"].description
+        let tmp = "\(labels).\(process.pid).tmp"
+        do {
+            try fs.write(tmp, JSON.text(saved, space: 2) + "\n")
+            try fs.rename(tmp, labels)
+        } catch { try? fs.unlink(tmp) }
     }
     return ["emails": emails, "orgs": orgs, "pairs": pairs]
 }

@@ -3,7 +3,7 @@ import childProcess, { execFile, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import fsSync, { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import fs, { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import fs, { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
@@ -2717,6 +2717,48 @@ test('accounts includes a known login organization with no Desktop directory', a
   assert.equal(row.label, 'known@example.com · Known Team')
   assert.equal(row.sessions.length, 0)
   assert.equal(await stat(row.dir).then(() => true, () => false), false)
+})
+
+test('accounts keeps a learned name after its login file goes away', async () => {
+  const h = await home()
+  const account = id(924)
+  const org = id(925)
+  const profile = path.join(h.root, '.claude-gone')
+  await mkdir(profile)
+  await mkdir(path.join(h.paths.records, account, org), { recursive: true })
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress: 'gone@example.com', organizationName: 'Gone Team', organizationType: 'team' }
+  }))
+  await accounts(h.paths)
+  await rm(profile, { recursive: true })
+  const row = (await accounts(h.paths)).find((candidate) => candidate.account === account && candidate.org === org)
+
+  assert.equal(row.label, 'gone@example.com · Gone Team')
+  const saved = JSON.parse(await readFile(h.paths.labels, 'utf8'))
+  assert.equal(saved.emails[account], 'gone@example.com')
+  assert.equal(saved.orgs[org], 'Gone Team')
+})
+
+test('accounts follows a login file that changes its email or organization name', async () => {
+  const h = await home()
+  const account = id(926)
+  const org = id(927)
+  const profile = path.join(h.root, '.claude-rename')
+  const login = (emailAddress, organizationName) => writeFile(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress, organizationName, organizationType: 'team' }
+  }))
+  await mkdir(profile)
+  await mkdir(h.paths.state, { recursive: true })
+  await login('old@example.com', 'Old Team')
+  await accounts(h.paths)
+  await login('new@example.com', 'New Team')
+  const row = (await accounts(h.paths)).find((candidate) => candidate.account === account && candidate.org === org)
+
+  assert.equal(row.label, 'new@example.com · New Team')
+  const saved = JSON.parse(await readFile(h.paths.labels, 'utf8'))
+  assert.equal(saved.emails[account], 'new@example.com')
+  assert.equal(saved.orgs[org], 'New Team')
 })
 
 test('accounts tells apart organizations that share a name with their uuid prefix', async () => {
