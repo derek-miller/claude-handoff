@@ -42,20 +42,24 @@ extension Engine {
         @Test("process inventory handles more than one megabyte of unrelated argv")
         func megabyteArgv() throws {
             let h = try home()
+            var ready: [Pipe] = []
             let children = try (0..<9).map { _ -> Foundation.Process in
-                let child = Foundation.Process()
+                let child = Foundation.Process(), pipe = Pipe()
                 child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-                child.arguments = ["-c", "import time; time.sleep(30)", String(repeating: "x", count: 120 * 1024)]
+                child.arguments = ["-c", "import sys, time; sys.stdout.write('r'); sys.stdout.flush(); time.sleep(30)", String(repeating: "x", count: 120 * 1024)]
                 child.standardInput = FileHandle.nullDevice
-                child.standardOutput = FileHandle.nullDevice
+                child.standardOutput = pipe
                 child.standardError = FileHandle.nullDevice
                 try child.run()
+                ready.append(pipe)
                 return child
             }
             defer {
                 for child in children where child.isRunning { child.terminate() }
                 for child in children { child.waitUntilExit() }
             }
+            // /usr/bin/python3 is a shim that re-execs; ps shows no argv for a process caught mid-exec.
+            for pipe in ready { _ = pipe.fileHandleForReading.readData(ofLength: 1) }
             let listing = ChildProcess.nativeSpawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,command="], SpawnOptions(timeout: 2000, maxBuffer: 16 * 1024 * 1024))
             eq(listing.status.map { Value(Int($0)) } ?? nil, 0)
             ok(listing.stdout.utf8.count > 1024 * 1024)
