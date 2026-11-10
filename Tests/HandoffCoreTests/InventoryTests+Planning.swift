@@ -176,7 +176,6 @@ extension Engine.Inventory {
         ok(try readText(transcript).contains("message 2"))
     }
 
-    // The Swift engine's cache generation is CACHE_VERSION (1013), kept apart from Node's 13.
     @Test("corrupt and legacy planning caches refresh replay analysis")
     func corruptAndLegacyCaches() throws {
         for state in ["corrupt", "legacy"] {

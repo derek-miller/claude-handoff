@@ -81,7 +81,7 @@ extension Engine.Inventory {
         deq(try conversation([attachment, .spread(attachment, ["uuid": Value(id(8101)), "attachment": .spread(attachment.attachment, ["prompt": Value(text)])])], session), [])
     }
 
-    // The reference LCS the Node suite compares the bounded matcher against.
+    // The reference LCS the bounded matcher is checked against.
     static func referenceMatch(_ source: [Int], _ target: [Int]) -> Value {
         if source.isEmpty { return .null }
         var counts: [Int: Int] = [:]
@@ -135,8 +135,6 @@ extension Engine.Inventory {
         eq(try conversationMatch(same, Value(Array(repeating: Value("same"), count: 99) + ["other"])), nil)
     }
 
-    // Node ran this in a child process with a 15 s timeout and logged the duration; here it runs in process
-    // against the same 15 s budget.
     @Test("bounded near-order matching handles large histories without quadratic work or counter overflow")
     func boundedNearOrderMatchingLarge() throws {
         let started = Date()

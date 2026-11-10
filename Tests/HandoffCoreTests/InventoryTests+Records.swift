@@ -101,8 +101,6 @@ extension Engine.Inventory {
         eq(shaped.conflicts, 0)
     }
 
-    // Not 1:1: Node counted JSON.parse calls on message lines during verification; Swift's JSON.parse cannot be
-    // spied on, so only the outcome and the untouched transcript prefix are checked.
     @Test("bridge byte verification parses history only when inventory found metadata", arguments: ["no bridge metadata", "bridge metadata", "shared transcript records"])
     func bridgeByteVerification(mode: String) throws {
         let bridge = mode != "no bridge metadata"

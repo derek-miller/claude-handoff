@@ -19,7 +19,7 @@ extension Engine {
 
         static func names(_ dir: String) throws -> Value { .strings(try readdir(dir)) }
 
-        // Object.fromEntries(accounts.map(a => [a.account, a])): the last row per account wins.
+        // The last row per account wins.
         static func byAccount(_ h: Home, _ processes: Value = .undefined) throws -> [String: Value] {
             var out: [String: Value] = [:]
             for row in try accounts(h.paths, processes).elements { out[row.account.str] = row }
