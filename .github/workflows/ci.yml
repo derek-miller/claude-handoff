@@ -24,28 +24,14 @@ jobs:
           "$(swift build -c release --show-bin-path)/claude-handoff" --version
           "$(swift build -c release --show-bin-path)/claude-handoff" --help
   engine:
-    # The engine behaviour suite, one Swift Testing suite per runner; "other" runs any suite not listed.
+    # The engine behaviour suite in a release build, one test process per suite (scripts/test-engine.sh).
     runs-on: macos-15
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [Accounts, Moves, Inventory, Receipts, Restarts, Cloud, CLI, MenuBar, other]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Select Xcode
         run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
-      - run: swift build --build-tests
-      - name: Tests
-        env:
-          SUITE: ${{ matrix.suite }}
-          LISTED: Accounts|Moves|Inventory|Receipts|Restarts|Cloud|CLI|MenuBar
-        run: |
-          if [ "$SUITE" = other ]; then
-            swift test --skip-build --filter 'Engine/' --skip "Engine/($LISTED)/"
-          else
-            swift test --skip-build --filter "Engine/$SUITE/"
-          fi
+      - run: scripts/test-engine.sh
   parity:
     # The Node suite with every engine call served by the Swift port.
     runs-on: macos-15
