@@ -4,7 +4,7 @@ import Testing
 @testable import HandoffCore
 
 // Direct filesystem access for test setup and assertions. These bypass the engine's `fs` table, so a test
-// that patches `fs` still sees the real files, as the Node suite's own imports did.
+// that patches `fs` still sees the real files.
 
 func readData(_ file: String) throws -> Data { try NodeFS.nativeReadFile(file) }
 func readText(_ file: String) throws -> String { String(decoding: try readData(file), as: UTF8.self) }
@@ -47,7 +47,7 @@ struct CLIResult {
 }
 
 // Runs the claude-handoff CLI in process with HOME at `home`. `setup` replaces tables (child processes, fs)
-// for this run only, the way the Node suite's cli() injected setup code into a fresh process.
+// for this run only.
 func cli(_ home: String, _ args: [String], setup: () -> Void = {}) -> CLIResult {
     let saved = (fs, process, childProcess, cloudFetch)
     defer { (fs, process, childProcess, cloudFetch) = saved }

@@ -40,8 +40,7 @@ enum Sandbox {
         roots = []
     }
 
-    // Mirrors the Node suite's fixtureCommand: the login keychain is unavailable and native Desktop
-    // commands fail unless the test supplies its own.
+    // The login keychain is unavailable and native Desktop commands fail unless the test supplies its own.
     static func fixtureChildProcess() -> ChildProcess {
         let table = ChildProcess()
         table.spawnSync = { file, args, options in
