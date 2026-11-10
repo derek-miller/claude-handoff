@@ -1051,7 +1051,8 @@ async function logins(paths) {
   // Desktop only caches the signed-in account, so remember every one seen for later runs.
   const remembered = await readJson(paths.labels).catch(() => ({}))
   const seen = await desktopProfiles(paths.webCache)
-  const saved = { emails: { ...remembered.emails, ...Object.fromEntries(seen.emails) }, orgs: { ...remembered.orgs, ...Object.fromEntries(seen.orgs) } }
+  // Live login files and Desktop's profile override what earlier runs remembered.
+  const saved = { emails: { ...remembered.emails, ...Object.fromEntries(emails), ...Object.fromEntries(seen.emails) }, orgs: { ...remembered.orgs, ...Object.fromEntries(orgs), ...Object.fromEntries(seen.orgs) } }
   for (const [account, email] of Object.entries(saved.emails)) if (UUID.test(account)) emails.set(account, email)
   for (const [org, name] of Object.entries(saved.orgs)) if (UUID.test(org)) orgs.set(org, name)
   for (const { account, org, files } of await records(paths.agentSessions)) {

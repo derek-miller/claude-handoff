@@ -2740,6 +2740,27 @@ test('accounts keeps a learned name after its login file goes away', async () =>
   assert.equal(saved.orgs[org], 'Gone Team')
 })
 
+test('accounts follows a login file that changes its email or organization name', async () => {
+  const h = await home()
+  const account = id(926)
+  const org = id(927)
+  const profile = path.join(h.root, '.claude-rename')
+  const login = (emailAddress, organizationName) => writeFile(path.join(profile, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: account, organizationUuid: org, emailAddress, organizationName, organizationType: 'team' }
+  }))
+  await mkdir(profile)
+  await mkdir(h.paths.state, { recursive: true })
+  await login('old@example.com', 'Old Team')
+  await accounts(h.paths)
+  await login('new@example.com', 'New Team')
+  const row = (await accounts(h.paths)).find((candidate) => candidate.account === account && candidate.org === org)
+
+  assert.equal(row.label, 'new@example.com · New Team')
+  const saved = JSON.parse(await readFile(h.paths.labels, 'utf8'))
+  assert.equal(saved.emails[account], 'new@example.com')
+  assert.equal(saved.orgs[org], 'New Team')
+})
+
 test('accounts tells apart organizations that share a name with their uuid prefix', async () => {
   const h = await home()
   const account = id(924)

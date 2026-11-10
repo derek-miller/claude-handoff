@@ -814,9 +814,11 @@ func logins(_ paths: Value = .undefined) throws -> Value {
     let remembered = (try? readJson(paths["labels"])) ?? Value.newObject()
     let seen = try desktopProfiles(paths["webCache"])
     let rememberedEmails = try member(remembered, "emails"), rememberedOrgs = remembered["orgs"]
+    // Live login files and Desktop's profile override what earlier runs remembered.
+    let entries = { (map: Value) in Value.fromEntries(map.asMap!.entries.map { ($0.0.description, $0.1) }) }
     let saved: Value = [
-        "emails": Value.spread(rememberedEmails, .fromEntries(seen["emails"].asMap!.entries.map { ($0.0.description, $0.1) })),
-        "orgs": Value.spread(rememberedOrgs, .fromEntries(seen["orgs"].asMap!.entries.map { ($0.0.description, $0.1) })),
+        "emails": Value.spread(rememberedEmails, entries(emails), entries(seen["emails"])),
+        "orgs": Value.spread(rememberedOrgs, entries(orgs), entries(seen["orgs"])),
     ]
     let previous: Value = ["emails": rememberedEmails ?? Value.newObject(), "orgs": rememberedOrgs ?? Value.newObject()]
     for (account, email) in saved["emails"].ownEntries where UUID.test(account) { emails.put(Value(account), email) }
