@@ -10,7 +10,7 @@ import Testing
 class TaskHome: Home {
     var sourceFile: String { path.join(dir("P"), "scheduled-tasks.json") }
     var targetFile: String { path.join(dir("T"), "scheduled-tasks.json") }
-    // interruptTaskFamily knobs, as the Node fixtures carried them on the object.
+    // How interruptTaskFamily runs: which matching mutation crashes, the notification id, restart, sources.
     var interruptAfter = 1
     var notificationId: String?
     var restart = false
