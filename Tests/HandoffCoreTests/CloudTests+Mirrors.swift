@@ -3,7 +3,7 @@ import Testing
 @testable import HandoffCore
 
 extension Engine.Cloud {
-    // assert.fail inside a mocked cloud call.
+    // A cloud call that must never happen: records an issue and throws.
     static func fail(_ message: String) -> Value {
         fn { _ in Issue.record(Comment(rawValue: message)); throw JSError(message) }
     }
@@ -39,7 +39,8 @@ extension Engine.Cloud {
         ]
     }()
 
-    @Test("bridge rehome preserves SSH mirrors and records through Move and Undo", arguments: Engine.Cloud.sshModes.map(\.0))
+    @Test("bridge rehome preserves SSH mirrors and records through Move and Undo", arguments: ["remote path", "configuration and remote path", "configuration without cached path", "configuration with empty cached path",
+                     "shared configuration", "shared remote path", "native mirror location", "native mirror alias"])
     func bridgeRehomePreservesSSH(mode: String) throws {
         let extra = Self.sshModes.first { $0.0 == mode }!.1
         let h = try bridgeFixture(), shared = mode.hasPrefix("shared")
@@ -191,7 +192,7 @@ extension Engine.Cloud {
         for sameLogin in [false, true] {
             for cache in ["cold", "warm", "legacy"] {
                 let h = try home(), entries = branchEntries(2, SOURCE, 1)
-                if sameLogin { h.acct = Four(P: h.acct.P, T: h.acct.P, Z: h.acct.Z, Q: h.acct.Q); try mkdirp(h.dir("T")) }
+                if sameLogin { h.acct.T = h.acct.P; try mkdirp(h.dir("T")) }
                 try h.write(SOURCE, entries.concat([["type": "bridge-session", "sessionId": Value(SOURCE), "bridgeSessionId": "session_prior_owner", "ownerAccountUuid": Value(h.acct.P), "ownerOrganizationUuid": Value(h.org.P)]]))
                 try h.record("P", SOURCE, rehomeRecord(["bridgeSessionIds": ["session_prior_owner"]]))
                 let all = try accounts(h.paths)
@@ -230,7 +231,8 @@ extension Engine.Cloud {
     @Test("task and restarted moves retain known mirror cleanup and Keep completed can cancel it")
     func taskMovesRetainMirrorCleanup() throws {
         for restart in [false, true] {
-            let h = try taskFamilyFixture(), io = taskHarness().io
+            let h = try taskFamilyFixture(), harness = taskHarness(), io = harness.io
+            defer { withExtendedLifetime(harness) {} }
             try h.record("P", SOURCE, rehomeRecord(["bridgeSessionIds": ["session_task_mirror"]]))
             let (from, to) = try h.selection()
             let cloud = cloudFixture(h, ["account": to.account, "org": to.org, "list": Self.fail("wrong source login")])

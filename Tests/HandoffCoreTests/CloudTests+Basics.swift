@@ -102,7 +102,7 @@ extension Engine.Cloud {
         throwsError("login is still updating") {
             try cloudClient(h.paths, nil, [
                 "active": ["account": Value(h.acct.P), "org": Value(h.org.P), "state": "known"],
-                "cookies": .newMap([("sessionKey", "fixture"), ("lastActiveOrg", Value(h.org.P))]),
+                "cookies": .newMap([(Value("sessionKey"), Value("fixture")), (Value("lastActiveOrg"), Value(h.org.P))]),
                 "userAgent": "fixture",
             ])
         }
@@ -117,7 +117,7 @@ extension Engine.Cloud {
             requested.append(url.path)
             return response(requested.last == "/api/account" ? ["uuid": Value(h.acct.P)] : [["uuid": Value(h.org.P)], ["uuid": Value(h.org.T)]])
         }
-        let io: Value = ["active": ["state": "unknown", "account": nil, "org": nil], "cookies": .newMap([("sessionKey", "fixture"), ("lastActiveOrg", Value(h.org.P))]), "userAgent": "fixture"]
+        let io: Value = ["active": ["state": "unknown", "account": nil, "org": nil], "cookies": .newMap([(Value("sessionKey"), Value("fixture")), (Value("lastActiveOrg"), Value(h.org.P))]), "userAgent": "fixture"]
         eq(try cloudClient(h.paths, nil, io).org, Value(h.org.P))
         eq(try cloudClient(h.paths, ["account": Value(h.acct.P), "org": Value(h.org.T), "label": "Team"], io).org, Value(h.org.T))
         requested = []
@@ -151,7 +151,7 @@ extension Engine.Cloud {
         let memory: Value = scenario == "memory pressure"
             ? try memoryBudget(["total": Value(10 * 1024 * 1024), "heap": Value(GiB), "usage": fn { _ in ["rss": 0, "heapUsed": 0] }, "available": fn { _ in Value(GiB) }])
             : .undefined
-        let cloud = try cloudClient(h.paths, nil, ["active": ["state": "known", "account": Value(h.acct.P), "org": Value(h.org.P)], "cookies": .newMap([("sessionKey", "fixture")]), "userAgent": "fixture", "memory": memory])
+        let cloud = try cloudClient(h.paths, nil, ["active": ["state": "known", "account": Value(h.acct.P), "org": Value(h.org.P)], "cookies": .newMap([(Value("sessionKey"), Value("fixture"))]), "userAgent": "fixture", "memory": memory])
         let errors = ["repeated cursor": "cursor did not advance", "repeated sequence": "sequence changed", "oversized page": "response changed", "event limit": "exceeded 1,000,000 events", "memory pressure": "memory budget"]
         if let error = errors[scenario] {
             throwsError(error) { try cloud.eventRows.call("cse_large") }
@@ -188,9 +188,8 @@ extension Engine.Cloud {
         }
     }
 
-    // Node paused an async body mid-read and started a second read. The Swift budget reads a whole body at
-    // once, but checks usage before each chunk: the second read runs from that check, while the first
-    // read holds the reservation for its first chunk.
+    // The budget checks usage before each chunk, so a second read started from that check runs while the
+    // first read holds the reservation for its first chunk.
     @Test("concurrent cloud bodies share reservations and return them after refusal")
     func concurrentBodiesShareReservations() throws {
         var usageCalls = 0

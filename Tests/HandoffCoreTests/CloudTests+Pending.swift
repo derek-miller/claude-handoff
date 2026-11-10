@@ -3,7 +3,7 @@ import Testing
 @testable import HandoffCore
 
 extension Engine.Cloud {
-    // report: (stage, text, extra) => progress.push({ stage, text, ...extra })
+    // A report callback that records each event as { stage, text, ...extra }.
     static func collect(_ progress: Box<[Value]>) -> Value {
         fn { args in
             progress.value.append(.spread(["stage": arg(args, 0), "text": arg(args, 1)], arg(args, 2).nullish ? [:] : arg(args, 2)))
@@ -92,7 +92,7 @@ extension Engine.Cloud {
             _ = try sweep(f.h.paths, options)
             eq(attempts, expected, "after \(elapsed) ms")
         }
-        active.at = Value(isoString(now))
+        active["at"] = Value(isoString(now))
         _ = try sweep(f.h.paths, options)
         eq(attempts, 4)
         ready = true
@@ -142,7 +142,7 @@ extension Engine.Cloud {
             let cloud = fn { args in
                 try cloudClient(h.paths, Self.arg(args, 0), [
                     "active": ["account": Value(mismatch == "Desktop login" ? h.acct.T : h.acct.P), "org": Value(h.org.P), "state": Value(mismatch == "logout" ? "logged-out" : "known")],
-                    "cookies": .newMap([("sessionKey", "fixture"), ("lastActiveOrg", Value(h.org.P))]), "userAgent": "fixture",
+                    "cookies": .newMap([(Value("sessionKey"), Value("fixture")), (Value("lastActiveOrg"), Value(h.org.P))]), "userAgent": "fixture",
                 ])
             }
             let result = try finishPending(h.paths, .spread(f.options, ["cloud": cloud]))
