@@ -758,7 +758,8 @@ extension Engine.Receipts {
             for (name, destination) in [("dangling", "../missing"), ("external", external), ("cycle", "cycle"), ("regular-target", path.join(external, "secret"))] {
                 let file = path.join(dir, name)
                 try symlink(destination, file)
-                links.append((file, destination, try lstat(file).ino))
+                let inode = try lstat(file).ino
+                links.append((file: file, destination: destination, inode: inode))
             }
         }
         let physicalExternal = try NodeFS.nativeRealpath(external)
