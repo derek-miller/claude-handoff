@@ -1257,29 +1257,37 @@ final class Model: ObservableObject {
 }
 
 // MenuBarExtra keeps a resized window's bottom edge, so a panel whose content changes height slides away from the
-// menu bar. This remembers where the system placed the top edge when the panel opened and keeps it there.
+// menu bar, even while it is closed, and reopens wherever it was left. This keeps the top edge a fixed gap below the
+// status item. The gap is learned from the system's own placement: drift only ever widens it, so the smallest seen wins.
 struct MenuBarPin: NSViewRepresentable {
     final class Pin: NSView {
-        private var top: CGFloat?
+        private static var gap: CGFloat?
         private var observers: [NSObjectProtocol] = []
+
+        private static func menuBarBottom(for window: NSWindow) -> CGFloat? {
+            NSApp.windows.first { $0.className.contains("StatusBarWindow") && $0.isVisible }?.frame.minY ?? window.screen?.visibleFrame.maxY
+        }
+
+        private static func place(_ window: NSWindow, learn: Bool) {
+            guard let bottom = menuBarBottom(for: window) else { return }
+            let observed = bottom - window.frame.maxY
+            if learn, observed >= 0 { gap = min(gap ?? observed, observed) }
+            guard let gap, abs(observed - gap) > 0.5 else { return }
+            window.setFrameTopLeftPoint(NSPoint(x: window.frame.minX, y: bottom - gap))
+        }
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             observers.forEach { NotificationCenter.default.removeObserver($0) }
             observers = []
-            top = nil
             guard let window else { return }
             let center = NotificationCenter.default
-            observers.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
-                self?.top = window.frame.maxY
-            })
-            observers.append(center.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
-                self?.top = nil
+            observers.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { _ in
+                Pin.place(window, learn: true)
             })
             for name in [NSWindow.didResizeNotification, NSWindow.didMoveNotification] {
-                observers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    guard let top = self?.top, window.isKeyWindow, abs(window.frame.maxY - top) > 0.5 else { return }
-                    window.setFrameTopLeftPoint(NSPoint(x: window.frame.minX, y: top))
+                observers.append(center.addObserver(forName: name, object: window, queue: .main) { _ in
+                    Pin.place(window, learn: false)
                 })
             }
         }
