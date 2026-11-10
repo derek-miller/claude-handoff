@@ -137,7 +137,7 @@ func deepEqual(_ a: Value, _ b: Value) -> Bool {
     }
 }
 
-// Array.prototype helpers over Value, so assertions read like the Node suite.
+// Array.prototype helpers over Value.
 extension Value {
     func find(_ predicate: (Value) throws -> Bool) rethrows -> Value { try elements.first(where: predicate) ?? .undefined }
     func findIndex(_ predicate: (Value) throws -> Bool) rethrows -> Int { try elements.firstIndex(where: predicate) ?? -1 }

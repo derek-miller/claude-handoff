@@ -53,7 +53,7 @@ extension Engine {
                     deq(args[0], ["account": Value(h.acct.P), "org": Value(row.org), "label": f.from[0].label])
                     return try cloudClient(h.paths, args[0], [
                         "active": try signedIn(h.paths, identity.processes),
-                        "cookies": .newMap([("sessionKey", "fixture"), ("lastActiveOrg", Value(h.org[activeOrg]))]),
+                        "cookies": .newMap([(Value("sessionKey"), Value("fixture")), (Value("lastActiveOrg"), Value(h.org[activeOrg]))]),
                         "userAgent": "fixture",
                     ])
                 }
