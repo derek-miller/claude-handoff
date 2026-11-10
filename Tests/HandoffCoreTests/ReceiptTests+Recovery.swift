@@ -234,7 +234,10 @@ extension Engine.Receipts {
                 try mkdirp(path.join(h.project, sid))
                 let sidecar = path.join(h.project, sid, "\(sid).txt")
                 try writeText(sidecar, "supporting data for \(sid)")
-                for file in [h.transcript(sid), sidecar] { files.append((file, try readData(file), try stat(file).ino)) }
+                for file in [h.transcript(sid), sidecar] {
+                    let bytes = try readData(file), inode = try stat(file).ino
+                    files.append((file: file, bytes: bytes, inode: inode))
+                }
             }
             let originalRecords = try [SOURCE, child].map { try readData(h.recordFile("P", $0)) }
             let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.P && $0.org.str == h.org.P }, to = all.find { $0.account.str == h.acct.P && $0.org.str == h.org.T }
