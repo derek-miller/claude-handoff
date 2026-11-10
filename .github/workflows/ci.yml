@@ -6,14 +6,9 @@ permissions:
 jobs:
   swift:
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Select Xcode
         run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
-      - name: Build with stack dumps
-        run: |
-          set +e
-          swift build --build-tests -Xswiftc -disable-batch-mode -j 1 -v > build.log 2>&1
-          status=$?
-          grep -nE "Stack dump|While |Please submit|signal|error:|^[0-9]+\.\t|-primary-file [^ ]*HandoffCoreTests" build.log | grep -v "warning:" | sed -E 's/ -[a-zA-Z-]+ [^ ]*\.(swiftmodule|swiftdoc|swiftsourceinfo|d|o|dia|swiftdeps)//g' | cut -c1-600 | tail -80
-          exit $status
+      - run: python3 .github/probe/bisect.py
