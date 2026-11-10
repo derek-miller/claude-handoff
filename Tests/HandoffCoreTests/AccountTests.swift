@@ -260,8 +260,6 @@ extension Engine {
             eq(row.label, "switched@example.com \u{00b7} Switched Team")
         }
 
-        // The Node test checked the suite's own mutatingOpen spy over Node's string and numeric flags. The Swift fs
-        // table only ever sees numeric open(2) flags, so the spy and this check cover those.
         @Test("mutation spies distinguish read-only and mutating open flags")
         func mutationSpies() {
             for flags in [O_RDONLY, O_RDONLY | O_NOFOLLOW, O_RDONLY | O_CLOEXEC] { #expect(!Moves.mutatingOpen(flags), "\(flags)") }

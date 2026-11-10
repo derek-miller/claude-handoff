@@ -8,10 +8,9 @@ extension Engine {
     struct Moves {
         static func arg(_ args: [Value], _ i: Int) -> Value { i < args.count ? args[i] : .undefined }
 
-        // The suite's spy for open(2) flags that can change a file.
         static func mutatingOpen(_ flags: Int32) -> Bool { flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND) != 0 }
 
-        // Object.fromEntries(accounts.map(a => [a.account, a])): the last row per account wins.
+        // The last row per account wins.
         static func byAccount(_ all: Value) -> [String: Value] {
             var out: [String: Value] = [:]
             for row in all.elements { out[row.account.str] = row }
@@ -82,8 +81,6 @@ extension Engine {
             eq(try verifyPlaced(h.paths).changed[0].found, changed.changed[0].found)
         }
 
-        // The Node test also ran every holder against its lockf-less fallback lock helper. The Swift engine takes
-        // flock(2) itself and has no fallback, so only the native and perl holders remain.
         @Test("native and fallback helpers share the kernel lock and release it after a move")
         func kernelLock() throws {
             let nativeAvailable = exists("/usr/bin/lockf")
@@ -179,8 +176,7 @@ extension Engine {
             eq(try readdir(h.dir("Z")).count, 1)
         }
 
-        // Node counted fs.readFile calls; the Swift engine may also stream a transcript through fs.open, so reads
-        // through either count.
+        // A transcript may be streamed through fs.open, so read-only opens count as reads.
         @Test("retirement rereads only potential destination carriers and preserves sources when carriers change")
         func retirementRereadsCarriers() throws {
             for changed in [false, true] {
