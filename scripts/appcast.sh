@@ -7,6 +7,8 @@ description="$(python3 - "$notes" "$release" <<'PY'
 import html, re, sys
 items = []
 for line in open(sys.argv[1], encoding="utf-8"):
+    if line.startswith("## ") and items:
+        break
     m = re.match(r"\s*[*-]\s+(.*)", line)
     if not m:
         continue
