@@ -2,10 +2,9 @@ import Darwin
 import Foundation
 @testable import HandoffCore
 
-// The Node suite simulated a crash by calling process.exit() inside a patched fs function in a child process.
-// In process, the engine would otherwise unwind through its own rollback, which a killed process never runs.
-// The fence lets the chosen mutation complete, then fails every later filesystem mutation and throws Crash, so
-// the disk holds exactly what a process killed at that point would have left behind.
+// A crash at a chosen filesystem mutation. Throwing from the engine would run its rollback, which a killed
+// process never does, so the fence lets the chosen mutation finish, then fails every later mutation and throws
+// Crash: the disk holds what a process killed at that point would have left behind.
 struct Crash: Error, CustomStringConvertible {
     var description: String { "fixture crash" }
 }

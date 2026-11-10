@@ -179,7 +179,6 @@ extension Engine {
             #expect(time == 0)
         }
 
-        // Not run against Swift by the parity harness: the work closure calls progress and check synchronously.
         @Test("long closed work gets a fresh bounded reopen wait")
         func freshReopenWait() throws {
             let h = try home()
@@ -278,7 +277,6 @@ extension Engine {
             eq(result.restart.outcome, "quit-not-confirmed")
         }
 
-        // Not run against Swift by the parity harness: the work closure calls check synchronously.
         @Test("a twenty-second shutdown leaves moving and reopening their own phases")
         func twentySecondShutdown() throws {
             let h = try home()
