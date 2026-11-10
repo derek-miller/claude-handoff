@@ -105,7 +105,7 @@ func fork(_ entries: Value, _ sourceId: String, _ targetId: String, _ title: Str
 }
 
 struct Four {
-    let P: String, T: String, Z: String, Q: String
+    var P: String, T: String, Z: String, Q: String
     subscript(_ key: String) -> String {
         switch key { case "P": P; case "T": T; case "Z": Z; case "Q": Q; default: fatalError("no fixture account \(key)") }
     }
@@ -117,7 +117,7 @@ class Home {
     let root: String
     let paths: Value
     let project: String
-    let acct = Four(P: id(901), T: id(902), Z: id(903), Q: id(904))
+    var acct = Four(P: id(901), T: id(902), Z: id(903), Q: id(904))
     let org = Four(P: id(911), T: id(912), Z: id(913), Q: id(914))
 
     init() throws {
