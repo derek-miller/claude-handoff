@@ -1,4 +1,4 @@
-// Release builds overwrite this from the tag; Tests/Reference/package.json must match for parity.
+// Stays 0.0.0-dev in the repository; scripts/build-app.sh writes the release tag's version here.
 public enum HandoffVersion {
-    public static let current = "1.0.2"
+    public static let current = "0.0.0-dev"
 }

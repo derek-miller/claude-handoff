@@ -11,7 +11,7 @@ SPARKLE_PUBLIC_KEY="${SPARKLE_PUBLIC_KEY:-}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 APP="dist/Claude Handoff.app"
 
-printf '// Release builds overwrite this from the tag.\npublic enum HandoffVersion {\n    public static let current = "%s"\n}\n' "$VERSION" > Sources/HandoffCore/Engine/Version.swift
+printf '// Written by scripts/build-app.sh from the release tag.\npublic enum HandoffVersion {\n    public static let current = "%s"\n}\n' "$VERSION" > Sources/HandoffCore/Engine/Version.swift
 trap 'git checkout -- Sources/HandoffCore/Engine/Version.swift 2>/dev/null || true' EXIT
 
 swift build -c release --arch arm64 --arch x86_64 --product ClaudeHandoff

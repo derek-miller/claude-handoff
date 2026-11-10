@@ -40,16 +40,15 @@ Ground rules:
 
 ## Releasing
 
-1. Bump `Tests/Reference/package.json` and `Sources/HandoffCore/Engine/Version.swift` together. Parity checks the receipt writer version.
-2. Push a `vX.Y.Z` tag.
-3. `.github/workflows/release.yml` then:
+1. Push a `vX.Y.Z` tag from `main`. Minor and patch must stay under 100.
+2. `.github/workflows/release.yml` then:
    - runs the tests;
    - builds the universal app and signs it with Developer ID;
    - notarizes and staples the app and the DMG;
    - signs the DMG for Sparkle;
    - publishes a GitHub release with the DMG and `appcast.xml`.
 
-Installed apps read updates from `releases/latest/download/appcast.xml`.
+The tag is the only place a version is set. In the repository, `Version.swift` and `Tests/Reference/package.json` both stay at `0.0.0-dev`. The release build writes the tag's version into the app and its build number, `major×10000 + minor×100 + patch`, which Sparkle uses to tell that a release is newer. Installed apps read updates from `releases/latest/download/appcast.xml`.
 
 Repository secrets:
 
