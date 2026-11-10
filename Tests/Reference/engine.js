@@ -1052,10 +1052,6 @@ async function logins(paths) {
   const remembered = await readJson(paths.labels).catch(() => ({}))
   const seen = await desktopProfiles(paths.webCache)
   const saved = { emails: { ...remembered.emails, ...Object.fromEntries(seen.emails) }, orgs: { ...remembered.orgs, ...Object.fromEntries(seen.orgs) } }
-  if (JSON.stringify(saved) !== JSON.stringify({ emails: remembered.emails ?? {}, orgs: remembered.orgs ?? {} })) {
-    const tmp = `${paths.labels}.${process.pid}.tmp`
-    await writeFile(tmp, `${JSON.stringify(saved, null, 2)}\n`).then(() => rename(tmp, paths.labels)).catch(() => unlink(tmp).catch(() => {}))
-  }
   for (const [account, email] of Object.entries(saved.emails)) if (UUID.test(account)) emails.set(account, email)
   for (const [org, name] of Object.entries(saved.orgs)) if (UUID.test(org)) orgs.set(org, name)
   for (const { account, org, files } of await records(paths.agentSessions)) {
@@ -1084,6 +1080,13 @@ async function logins(paths) {
       if (who?.includes('@') && !emails.has(account)) emails.set(account, who)
       if (team && team !== short(org) && !orgs.has(org)) orgs.set(org, team)
     }
+  }
+  // Login files, agent records and receipts come and go, so keep any name they taught us.
+  for (const [account, email] of emails) if (UUID.test(account) && !(account in saved.emails)) saved.emails[account] = email
+  for (const [org, name] of orgs) if (UUID.test(org) && !(org in saved.orgs)) saved.orgs[org] = name
+  if (JSON.stringify(saved) !== JSON.stringify({ emails: remembered.emails ?? {}, orgs: remembered.orgs ?? {} })) {
+    const tmp = `${paths.labels}.${process.pid}.tmp`
+    await writeFile(tmp, `${JSON.stringify(saved, null, 2)}\n`).then(() => rename(tmp, paths.labels)).catch(() => unlink(tmp).catch(() => {}))
   }
   return { emails, orgs, pairs }
 }
