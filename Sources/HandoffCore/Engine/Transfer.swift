@@ -10,7 +10,7 @@ fileprivate func optCall(_ f: Value, _ args: Value...) throws -> Value {
 
 fileprivate func roundHalfUp(_ x: Double) -> Double { (x + 0.5).rounded(.down) }
 
-func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
+func transfer(_ inv: MovePlan, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
     var context = context.isUndefined ? Value.newObject() : context
     context = Value.spread(context, [
         "at": context.existing["receipt"]["at"] ?? context.at ?? .string(stamp()),
@@ -81,7 +81,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Data
         unit.held = unitHeld ?? Value(existing.receipt.held.elements.filter { row in !row.sources.elements.contains { source in files.contains(source.file) } })
         do {
             try optCall(context.check, true)
-            let next = try transferRecords(unit, to, paths, unitReporter, Value.spread(context, ["existing": existing, "taskFamily": family] as Value))
+            let next = try transferRecords(MovePlan(unit), to, paths, unitReporter, Value.spread(context, ["existing": existing, "taskFamily": family] as Value))
             if !last { failed.append(contentsOf: (next["unwound"] ?? []).elements) }
             return next["deferred"].truthy || next["file"].truthy || !result["file"].truthy ? next : result
         } catch {
@@ -129,7 +129,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Data
             return ["file": file, "receipt": after.raw, "ok": false]
         }
     }
-    let regular = Value.spread(inv, ["cloud": families.isEmpty ? inv.cloud : emptyCloud,
+    let regular = Value.spread(inv.raw, ["cloud": families.isEmpty ? inv.cloud : emptyCloud,
                                      "move": Value(inv.move.elements.filter { !$0.taskFamily.truthy }),
                                      "sources": Value(inv.sources.elements.filter { !$0.taskFamily.truthy })] as Value)
     if families.isEmpty || !context.existing.truthy || regular.move.length > 0 || regular.sources.length > 0 || regular.blocked.length > 0 || regular.unreadable.length > 0 || regular.rejected.length > 0 {
@@ -137,7 +137,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Data
     }
     if result["deferred"].truthy || result["recoveryRequired"].truthy { return result }
     for family in families {
-        let unit = Value.spread(inv, ["move": Value(inv.move.elements.filter { $0.taskFamily === family }), "sources": Value(inv.sources.elements.filter { $0.taskFamily === family }),
+        let unit = Value.spread(inv.raw, ["move": Value(inv.move.elements.filter { $0.taskFamily === family }), "sources": Value(inv.sources.elements.filter { $0.taskFamily === family }),
                                       "there": [], "blocked": [], "unreadable": [], "rejected": [], "cloud": emptyCloud, "cloudRequested": false] as Value)
         if !result["file"].truthy && !context.existing.truthy { Value.assign(unit, ["blocked": inv.blocked, "unreadable": inv.unreadable, "rejected": inv.rejected] as Value) }
         result = try attempt(unit, family, false,
@@ -196,7 +196,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Data
     }
     if families.isEmpty && failed.isEmpty { return result }
     if inv.cloud["checked"].truthy && !families.isEmpty {
-        result = try transferRecords(Value.spread(inv, ["move": [], "sources": [], "targets": [], "there": [], "blocked": [], "unreadable": [], "rejected": [], "held": result.receipt.held] as Value),
+        result = try transferRecords(MovePlan(Value.spread(inv.raw, ["move": [], "sources": [], "targets": [], "there": [], "blocked": [], "unreadable": [], "rejected": [], "held": result.receipt.held] as Value)),
                                      to, paths, unitReport(true), Value.spread(context, ["existing": ["file": file, "receipt": receipt.raw], "wholeOperation": true] as Value))
     } else if !families.isEmpty {
         for phase in ["verify", "retire"] { _ = try progress(report, .string(phase), completed[phase], totals[phase]) }
@@ -219,7 +219,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Data
     return Value.spread(result, tail)
 }
 
-func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
+func transferRecords(_ inv: MovePlan, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
     let context = context.isUndefined ? Value.newObject() : context
     try optCall(context.check, true)
     if context.restart.truthy && inv.cloud["checked"].truthy { throw EngineError("Cloud work cannot run inside the restart window") }
@@ -641,7 +641,7 @@ func finishPending(_ paths: DataLayout, _ options: Value = .undefined) throws ->
         if inv.cloud["later"].length > 0 { try report.call("later", .string(inv.cloud.later.elements.map { $0.title.description }.joined(separator: "\n"))) }
         let save = Value { _ in try saveJson(file, receipt.raw) }
         let beforeRemote = receipt.remote.length
-        _ = try archiveCloud(inv, receipt, save, report)
+        _ = try archiveCloud(MovePlan(inv), receipt, save, report)
         _ = try finishCloudAttempt(receipt, cloud, inv.cloud.later, inv.cloud.waiting, ["memory": memory, "isolatedId": inv.cloud.isolatedId])
         _ = try projectLocalFailures(receipt, paths)
         try save.call()
@@ -743,8 +743,8 @@ func keepLocal(_ paths: DataLayout, _ options: Value = .undefined) throws -> Val
     })
 }
 
-public func move(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined) throws -> Value { try move(inv, to, DataLayout(paths), report) }
-func move(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined) throws -> Value {
+public func move(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined) throws -> Value { try move(MovePlan(inv), to, DataLayout(paths), report) }
+func move(_ inv: MovePlan, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     return try locked(paths, Value { _ in
         let reconciled = try reconcile(paths, ["cloud": inv.cloud["client"]])

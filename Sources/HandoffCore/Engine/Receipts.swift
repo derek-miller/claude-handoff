@@ -854,7 +854,8 @@ func untouched(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ c
     return try and(Value(sameRecord), try witnessed(row, liveWorkers, checkShared))
 }
 
-public func carrying(_ inv: Value = .undefined, _ landed: Value = .undefined, _ gone: Value = .undefined) throws -> Value {
+public func carrying(_ inv: Value = .undefined, _ landed: Value = .undefined, _ gone: Value = .undefined) throws -> Value { try carrying(MovePlan(inv), landed, gone) }
+func carrying(_ inv: MovePlan, _ landed: Value = .undefined, _ gone: Value = .undefined) throws -> Value {
     let gone = gone.isUndefined ? Value.newSet() : gone
     let carried = inv.targets.elements.filter { $0.transcript.truthy && !gone.has($0) }.map { ["by": $0.id, "history": $0] as Value }
     return Value(landed.elements + carried)

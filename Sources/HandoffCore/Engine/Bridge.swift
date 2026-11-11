@@ -514,7 +514,8 @@ func rehomeOwnership(_ row: Value = .undefined, _ liveWorkers: Value = .undefine
     }
     return try ownership(row, liveWorkers, false)
 }
-public func retirementOwnership(_ inv: Value = .undefined, _ row: Value = .undefined, _ owner: Value = .undefined, _ liveWorkers: Value = .undefined) throws -> Value {
+public func retirementOwnership(_ inv: Value = .undefined, _ row: Value = .undefined, _ owner: Value = .undefined, _ liveWorkers: Value = .undefined) throws -> Value { try retirementOwnership(MovePlan(inv), row, owner, liveWorkers) }
+func retirementOwnership(_ inv: MovePlan, _ row: Value = .undefined, _ owner: Value = .undefined, _ liveWorkers: Value = .undefined) throws -> Value {
     owner.history.strategy === "rehome" || inv.cloudRequested.truthy ? try rehomeOwnership(row, liveWorkers) : try ownership(row, liveWorkers)
 }
 func sourceIdentity(_ row: Value = .undefined) throws -> Value {
@@ -542,7 +543,8 @@ func taggedCloudFailure(_ cloud: Value = .undefined, _ failure: Value = .undefin
 func cloudTagged(_ row: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
     Value(row.cloudAccount === cloud.account && row.cloudOrg === cloud.org)
 }
-public func inventoryFailures(_ inv: Value = .undefined) throws -> Value {
+public func inventoryFailures(_ inv: Value = .undefined) throws -> Value { try inventoryFailures(MovePlan(inv)) }
+func inventoryFailures(_ inv: MovePlan) throws -> Value {
     let local = try (inv.unreadable.elements + inv.rejected.elements + (inv.blocked ?? .newArray()).elements).map { try inventoryFailure($0) }
     let cloud = try (inv.cloud.blocked ?? .newArray()).elements.map { try taggedCloudFailure(inv.cloud, try inventoryFailure($0)) }
     return Value(local + cloud)
