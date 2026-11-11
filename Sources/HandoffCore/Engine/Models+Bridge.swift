@@ -419,29 +419,6 @@ struct FailureSource {
     }
 }
 
-    var isPresent: Bool { raw.truthy }
-    var account: Value {
-        get { raw["account"] }
-        nonmutating set { raw["account"] = newValue }
-    }
-    var org: Value {
-        get { raw["org"] }
-        nonmutating set { raw["org"] = newValue }
-    }
-    var status: Value {
-        get { raw["status"] }
-        nonmutating set { raw["status"] = newValue }
-    }
-    var waiting: Value {
-        get { raw["waiting"] }
-        nonmutating set { raw["waiting"] = newValue }
-    }
-    var checkedAt: Value {
-        get { raw["checkedAt"] }
-        nonmutating set { raw["checkedAt"] = newValue }
-    }
-}
-
 // A session's sidecar folder as a fingerprint or manifest records it.
 struct SidecarTree {
     let raw: Value
