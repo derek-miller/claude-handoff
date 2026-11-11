@@ -234,7 +234,7 @@ extension Engine.Inventory {
             try inventory([from], to, h.paths, fn { args in
                 if Self.arg(args, 0) == "scan" { completed = Self.arg(args, 2).completed }
                 return .undefined
-            }, ["processes": [], "check": fn { () in if completed.asNumber ?? 0 > 0 { throw JSError("fixture deadline spent") } }])
+            }, ["processes": [], "check": fn { () in if completed.asNumber ?? 0 > 0 { throw EngineError("fixture deadline spent") } }])
         }
         eq(completed, 1)
         eq(try readdir(h.dir("T")).count, 0)

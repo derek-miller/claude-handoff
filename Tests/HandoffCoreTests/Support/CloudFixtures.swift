@@ -127,7 +127,7 @@ final class LimitRetry {
                 row.reads += 1
                 if self.batchRoom > 0 { self.batchRoom -= 1; self.batchReads += 1 } else { self.batchReads = 1 }
                 self.peak = max(self.peak, self.batchReads)
-                if let code = codes[row.mode] { throw jsThrow("Synthetic \(row.mode) refusal", code: code) }
+                if let code = codes[row.mode] { throw makeError("Synthetic \(row.mode) refusal", code: code) }
                 eq(self.cloud.memory, self.memory)
                 return remoteRows(row.entries)
             },
@@ -139,7 +139,7 @@ final class LimitRetry {
     func lookup(_ id: Value) throws -> LimitRow {
         guard let row = rows.first(where: { $0.id == id.str }) else {
             Issue.record("no limit row for \(id)")
-            throw JSError("no limit row for \(id)")
+            throw EngineError("no limit row for \(id)")
         }
         return row
     }

@@ -1,26 +1,26 @@
 import Darwin
 import Foundation
 
-// engine.js lines 2901-3530: receipts, journals, atomic writes, undo, recovery and reconciliation.
+// Receipts, journals, atomic writes, Undo, recovery and reconciliation.
 
 // MARK: - Local helpers
 
 fileprivate func arg(_ a: [Value], _ i: Int) -> Value { i < a.count ? a[i] : .undefined }
 
-// `f?.(...args)`
+// Calls f unless it is null or undefined.
 @discardableResult
 fileprivate func optCall(_ f: Value, _ args: Value...) throws -> Value {
     if f.nullish { return .undefined }
     return try f.callArgs(args)
 }
 
-// `promise.catch(() => null)`
+// The body's result, or null if it throws.
 fileprivate func catchNull(_ f: () throws -> Value) -> Value {
     do { return try f() } catch { return .null }
 }
 
-// Array.prototype.flatMap (one level).
-fileprivate func jsFlatMap(_ xs: [Value], _ f: (Value) throws -> Value) rethrows -> [Value] {
+// flatMap that flattens array results one level.
+fileprivate func flatMapValues(_ xs: [Value], _ f: (Value) throws -> Value) rethrows -> [Value] {
     var out: [Value] = []
     for x in xs {
         let r = try f(x)
@@ -30,15 +30,15 @@ fileprivate func jsFlatMap(_ xs: [Value], _ f: (Value) throws -> Value) rethrows
 }
 
 // ToIntegerOrInfinity for slice/splice arguments.
-fileprivate func jsInteger(_ v: Value) -> Int {
-    let d = v.isUndefined ? 0 : jsNumber(v)
+fileprivate func toInteger(_ v: Value) -> Int {
+    let d = v.isUndefined ? 0 : toNumber(v)
     if d.isNaN { return 0 }
     if d >= 9.0e18 { return Int.max / 2 }
     if d <= -9.0e18 { return Int.min / 2 }
     return Int(d.rounded(.towardZero))
 }
 
-// Relative splice start, clamped like Array.prototype.splice.
+// A splice start: negative counts from the end, clamped to the array.
 fileprivate func spliceStart(_ d: Double, _ length: Int) -> Int {
     if d.isNaN { return 0 }
     let n = d.isInfinite ? (d < 0 ? Int.min / 2 : Int.max / 2) : Int(d.rounded(.towardZero))
@@ -50,18 +50,16 @@ fileprivate func indexOf(_ xs: Value, _ v: Value) -> Int { xs.elements.firstInde
 // `set.values().next().value`
 fileprivate func firstValue(_ s: Value) -> Value { s.elements.first ?? .undefined }
 
-fileprivate func errorMessage(_ error: Error) -> Value { jsErrorValue(error)["message"] }
+fileprivate func errorMessage(_ error: Error) -> Value { errorObject(error)["message"] }
 
 // MARK: - Receipts
 
-// L2901
 func receipts(_ paths: Value = .undefined) throws -> Value {
     let names: [String]
     do { names = try fs.names(paths.state.description) } catch { names = [] }
     return .strings(defaultSorted(names.filter { RECEIPT_FILE.test($0) }))
 }
 
-// L2903
 public func latestReceipt(_ paths: Value = .undefined) throws -> Value {
     let name = try receipts(paths).elements.last ?? .undefined
     if !name.truthy { return .null }
@@ -70,21 +68,20 @@ public func latestReceipt(_ paths: Value = .undefined) throws -> Value {
     if !receipt.truthy { return ["name": name, "file": file, "corrupt": true] }
     if !receipt.writer.truthy && (receipt.finalizing.truthy && receipt.appendCheckpoint.truthy && receipt.appendCheckpoint.taskTransfers.isUndefined
         || receipt.pending.truthy && !(["rehome", "remote"] as Value).includes(receipt.pending.strategy)) {
-        throw jsThrow(OLDER_MOVE, code: "OLDER_MOVE", [("file", file)])
+        throw makeError(OLDER_MOVE, code: "OLDER_MOVE", [("file", file)])
     }
     let before = stable(receipt)
     if try !needsRecovery(receipt).truthy { _ = try projectLocalFailures(receipt, paths) }
     return ["name": name, "file": file, "receipt": receipt, "projected": Value(stable(receipt) != before)]
 }
 
-// L2917
 public func deferredWorkflow(_ paths: Value = .undefined, _ latest: Value = .undefined) throws -> Value {
     var latest = latest
     if latest.isUndefined { latest = try latestReceipt(paths) }
     if !latest.truthy || latest.corrupt.truthy { return .null }
     let receipt = latest.receipt
     if receipt.remoteUndoing["length"].truthy {
-        let m = JSMap()
+        let m = ValueMap()
         for row in receipt.remoteUndoing.elements {
             m.set(Value("\(row.account)/\(row.org)"), ["account": row.account, "org": row.org, "label": try accountLabel(row)])
         }
@@ -92,7 +89,7 @@ public func deferredWorkflow(_ paths: Value = .undefined, _ latest: Value = .und
     }
     if (receipt.pending.truthy || receipt.retiring.truthy || receipt.finalizing.truthy || receipt.undoing.truthy) && receipt.taskTransfers["length"].truthy {
         let transfers = try recoveryFamilies(receipt)
-        let m = JSMap()
+        let m = ValueMap()
         for row in transfers.elements { m.set(Value("\(row.from.account)/\(row.from.org)"), row.from) }
         let sources = m.values
         if !sources.isEmpty {
@@ -101,8 +98,8 @@ public func deferredWorkflow(_ paths: Value = .undefined, _ latest: Value = .und
     }
     if receipt.undoing.truthy { return .spread(latest, ["mode": "undo", "sources": receipt.fromAccounts ?? Value.newArray()]) }
     if receipt.held["length"].truthy {
-        let m = JSMap()
-        for row in jsFlatMap(receipt.held.elements, { $0.sources }) {
+        let m = ValueMap()
+        for row in flatMapValues(receipt.held.elements, { $0.sources }) {
             m.set(Value("\(row.account)/\(row.org)"), ["account": row.account, "org": row.org, "label": try accountLabel(row)])
         }
         return .spread(latest, ["mode": "local", "sources": Value(m.values)])
@@ -117,7 +114,6 @@ public func deferredWorkflow(_ paths: Value = .undefined, _ latest: Value = .und
     return sources.length != 0 ? .spread(latest, ["mode": "cloud", "sources": sources]) : .null
 }
 
-// L2940
 @discardableResult
 func syncPath(_ file: Value = .undefined) throws -> Value {
     let handle = try fs.open(file.description, O_RDONLY | O_NOFOLLOW, 0o666)
@@ -129,7 +125,6 @@ func syncPath(_ file: Value = .undefined) throws -> Value {
     return .undefined
 }
 
-// L2945
 @discardableResult
 func saveText(_ file: Value = .undefined, _ text: Value = .undefined, _ before: Value = .undefined, _ durable: Value = .undefined) throws -> Value {
     let before = fnOr(before)
@@ -146,29 +141,27 @@ func saveText(_ file: Value = .undefined, _ text: Value = .undefined, _ before: 
     return text
 }
 
-// L2960
 @discardableResult
 func saveJson(_ file: Value = .undefined, _ value: Value = .undefined, _ spacing: Value = .undefined, _ durable: Value = .undefined) throws -> Value {
-    let spacing = spacing.isUndefined ? 2 : jsInteger(spacing)
+    let spacing = spacing.isUndefined ? 2 : toInteger(spacing)
     return try saveText(file, Value(jsonText(value, spacing)), .undefined, durable)
 }
 
-// L2962
 public func readReceipt(_ file: Value = .undefined) throws -> Value {
     let receipt = try readJson(file)
     let handle: FileHandle
     do { handle = try fs.open("\(file).journal", "r") } catch {
-        if jsErrorValue(error).code === "ENOENT" { return receipt }
+        if errorObject(error).code === "ENOENT" { return receipt }
         throw error
     }
     func apply(_ line: String) throws {
         let patch = try JSON.parse(line)
-        if !isSafeInteger(patch.sequence) || jsNumber(patch.sequence) < 1 { throw JSError("Invalid move journal sequence") }
-        let sequence = jsNumber(patch.sequence)
-        if sequence <= jsNumber(receipt.journalSequence ?? 0) { return }
-        if sequence != jsNumber(receipt.journalSequence ?? 0) + 1 { throw JSError("Incomplete move journal") }
+        if !isSafeInteger(patch.sequence) || toNumber(patch.sequence) < 1 { throw EngineError("Invalid move journal sequence") }
+        let sequence = toNumber(patch.sequence)
+        if sequence <= toNumber(receipt.journalSequence ?? 0) { return }
+        if sequence != toNumber(receipt.journalSequence ?? 0) + 1 { throw EngineError("Incomplete move journal") }
         for key in ["sessions", "failed", "retained"] {
-            if !patch[key].isArray { throw JSError("Invalid move journal entries") }
+            if !patch[key].isArray { throw EngineError("Invalid move journal entries") }
             for row in patch[key].elements {
                 if receipt[key].nullish { receipt[key] = Value.newArray() }
                 receipt[key].push(row)
@@ -199,7 +192,6 @@ public func readReceipt(_ file: Value = .undefined) throws -> Value {
     return receipt
 }
 
-// L2999
 func placementJournal(_ file: Value = .undefined, _ receipt: Value = .undefined, _ check: Value = .undefined) throws -> Value {
     let check = fnOr(check)
     try check.call()
@@ -215,8 +207,8 @@ func placementJournal(_ file: Value = .undefined, _ receipt: Value = .undefined,
     let save = Value { args in
         let durable = arg(args, 0).isUndefined ? Value(false) : arg(args, 0)
         try check.call()
-        let patch: Value = ["sequence": Value(jsNumber(receipt.journalSequence ?? 0) + 1), "pending": receipt.pending ?? .null]
-        for key in keys { patch[key] = Value(jsArraySlice((receipt[key] ?? Value.newArray()).elements, sizes[key]!)) }
+        let patch: Value = ["sequence": Value(toNumber(receipt.journalSequence ?? 0) + 1), "pending": receipt.pending ?? .null]
+        for key in keys { patch[key] = Value(sliceArray((receipt[key] ?? Value.newArray()).elements, sizes[key]!)) }
         do {
             try handle.writeFile(jsonText(patch, 0))
             if durable.truthy {
@@ -226,9 +218,9 @@ func placementJournal(_ file: Value = .undefined, _ receipt: Value = .undefined,
             }
             productive()
         } catch {
-            let e = jsErrorValue(error)
+            let e = errorObject(error)
             e["code"] = "JOURNAL_WRITE"
-            throw JSError(e)
+            throw EngineError(e)
         }
         receipt.journalSequence = patch.sequence
         for key in keys { sizes[key] = receipt[key].nullish ? 0 : receipt[key].length }
@@ -246,45 +238,42 @@ func placementJournal(_ file: Value = .undefined, _ receipt: Value = .undefined,
     return ["save": save, "close": close, "compact": compact]
 }
 
-// L3028
 public func recoveryPending(_ paths: Value = .undefined) throws -> Value {
     let latest = try latestReceipt(paths)
     if !latest.truthy || latest.corrupt.truthy { return latest }
     return try needsRecovery(latest.receipt).truthy ? ["name": latest.name, "file": latest.file, "receipt": latest.receipt] : .null
 }
 
-// L3035
 func parkingOrder(_ item: Value = .undefined) throws -> Value {
     func tmp(_ v: Value) -> Double { (v[0].asString?.hasSuffix(".json.tmp") ?? false) ? 1 : 0 }
-    return Value(jsSorted(item.moved.elements) { a, b in tmp(b) - tmp(a) })
+    return Value(stableSorted(item.moved.elements) { a, b in tmp(b) - tmp(a) })
 }
 
-// L3037
 @discardableResult
 func park(_ plan: Value = .undefined, _ before: Value = .undefined) throws -> Value {
     let before = fnOr(before)
     for item in plan.elements {
         try before.call(item)
-        let hashes = JSMap((item.hashes ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
-        let trees = JSMap((item.trees ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
-        let semantics = JSMap((item.semantics ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
+        let hashes = ValueMap((item.hashes ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
+        let trees = ValueMap((item.trees ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
+        let semantics = ValueMap((item.semantics ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
         for pair in try parkingOrder(item).elements {
             let original = pair[0], parked = pair[1]
             let hasOriginal = exists(original), hasParked = exists(parked)
-            if hasOriginal && hasParked { throw JSError("retirement path occupied: \(path.basename(parked.description))") }
+            if hasOriginal && hasParked { throw EngineError("retirement path occupied: \(path.basename(parked.description))") }
             if hasParked { continue }
-            if !hasOriginal { throw JSError("retirement artifact missing: \(path.basename(original.description))") }
+            if !hasOriginal { throw EngineError("retirement artifact missing: \(path.basename(original.description))") }
             if hashes.has(original), Value(sha(try readFile(original))) !== hashes.get(original) {
-                throw JSError("retirement artifact changed: \(path.basename(original.description))")
+                throw EngineError("retirement artifact changed: \(path.basename(original.description))")
             }
             if trees.has(original), try manifest(original).sha !== trees.get(original) {
-                throw JSError("retirement artifact changed: \(path.basename(original.description))")
+                throw EngineError("retirement artifact changed: \(path.basename(original.description))")
             }
             if semantics.has(original), try recordSemantic(try readJson(original)) !== semantics.get(original) {
-                throw JSError("retirement artifact changed: \(path.basename(original.description))")
+                throw EngineError("retirement artifact changed: \(path.basename(original.description))")
             }
             if LOCAL_RECORD.test(path.basename(original.description, ".json")) && exists(Value("\(original).tmp")) {
-                throw JSError("Desktop record has a new pending update: \(path.basename(original.description))")
+                throw EngineError("Desktop record has a new pending update: \(path.basename(original.description))")
             }
             try fs.mkdirp(path.dirname(parked.description))
             try fs.rename(original.description, parked.description)
@@ -294,7 +283,6 @@ func park(_ plan: Value = .undefined, _ before: Value = .undefined) throws -> Va
     return .undefined
 }
 
-// L3059
 @discardableResult
 func restore(_ plan: Value = .undefined, _ root: Value = .undefined, _ before: Value = .undefined) throws -> Value {
     let before = fnOr(before)
@@ -315,7 +303,6 @@ func restore(_ plan: Value = .undefined, _ root: Value = .undefined, _ before: V
     return .undefined
 }
 
-// L3074
 func prepareUndo(_ receipt: Value = .undefined, _ paths: Value = .undefined) throws -> Value {
     let dest = path.join(paths.state.description, "quarantine", receipt.at.description)
     var plan: [Value] = []
@@ -337,7 +324,6 @@ func prepareUndo(_ receipt: Value = .undefined, _ paths: Value = .undefined) thr
     return Value(plan)
 }
 
-// L3094
 func taskTransferProblems(_ transfers: Value = .undefined, _ paths: Value = .undefined, _ inspect: Value = .undefined, _ partial: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let partial = partial.isUndefined ? Value(false) : partial
     let check = fnOr(check)
@@ -351,29 +337,29 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: Value = .und
             let cliIds = Value.newSet(family.links.elements.map { $0[1] })
             let inspected = try optCall(inspect)
             let table = try inspected.nullish ? processTable(paths.claudeApp) : inspected
-            let liveWorkers = Value.newSet(jsFlatMap(table.elements.filter { $0.worker.truthy }) { $0.ids })
+            let liveWorkers = Value.newSet(flatMapValues(table.elements.filter { $0.worker.truthy }) { $0.ids })
             if try schedulerBusy(paths, [family.from, family.to], table).truthy { problems.append(Value(SCHEDULER_OWNS)) }
-            if try sameAccount(family.from, family.to).truthy { throw JSError("scheduled task namespaces must differ") }
+            if try sameAccount(family.from, family.to).truthy { throw EngineError("scheduled task namespaces must differ") }
             var selected: [Bool] = []
             for (file, namespace) in [(family.sourceFile, family.from), (family.targetFile, family.to)] {
                 if !UUID.test(namespace.account.description) || !UUID.test(namespace.org.description)
                     || file !== Value(path.join(paths.records.description, namespace.account.description, namespace.org.description, "scheduled-tasks.json")) {
-                    throw JSError("scheduled task namespace mismatch")
+                    throw EngineError("scheduled task namespace mismatch")
                 }
                 let registry = try taskSessions(file).registry
                 let tasks = registry.scheduledTasks ?? Value.newArray()
                 let target = file === family.targetFile
                 let kind = try taskRegistrationKind(family, registry, Value(target), selected.isEmpty ? .undefined : Value(selected[0]))
-                if tasks.elements.contains(where: { !ids.has($0.id) && recordIds.has($0.notifySessionId) }) { throw JSError("new scheduled task dependency") }
+                if tasks.elements.contains(where: { !ids.has($0.id) && recordIds.has($0.notifySessionId) }) { throw EngineError("new scheduled task dependency") }
                 if family.state.truthy {
                     let expected = try kind === "published" ? family.state : target ? family.targetState : taskState(.null, Value.newArray())
-                    if try stable(taskState(registry, family.ids)) != stable(expected) { throw JSError("scheduled task state changed") }
+                    if try stable(taskState(registry, family.ids)) != stable(expected) { throw EngineError("scheduled task state changed") }
                 }
                 selected.append(kind === "published")
                 let dir = Value(path.dirname(file.description))
                 let rows: Value
                 do { rows = try folderRecords(dir, snapshots, check) } catch {
-                    let e = jsErrorValue(error)
+                    let e = errorObject(error)
                     if file === family.targetFile && e.code === "ENOENT" && e.path === dir { rows = Value.newArray() } else { throw error }
                 }
                 var records: [Value] = []
@@ -382,14 +368,14 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: Value = .und
                     try check.call()
                     records.append(record)
                     let member = recordIds.has(record.sessionId)
-                    if !member && file === family.targetFile && cliIds.has(record.cliSessionId) { throw JSError("target scheduled task session id collision") }
+                    if !member && file === family.targetFile && cliIds.has(record.cliSessionId) { throw EngineError("target scheduled task session id collision") }
                     if !member && (ids.has(record.scheduledTaskId) || recordIds.has(record.notifySessionId) || recordIds.has(record.forkedFromSessionId)) {
-                        throw JSError("new scheduled task family dependency")
+                        throw EngineError("new scheduled task family dependency")
                     }
                     if try member && (!validDesktopRecord(["file": recordFile, "record": record]).truthy || links.get(record.sessionId) !== Value(stable(taskLinks(record)))) {
-                        throw JSError("scheduled task family identity or route changed")
+                        throw EngineError("scheduled task family identity or route changed")
                     }
-                    if try member && ownsWorker(liveWorkers, record.cliSessionId, record.sessionId).truthy { throw JSError("running worker owns scheduled task family") }
+                    if try member && ownsWorker(liveWorkers, record.cliSessionId, record.sessionId).truthy { throw EngineError("running worker owns scheduled task family") }
                 }
                 if kind === "twin" {
                     for replaced in family.replaced.elements {
@@ -399,15 +385,15 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: Value = .und
                             family.tasks.elements.first { $0.id === task.id } ?? .undefined, task,
                             ["source": family.state, "target": registry],
                             Value(records.filter { first || !recordIds.has($0.sessionId) }), false)
-                        if problem.truthy { throw JSError(problem.description) }
+                        if problem.truthy { throw EngineError(problem.description) }
                     }
                 }
             }
             if family.tasks.length != 0 && (selected.allSatisfy { $0 } || !partial.truthy && (selected[0] || !selected[1])) {
-                throw JSError("scheduled task ownership changed")
+                throw EngineError("scheduled task ownership changed")
             }
         } catch {
-            let e = jsErrorValue(error)
+            let e = errorObject(error)
             if e.code === "MOVE_STALLED" || e.code === "RESTART_REOPENED" { throw error }
             problems.append(e["message"])
         }
@@ -415,7 +401,6 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: Value = .und
     return Value(unique(problems))
 }
 
-// L3143
 @discardableResult
 func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .undefined, _ present: Value = .undefined, _ paths: Value = .undefined, _ inspect: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let check = fnOr(check)
@@ -424,7 +409,7 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
     for family in families {
         try check.call(true)
         let problems = try taskTransferProblems([family], paths, inspect, true, check, snapshots)
-        if problems.length != 0 { throw JSError(problems.join(", ")) }
+        if problems.length != 0 { throw EngineError(problems.join(", ")) }
         let file = side === "source" ? family.sourceFile : family.targetFile
         let registry = try taskSessions(file).registry
         let tasks = registry.scheduledTasks ?? Value.newArray()
@@ -441,12 +426,12 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
             }
         } else if side === "target" {
             for replaced in (family.replaced ?? Value.newArray()).elements {
-                next.insert(replaced.task, at: spliceStart(min(jsNumber(replaced.index), Double(next.count)), next.count))
+                next.insert(replaced.task, at: spliceStart(min(toNumber(replaced.index), Double(next.count)), next.count))
             }
         }
-        if try stable(taskSessions(file).registry) != stable(registry) { throw JSError("scheduled task registry changed before write") }
+        if try stable(taskSessions(file).registry) != stable(registry) { throw EngineError("scheduled task registry changed before write") }
         try check.call(true)
-        if try schedulerBusy(paths, [family.from, family.to], optCall(inspect)).truthy { throw JSError(SCHEDULER_OWNS) }
+        if try schedulerBusy(paths, [family.from, family.to], optCall(inspect)).truthy { throw EngineError(SCHEDULER_OWNS) }
         let after = Value.spread(registry, ["scheduledTasks": Value(next)])
         if family.state.truthy {
             for key in TASK_STATE_KEYS {
@@ -460,23 +445,22 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
         if !present.truthy && side === "target" && !family.targetHadTasks.truthy && next.isEmpty { after.removeKey("scheduledTasks") }
         let remove = !present.truthy && side === "target" && !family.targetExisted.truthy && after.ownKeys.isEmpty
         if remove {
-            do { try fs.unlink(file.description) } catch { if jsErrorValue(error).code !== "ENOENT" { throw error } }
+            do { try fs.unlink(file.description) } catch { if errorObject(error).code !== "ENOENT" { throw error } }
         } else {
             try saveText(file, Value(jsonText(after)), Value { _ in
                 let problems = try taskTransferProblems([family], paths, inspect, true, check, snapshots)
-                if problems.length != 0 { throw JSError(problems.join(", ")) }
+                if problems.length != 0 { throw EngineError(problems.join(", ")) }
                 try check.call(true)
-                if try stable(taskSessions(file).registry) != stable(registry) { throw JSError("scheduled task registry changed before publication") }
-                if try schedulerBusy(paths, [family.from, family.to], optCall(inspect)).truthy { throw JSError(SCHEDULER_OWNS) }
+                if try stable(taskSessions(file).registry) != stable(registry) { throw EngineError("scheduled task registry changed before publication") }
+                if try schedulerBusy(paths, [family.from, family.to], optCall(inspect)).truthy { throw EngineError(SCHEDULER_OWNS) }
                 return .undefined
             })
         }
-        if try stable(taskSessions(file).registry) != stable(remove ? .null : after) { throw JSError("scheduled task registry changed during write") }
+        if try stable(taskSessions(file).registry) != stable(remove ? .null : after) { throw EngineError("scheduled task registry changed during write") }
     }
     return .undefined
 }
 
-// L3188
 func finishUndo(_ receipt: Value = .undefined, _ file: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
     let root = Value(path.join(paths.state.description, "quarantine"))
@@ -533,7 +517,6 @@ func finishUndo(_ receipt: Value = .undefined, _ file: Value = .undefined, _ pat
     return ["receipt": receipt, "dest": dest]
 }
 
-// L3238
 func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liveWorkers: Value = .undefined, _ before: Value = .undefined) throws -> Value {
     let liveWorkers = liveWorkers.isUndefined ? try workers() : liveWorkers
     let before = fnOr(before)
@@ -611,7 +594,6 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
     return Value.newArray()
 }
 
-// L3300
 public func reconcile(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     var paths = paths
     let options = options.isUndefined ? Value.newObject() : options
@@ -645,7 +627,7 @@ public func reconcile(_ paths: Value = .undefined, _ options: Value = .undefined
             do { return Value(try appProcess(current, try inspect.call()).truthy) } catch { return false }
         }
         if try !running.call().truthy {
-            let deadline = jsNumber(try now.call()) + REOPEN_RESERVE
+            let deadline = toNumber(try now.call()) + REOPEN_RESERVE
             let run = io.command ?? Value { a in try command(arg(a, 0), arg(a, 1), arg(a, 2)) }
             let opened = try run.call("/usr/bin/open", ["-g", "-a", paths.claudeApp], Value(REOPEN_RESERVE))
             restart.outcome = try opened.status === 0 && waitFor(running, Value(deadline), now, io.wait).truthy ? "interrupted-reopened" : "reopen-failed"
@@ -656,12 +638,11 @@ public func reconcile(_ paths: Value = .undefined, _ options: Value = .undefined
     if let thrown { throw thrown }
     if interrupted && restart.outcome === "reopen-failed" {
         let message = [result.error, "Reopen Claude Desktop manually, then retry"].filter { $0.truthy }.map { $0.description }.joined(separator: ". ")
-        throw jsThrow(message, code: "REOPEN_FAILED")
+        throw makeError(message, code: "REOPEN_FAILED")
     }
     return result ?? (interrupted ? ["title": "Interrupted restart", "error": "Desktop is running. Retry the requested operation."] : .null)
 }
 
-// L3332
 func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
     let p = try recoveryPending(paths)
@@ -681,7 +662,7 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
     else {
         var rows: [Value] = []
         if receipt.pending.truthy { rows.append(receipt.pending) }
-        if receipt.finalizing.truthy { rows += jsArraySlice((receipt.sessions ?? Value.newArray()).elements, jsInteger(receipt.appendCheckpoint.sessions ?? 0)) }
+        if receipt.finalizing.truthy { rows += sliceArray((receipt.sessions ?? Value.newArray()).elements, toInteger(receipt.appendCheckpoint.sessions ?? 0)) }
         bridgeRows = Value(rows)
     }
     let bridgeIssues = try bridgeProblems(bridgeRows, Value(receipt.undoing.truthy))
@@ -765,7 +746,7 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
             _ = try quarantine(made, failedDirectory, Value { _ in
                 try optCall(options.check, true)
                 if try ownsWorker(workers(inspect.call()), targetId, Value(path.basename(made[0].description, ".json"))).truthy {
-                    throw JSError("A running worker owns the unfinished record. Recovery remains pending.")
+                    throw EngineError("A running worker owns the unfinished record. Recovery remains pending.")
                 }
                 return .undefined
             })
@@ -781,8 +762,8 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
     if receipt.finalizing.truthy {
         let checkpoint = receipt.appendCheckpoint
         let root = Value(path.join(paths.state.description, "quarantine"))
-        let superseded = Value(jsArraySlice(receipt.superseded.elements, jsInteger(checkpoint.superseded ?? 0)))
-        let rollingBack = Value(jsArraySlice((receipt.sessions ?? Value.newArray()).elements, jsInteger(checkpoint.sessions ?? 0)))
+        let superseded = Value(sliceArray(receipt.superseded.elements, toInteger(checkpoint.superseded ?? 0)))
+        let rollingBack = Value(sliceArray((receipt.sessions ?? Value.newArray()).elements, toInteger(checkpoint.sessions ?? 0)))
         let blocked = try restoreProblems(superseded, root).elements + bridgeProblems(rollingBack).elements
         if !blocked.isEmpty { return ["title": "recovery blocked", "error": Value(Value(blocked).join(", ")), "problems": Value(blocked)] }
         try writeTaskRegistrations(taskTransfers, "target", false, paths, inspect, options.check)
@@ -810,9 +791,9 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
             return ["title": "scheduled task recovery blocked", "error": "scheduled task family records changed, recovery remains pending"]
         }
         try writeTaskRegistrations(taskTransfers, "source", true, paths, inspect, options.check)
-        receipt.taskTransfers = Value(jsArraySlice((receipt.taskTransfers ?? Value.newArray()).elements, 0, jsInteger(checkpoint.taskTransfers ?? 0)))
-        receipt.sessions = Value(jsArraySlice((receipt.sessions ?? Value.newArray()).elements, 0, jsInteger(checkpoint.sessions ?? 0)) + kept)
-        receipt.superseded = Value(jsArraySlice(receipt.superseded.elements, 0, jsInteger(checkpoint.superseded ?? 0)))
+        receipt.taskTransfers = Value(sliceArray((receipt.taskTransfers ?? Value.newArray()).elements, 0, toInteger(checkpoint.taskTransfers ?? 0)))
+        receipt.sessions = Value(sliceArray((receipt.sessions ?? Value.newArray()).elements, 0, toInteger(checkpoint.sessions ?? 0)) + kept)
+        receipt.superseded = Value(sliceArray(receipt.superseded.elements, 0, toInteger(checkpoint.superseded ?? 0)))
         receipt.finalizing = false
         receipt.verification = checkpoint.verification ?? [
             "ok": Value(kept.isEmpty),
@@ -836,7 +817,6 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
     ]
 }
 
-// L3475
 func witnessed(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ checkShared: Value = .undefined) throws -> Value {
     let checkShared = checkShared.isUndefined ? Value(true) : checkShared
     let expectedSidecars = row.sidecar ?? row.sidecars
@@ -862,7 +842,6 @@ func witnessed(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ c
     return try Value(exists(row.transcript) && !changed(row.transcript, row.id, ["semantic": row.snapshot, "semanticVersion": Value(SEMANTIC_VERSION), "bridge": row.bridge]).truthy)
 }
 
-// L3493
 func untouched(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ checkShared: Value = .undefined) throws -> Value {
     let record = row.session.file ?? row.file
     let raw: Value = record.truthy ? catchNull { try readFile(record) } : .null
@@ -873,16 +852,14 @@ func untouched(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ c
     return try and(Value(sameRecord), try witnessed(row, liveWorkers, checkShared))
 }
 
-// L3503
 public func carrying(_ inv: Value = .undefined, _ landed: Value = .undefined, _ gone: Value = .undefined) throws -> Value {
     let gone = gone.isUndefined ? Value.newSet() : gone
     let carried = inv.targets.elements.filter { $0.transcript.truthy && !gone.has($0) }.map { ["by": $0.id, "history": $0] as Value }
     return Value(landed.elements + carried)
 }
 
-// L3507
 public func owners(_ sources: Value = .undefined, _ carried: Value = .undefined) throws -> Value {
-    let candidates = JSMap(sources.elements.filter { $0.roots["size"].truthy }.map { (firstValue($0.roots), Value.newArray()) })
+    let candidates = ValueMap(sources.elements.filter { $0.roots["size"].truthy }.map { (firstValue($0.roots), Value.newArray()) })
     for carrier in carried.elements { for root in carrier.history.roots.elements { candidates.get(root).push(carrier) } }
     var out: [Value] = []
     for s in sources.elements {
@@ -898,11 +875,10 @@ public func owners(_ sources: Value = .undefined, _ carried: Value = .undefined)
     return Value(out)
 }
 
-// L3513
 func parentReferences(_ directories: Value = .undefined, _ snapshots: Value = .undefined, _ check: Value = .undefined) throws -> Value {
     let snapshots = snapshots.isUndefined ? Value.null : snapshots
     let check = fnOr(check)
-    let parents = JSMap()
+    let parents = ValueMap()
     for dir in directories.elements {
         for row in try folderRecords(dir, snapshots, check).elements {
             let parent = row.record.forkedFromSessionId
@@ -912,7 +888,6 @@ func parentReferences(_ directories: Value = .undefined, _ snapshots: Value = .u
     return .map(parents)
 }
 
-// L3522
 func undoParentProblems(_ receipt: Value = .undefined) throws -> Value {
     let removing = Value.newSet(receipt.sessions.elements.map { $0.record })
     do {

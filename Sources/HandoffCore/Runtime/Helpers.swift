@@ -17,7 +17,7 @@ public func sha(_ v: Value) -> String {
     return sha(v.description)
 }
 
-// JS default sort order: UTF-16 code units.
+// Default string order: UTF-16 code units.
 public func utf16Less(_ a: String, _ b: String) -> Bool {
     var ia = a.utf16.makeIterator(), ib = b.utf16.makeIterator()
     while true {
@@ -41,27 +41,27 @@ public func localeCompare(_ a: String, _ b: String) -> Int {
 
 public func sortKeys(_ v: Value) -> Value {
     switch v {
-    case .array(let a): return .array(JSArray(a.items.map(sortKeys)))
+    case .array(let a): return .array(ValueArray(a.items.map(sortKeys)))
     case .object, .set, .map, .bytes:
         let keys = v.ownKeys.sorted(by: utf16Less)
-        return .object(JSObject(keys.map { ($0, sortKeys(v[$0])) }))
+        return .object(ValueObject(keys.map { ($0, sortKeys(v[$0])) }))
     default: return v
     }
 }
 
 public func stable(_ v: Value) -> String { (try? JSON.stringify(v, sorted: true)) ?? "undefined" }
 public func jsonText(_ v: Value, _ spacing: Int = 2) -> String { JSON.text(v, space: spacing) + "\n" }
-public func short(_ id: String) -> String { jsSlice(id, 0, 8) }
+public func short(_ id: String) -> String { sliceString(id, 0, 8) }
 public func short(_ id: Value) -> String { short(id.description) }
 
-// Number.prototype.toLocaleString('en-US')
+// A number with en-US grouping separators.
 public func count(_ v: Double) -> String {
     let f = NumberFormatter()
     f.locale = Locale(identifier: "en_US")
     f.numberStyle = .decimal
     f.maximumFractionDigits = 3
     f.roundingMode = .halfEven
-    return f.string(from: NSNumber(value: v)) ?? jsNumberString(v)
+    return f.string(from: NSNumber(value: v)) ?? numberString(v)
 }
 public func count(_ v: Int) -> String { count(Double(v)) }
 public func count(_ v: Value) -> String { count(v.asNumber ?? .nan) }
@@ -72,16 +72,16 @@ public func quantity(_ value: Value, _ singular: String, _ plural: String? = nil
     "\(count(value)) \(value.asNumber == 1 ? singular : plural ?? singular + "s")"
 }
 
-// MARK: - Strings with JS (UTF-16) indexing
+// MARK: - Strings indexed by UTF-16 code unit
 
-public func jsSlice(_ s: String, _ start: Int, _ end: Int? = nil) -> String {
+public func sliceString(_ s: String, _ start: Int, _ end: Int? = nil) -> String {
     let u = Array(s.utf16)
     func clamp(_ i: Int) -> Int { i < 0 ? max(0, u.count + i) : min(i, u.count) }
     let a = clamp(start), b = clamp(end ?? u.count)
     return a < b ? String(decoding: u[a..<b], as: UTF16.self) : ""
 }
 
-public func jsArraySlice(_ xs: [Value], _ start: Int, _ end: Int? = nil) -> [Value] {
+public func sliceArray(_ xs: [Value], _ start: Int, _ end: Int? = nil) -> [Value] {
     func clamp(_ i: Int) -> Int { i < 0 ? max(0, xs.count + i) : min(i, xs.count) }
     let a = clamp(start), b = clamp(end ?? xs.count)
     return a < b ? Array(xs[a..<b]) : []
@@ -97,21 +97,21 @@ public func padEnd(_ s: String, _ n: Int, _ fill: String = " ") -> String {
 }
 
 extension String {
-    // JS String.prototype.trim whitespace set.
-    public var jsTrim: String { trimmingCharacters(in: .whitespacesAndNewlines) }
-    public func jsSplit(_ sep: String) -> [String] {
+    // Trims whitespace and newlines.
+    public var trimmingWhitespace: String { trimmingCharacters(in: .whitespacesAndNewlines) }
+    public func splitting(_ sep: String) -> [String] {
         if sep.isEmpty { return utf16.map { String(utf16CodeUnits: [$0], count: 1) } }
         return components(separatedBy: sep)
     }
 }
 
-// MARK: - Regular expressions (JS syntax through ICU)
+// MARK: - Regular expressions (ICU)
 
-public final class JSRegExp {
+public final class TextPattern {
     public let source: String
     public let flags: String
     let re: NSRegularExpression
-    private static var cache: [String: JSRegExp] = [:]
+    private static var cache: [String: TextPattern] = [:]
     private static let lock = NSLock()
 
     public init(_ source: String, _ flags: String = "") {
@@ -121,10 +121,11 @@ public final class JSRegExp {
         if flags.contains("i") { opts.insert(.caseInsensitive) }
         if flags.contains("m") { opts.insert(.anchorsMatchLines) }
         if flags.contains("s") { opts.insert(.dotMatchesLineSeparators) }
-        re = try! NSRegularExpression(pattern: flags.contains("m") ? source : JSRegExp.strictEnd(source), options: opts)
+        re = try! NSRegularExpression(pattern: flags.contains("m") ? source : TextPattern.strictEnd(source), options: opts)
     }
 
-    // ICU's `$` also matches before a final newline; JS's only matches at the very end.
+    // ICU's `$` also matches before a final newline. Rewrites `$` outside classes so that, without the m flag,
+    // it matches only at the very end.
     static func strictEnd(_ source: String) -> String {
         var out = "", escaped = false, inClass = false
         for ch in source {
@@ -140,11 +141,11 @@ public final class JSRegExp {
         return out
     }
 
-    public static func cached(_ source: String, _ flags: String = "") -> JSRegExp {
+    public static func cached(_ source: String, _ flags: String = "") -> TextPattern {
         lock.lock(); defer { lock.unlock() }
         let key = flags + "/" + source
         if let r = cache[key] { return r }
-        let r = JSRegExp(source, flags)
+        let r = TextPattern(source, flags)
         cache[key] = r
         return r
     }
@@ -168,7 +169,7 @@ public final class JSRegExp {
             return r.location == NSNotFound ? nil : Range(r, in: s).map { String(s[$0]) }
         }
     }
-    // s.replace(re, replacement) honoring the g flag; replacement uses JS `$1` syntax.
+    // Replaces the first match, or every match with the g flag; the replacement uses `$1` group syntax.
     public func replace(_ s: String, _ template: String) -> String {
         let t = template.replacingOccurrences(of: "$&", with: "$0")
         let range = NSRange(s.startIndex..., in: s)
@@ -202,13 +203,13 @@ public final class JSRegExp {
     }
 }
 
-public func re(_ source: String, _ flags: String = "") -> JSRegExp { JSRegExp.cached(source, flags) }
+public func re(_ source: String, _ flags: String = "") -> TextPattern { TextPattern.cached(source, flags) }
 
 // MARK: - Dates
 
 public func dateNow() -> Double { process.now() }
 
-// new Date(ms).toISOString()
+// An epoch time in milliseconds as an ISO 8601 UTC string with milliseconds.
 public func isoString(_ ms: Double) -> String {
     let secs = (ms / 1000).rounded(.down)
     let millis = Int(ms - secs * 1000)
@@ -242,7 +243,7 @@ public func dateParse(_ s: String) -> Double {
         return (d.timeIntervalSince1970 * 1000).rounded() + (frac * 1000).rounded(.down)
     }
     // "Fri Sep  4 18:00:00 2026" (ps lstart, local time)
-    // Date#toString appends " (Pacific Standard Time)", which Date.parse ignores.
+    // A trailing zone name such as " (Pacific Standard Time)" is ignored.
     let text = re(#"\s*\([^()]*\)$"#).replace(s.replacingOccurrences(of: "  ", with: " ")) { _ in "" }
     for f in DateCache.shared.formatters(TimeZone.current) {
         if let d = f.date(from: text) { return (d.timeIntervalSince1970 * 1000).rounded() }
@@ -285,7 +286,7 @@ final class DateCache: @unchecked Sendable {
 }
 
 // stamp(): receipt file names.
-public func stamp() -> String { jsSlice(isoNow(), 0, 23).replacingOccurrences(of: ":", with: "-").replacingOccurrences(of: ".", with: "-") }
+public func stamp() -> String { sliceString(isoNow(), 0, 23).replacingOccurrences(of: ":", with: "-").replacingOccurrences(of: ".", with: "-") }
 
 // MARK: - Crypto
 
@@ -311,14 +312,15 @@ public func aes128cbcDecrypt(_ data: Data, key: Data, iv: Data) throws -> Data {
         CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES128), CCOptions(kCCOptionPKCS7Padding),
                 k.baseAddress, key.count, v.baseAddress, d.baseAddress, data.count, &out, out.count, &moved)
     } } }
-    if status != kCCSuccess { throw JSError("bad decrypt", code: "ERR_OSSL_BAD_DECRYPT") }
+    if status != kCCSuccess { throw EngineError("bad decrypt", code: "ERR_OSSL_BAD_DECRYPT") }
     return Data(out[0..<moved])
 }
 
 // MARK: - Numbers
 
-// Number(v)
-public func jsNumber(_ v: Value) -> Double {
+// A value's numeric form. Strings parse after trimming (blank is 0, 0x is hex, Infinity is allowed), booleans
+// are 0 or 1, null is 0, an array converts through its only element (empty is 0), and anything else is NaN.
+public func toNumber(_ v: Value) -> Double {
     switch v {
     case .undefined: return .nan
     case .null: return 0
@@ -326,14 +328,14 @@ public func jsNumber(_ v: Value) -> Double {
     case .number(let d): return d
     case .bigint(let i): return Double(i)
     case .string(let s):
-        let t = s.jsTrim
+        let t = s.trimmingWhitespace
         if t.isEmpty { return 0 }
         if t.hasPrefix("0x") || t.hasPrefix("0X") { return UInt64(t.dropFirst(2), radix: 16).map(Double.init) ?? .nan }
         if t == "Infinity" || t == "+Infinity" { return .infinity }
         if t == "-Infinity" { return -.infinity }
         guard t.allSatisfy({ "0123456789+-.eE".contains($0) }) else { return .nan }
         return Double(t) ?? .nan
-    case .array(let a): return a.items.isEmpty ? 0 : a.items.count == 1 ? jsNumber(.string(a.items[0].description)) : .nan
+    case .array(let a): return a.items.isEmpty ? 0 : a.items.count == 1 ? toNumber(.string(a.items[0].description)) : .nan
     default: return .nan
     }
 }
@@ -347,21 +349,21 @@ public func isFiniteNumber(_ v: Value) -> Bool { if case .number(let d) = v { re
 // MARK: - Arrays
 
 extension Array where Element == Value {
-    public var value: Value { .array(JSArray(self)) }
+    public var value: Value { .array(ValueArray(self)) }
 }
 
 extension Array where Element == String {
     public var value: Value { .strings(self) }
 }
 
-// [...new Set(xs)]
-public func unique(_ xs: [Value]) -> [Value] { JSSet(xs).values }
+// The distinct values in first-seen order.
+public func unique(_ xs: [Value]) -> [Value] { ValueSet(xs).values }
 public func unique(_ xs: [String]) -> [String] {
     var seen = Set<String>()
     return xs.filter { seen.insert($0).inserted }
 }
 
-// Array.prototype.sort() with no comparator: by ToString, UTF-16 order, undefined last.
+// Default value order: by string form in UTF-16 order, undefined last.
 public func defaultSorted(_ xs: [Value]) -> [Value] {
     let defined = xs.filter { !$0.isUndefined }, undef = xs.filter { $0.isUndefined }
     return defined.enumerated().sorted { a, b in
@@ -371,8 +373,8 @@ public func defaultSorted(_ xs: [Value]) -> [Value] {
 }
 public func defaultSorted(_ xs: [String]) -> [String] { xs.sorted(by: utf16Less) }
 
-// Stable sort with a JS comparator returning a number.
-public func jsSorted(_ xs: [Value], _ compare: (Value, Value) throws -> Double) rethrows -> [Value] {
+// Stable sort with a comparator returning a negative, zero or positive number.
+public func stableSorted(_ xs: [Value], _ compare: (Value, Value) throws -> Double) rethrows -> [Value] {
     try xs.enumerated().sorted { a, b in
         let c = try compare(a.element, b.element)
         return c < 0 || (c == 0 && a.offset < b.offset)

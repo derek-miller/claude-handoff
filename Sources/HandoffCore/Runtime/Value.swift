@@ -1,8 +1,7 @@
 import Foundation
 
-// A JavaScript-shaped dynamic value. The engine was written against untyped JSON that it mutates in
-// place and writes back byte-for-byte, so objects and arrays are shared references, keys keep JS order,
-// and serialization matches JSON.stringify.
+// A dynamic value. The engine works on untyped JSON that it mutates in place and writes back byte for byte,
+// so objects and arrays are shared references, keys keep insertion order, and undefined is distinct from null.
 @dynamicMemberLookup
 public enum Value {
     case undefined
@@ -11,33 +10,33 @@ public enum Value {
     case number(Double)
     case bigint(Int64)
     case string(String)
-    case array(JSArray)
-    case object(JSObject)
-    case set(JSSet)
-    case map(JSMap)
-    case function(JSFunction)
-    case bytes(JSBytes)
+    case array(ValueArray)
+    case object(ValueObject)
+    case set(ValueSet)
+    case map(ValueMap)
+    case function(ValueFunction)
+    case bytes(ValueBytes)
 }
 
-public final class JSArray {
+public final class ValueArray {
     public var items: [Value]
-    public var props: JSObject?
+    public var props: ValueObject?
     public init(_ items: [Value] = []) { self.items = items }
 }
 
-public final class JSBytes {
+public final class ValueBytes {
     public var data: Data
     public init(_ data: Data) { self.data = data }
 }
 
-public final class JSFunction {
+public final class ValueFunction {
     public let body: ([Value]) throws -> Value
-    public var props: JSObject?
+    public var props: ValueObject?
     public init(_ body: @escaping ([Value]) throws -> Value) { self.body = body }
 }
 
-// Property order follows ECMAScript OrdinaryOwnPropertyKeys: array-index keys ascending, then strings in insertion order.
-public final class JSObject {
+// Property order: integer-like keys ascending, then the other keys in insertion order.
+public final class ValueObject {
     public private(set) var indexKeys: [String] = []
     public private(set) var stringKeys: [String] = []
     public private(set) var storage: [String: Value] = [:]
@@ -45,7 +44,7 @@ public final class JSObject {
     public init() {}
     public init(_ pairs: [(String, Value)]) { for (k, v) in pairs { self[k] = v } }
 
-    // Error objects keep `message` and `name` non-enumerable, as in JS.
+    // Error objects keep `message` and `name` non-enumerable, so they stay out of JSON and key lists.
     public var hidden: Set<String> = []
     public var keys: [String] {
         let all = indexKeys.isEmpty ? stringKeys : indexKeys + stringKeys
@@ -66,8 +65,8 @@ public final class JSObject {
         get { storage[key] ?? .undefined }
         set {
             if storage.updateValue(newValue, forKey: key) == nil {
-                if let n = JSObject.arrayIndex(key) {
-                    let pos = indexKeys.firstIndex { JSObject.arrayIndex($0)! > n } ?? indexKeys.count
+                if let n = ValueObject.arrayIndex(key) {
+                    let pos = indexKeys.firstIndex { ValueObject.arrayIndex($0)! > n } ?? indexKeys.count
                     indexKeys.insert(key, at: pos)
                 } else {
                     stringKeys.append(key)
@@ -86,7 +85,7 @@ public final class JSObject {
     public var entries: [(String, Value)] { keys.map { ($0, storage[$0]!) } }
 }
 
-// SameValueZero identity for Set and Map keys.
+// Set and map key identity: strings and numbers by value (NaN equals NaN, 0 equals -0), objects by reference.
 public enum HashKey: Hashable {
     case undefined, null, bool(Bool), number(Double), nan, bigint(Int64), string(String), ref(ObjectIdentifier)
     init(_ v: Value) {
@@ -107,14 +106,14 @@ public enum HashKey: Hashable {
     }
 }
 
-public final class JSSet {
+public final class ValueSet {
     public private(set) var values: [Value] = []
     private var index: [HashKey: Int] = [:]
-    public var props: JSObject?
+    public var props: ValueObject?
     public init(_ values: [Value] = []) { for v in values { add(v) } }
     public var size: Int { index.count }
     public func has(_ v: Value) -> Bool { index[HashKey(v)] != nil }
-    @discardableResult public func add(_ v: Value) -> JSSet {
+    @discardableResult public func add(_ v: Value) -> ValueSet {
         let k = HashKey(v)
         if index[k] == nil { index[k] = values.count; values.append(v) }
         return self
@@ -126,18 +125,18 @@ public final class JSSet {
         return true
     }
     public func clear() { values = []; index = [:] }
-    public func isSubset(of other: JSSet) -> Bool { size <= other.size && values.allSatisfy { other.has($0) } }
+    public func isSubset(of other: ValueSet) -> Bool { size <= other.size && values.allSatisfy { other.has($0) } }
 }
 
-public final class JSMap {
+public final class ValueMap {
     public private(set) var keys: [Value] = []
     private var storage: [HashKey: Value] = [:]
-    public var props: JSObject?
+    public var props: ValueObject?
     public init(_ pairs: [(Value, Value)] = []) { for (k, v) in pairs { set(k, v) } }
     public var size: Int { storage.count }
     public func has(_ k: Value) -> Bool { storage[HashKey(k)] != nil }
     public func get(_ k: Value) -> Value { storage[HashKey(k)] ?? .undefined }
-    @discardableResult public func set(_ k: Value, _ v: Value) -> JSMap {
+    @discardableResult public func set(_ k: Value, _ v: Value) -> ValueMap {
         let h = HashKey(k)
         if storage.updateValue(v, forKey: h) == nil { keys.append(k) }
         return self
@@ -162,8 +161,8 @@ extension Value: ExpressibleByStringLiteral, ExpressibleByIntegerLiteral, Expres
     public init(integerLiteral value: Int) { self = .number(Double(value)) }
     public init(floatLiteral value: Double) { self = .number(value) }
     public init(booleanLiteral value: Bool) { self = .bool(value) }
-    public init(arrayLiteral elements: Value...) { self = .array(JSArray(elements)) }
-    public init(dictionaryLiteral elements: (String, Value)...) { self = .object(JSObject(elements)) }
+    public init(arrayLiteral elements: Value...) { self = .array(ValueArray(elements)) }
+    public init(dictionaryLiteral elements: (String, Value)...) { self = .object(ValueObject(elements)) }
     public init(nilLiteral: ()) { self = .null }
 
     public init(_ s: String) { self = .string(s) }
@@ -171,15 +170,15 @@ extension Value: ExpressibleByStringLiteral, ExpressibleByIntegerLiteral, Expres
     public init(_ n: Int) { self = .number(Double(n)) }
     public init(_ n: Double) { self = .number(n) }
     public init(_ b: Bool) { self = .bool(b) }
-    public init(_ items: [Value]) { self = .array(JSArray(items)) }
-    public init(_ pairs: [(String, Value)]) { self = .object(JSObject(pairs)) }
-    public init(_ fn: @escaping ([Value]) throws -> Value) { self = .function(JSFunction(fn)) }
-    public init(_ data: Data) { self = .bytes(JSBytes(data)) }
-    public static func strings(_ xs: [String]) -> Value { .array(JSArray(xs.map { .string($0) })) }
-    public static func newSet(_ xs: [Value] = []) -> Value { .set(JSSet(xs)) }
-    public static func newMap(_ xs: [(Value, Value)] = []) -> Value { .map(JSMap(xs)) }
-    public static func newObject() -> Value { .object(JSObject()) }
-    public static func newArray() -> Value { .array(JSArray()) }
+    public init(_ items: [Value]) { self = .array(ValueArray(items)) }
+    public init(_ pairs: [(String, Value)]) { self = .object(ValueObject(pairs)) }
+    public init(_ fn: @escaping ([Value]) throws -> Value) { self = .function(ValueFunction(fn)) }
+    public init(_ data: Data) { self = .bytes(ValueBytes(data)) }
+    public static func strings(_ xs: [String]) -> Value { .array(ValueArray(xs.map { .string($0) })) }
+    public static func newSet(_ xs: [Value] = []) -> Value { .set(ValueSet(xs)) }
+    public static func newMap(_ xs: [(Value, Value)] = []) -> Value { .map(ValueMap(xs)) }
+    public static func newObject() -> Value { .object(ValueObject()) }
+    public static func newArray() -> Value { .array(ValueArray()) }
 }
 
 // MARK: - Inspection
@@ -202,7 +201,7 @@ extension Value {
     public var isString: Bool { if case .string = self { return true }; return false }
     public var isNumber: Bool { if case .number = self { return true }; return false }
     public var isFunction: Bool { if case .function = self { return true }; return false }
-    // typeof v === 'object' && v !== null
+    // An object, array, set, map or byte buffer.
     public var isObjectLike: Bool {
         switch self {
         case .array, .object, .set, .map, .bytes: return true
@@ -229,11 +228,11 @@ extension Value {
     public var asNumber: Double? { if case .number(let d) = self { return d }; return nil }
     public var asInt: Int? { if case .number(let d) = self, d.isFinite, d == d.rounded(), abs(d) < 9.3e18 { return Int(d) }; return nil }
     public var asBool: Bool? { if case .bool(let b) = self { return b }; return nil }
-    public var asArray: JSArray? { if case .array(let a) = self { return a }; return nil }
-    public var asObject: JSObject? { if case .object(let o) = self { return o }; return nil }
-    public var asSet: JSSet? { if case .set(let s) = self { return s }; return nil }
-    public var asMap: JSMap? { if case .map(let m) = self { return m }; return nil }
-    public var asFunction: JSFunction? { if case .function(let f) = self { return f }; return nil }
+    public var asArray: ValueArray? { if case .array(let a) = self { return a }; return nil }
+    public var asObject: ValueObject? { if case .object(let o) = self { return o }; return nil }
+    public var asSet: ValueSet? { if case .set(let s) = self { return s }; return nil }
+    public var asMap: ValueMap? { if case .map(let m) = self { return m }; return nil }
+    public var asFunction: ValueFunction? { if case .function(let f) = self { return f }; return nil }
     public var asData: Data? { if case .bytes(let b) = self { return b.data }; return nil }
 
     // Elements of an array, the values of a Set, or [] for anything else. Use for `for … of` and array transforms.
@@ -241,11 +240,11 @@ extension Value {
         switch self {
         case .array(let a): return a.items
         case .set(let s): return s.values
-        case .map(let m): return m.entries.map { .array(JSArray([$0.0, $0.1])) }
+        case .map(let m): return m.entries.map { .array(ValueArray([$0.0, $0.1])) }
         default: return []
         }
     }
-    // Own enumerable string keys (Object.keys).
+    // Enumerable string keys, in order.
     public var ownKeys: [String] {
         switch self {
         case .object(let o): return o.keys
@@ -263,7 +262,7 @@ extension Value {
         }
     }
 
-    var props: JSObject? {
+    var props: ValueObject? {
         switch self {
         case .array(let a): return a.props
         case .set(let s): return s.props
@@ -273,12 +272,12 @@ extension Value {
         }
     }
 
-    private func ensureProps() -> JSObject? {
+    private func ensureProps() -> ValueObject? {
         switch self {
-        case .array(let a): if a.props == nil { a.props = JSObject() }; return a.props
-        case .set(let s): if s.props == nil { s.props = JSObject() }; return s.props
-        case .map(let m): if m.props == nil { m.props = JSObject() }; return m.props
-        case .function(let f): if f.props == nil { f.props = JSObject() }; return f.props
+        case .array(let a): if a.props == nil { a.props = ValueObject() }; return a.props
+        case .set(let s): if s.props == nil { s.props = ValueObject() }; return s.props
+        case .map(let m): if m.props == nil { m.props = ValueObject() }; return m.props
+        case .function(let f): if f.props == nil { f.props = ValueObject() }; return f.props
         default: return nil
         }
     }
@@ -365,7 +364,7 @@ extension Value {
     public func call(_ args: Value...) throws -> Value { try callArgs(args) }
     @discardableResult
     public func callArgs(_ args: [Value]) throws -> Value {
-        guard case .function(let f) = self else { throw JSError.type("\(self.typeOf) is not a function") }
+        guard case .function(let f) = self else { throw EngineError.type("\(self.typeOf) is not a function") }
         return try f.body(args)
     }
 }
@@ -395,31 +394,31 @@ extension Value {
 }
 
 extension Value: Equatable {
-    // Swift `==` is JS `===`, so `Value` can be used with contains/firstIndex.
+    // `==` is strict equality (no type coercion; objects compare by identity), so `Value` works with contains/firstIndex.
     public static func == (a: Value, b: Value) -> Bool { a === b }
 }
 
 infix operator ??= : AssignmentPrecedence
 
-// JS `??` (null and undefined only).
+// `??` falls back only for null and undefined.
 public func ?? (lhs: Value, rhs: @autoclosure () throws -> Value) rethrows -> Value {
     lhs.nullish ? try rhs() : lhs
 }
-// JS `a ??= b` on a property: `obj.key ??= b` — evaluated by reading then writing.
+// `obj.key ??= b` assigns only when the property is null or undefined.
 public func ??= (lhs: inout Value, rhs: @autoclosure () throws -> Value) rethrows {
     if lhs.nullish { lhs = try rhs() }
 }
-// JS `||` and `&&` returning operands.
+// `||` and `&&` on truthiness, returning an operand rather than a Bool.
 public func or(_ a: Value, _ b: @autoclosure () throws -> Value) rethrows -> Value { a.truthy ? a : try b() }
 public func and(_ a: Value, _ b: @autoclosure () throws -> Value) rethrows -> Value { a.truthy ? try b() : a }
 
 // MARK: - Object helpers
 
 extension Value {
-    // `{ ...a, ...b }` — later sources override earlier ones, keeping the first key position.
+    // Merges objects: later sources override earlier ones, and each key keeps its first position.
     public static func spread(_ sources: Value...) -> Value { spread(sources) }
     public static func spread(_ sources: [Value]) -> Value {
-        let o = JSObject()
+        let o = ValueObject()
         for s in sources {
             switch s {
             case .object(let src): for k in src.keys { o[k] = src[k] }
@@ -430,23 +429,23 @@ extension Value {
         }
         return .object(o)
     }
-    // Object.assign(target, ...sources) — mutates and returns target.
+    // Copies every source's keys onto target and returns target.
     @discardableResult
     public static func assign(_ target: Value, _ sources: Value...) -> Value {
         for s in sources { for (k, v) in s.ownEntries { target[k] = v } }
         return target
     }
-    // Object.fromEntries
-    public static func fromEntries(_ pairs: [(String, Value)]) -> Value { .object(JSObject(pairs)) }
+    // An object built from [key, value] pairs.
+    public static func fromEntries(_ pairs: [(String, Value)]) -> Value { .object(ValueObject(pairs)) }
     public static func fromEntries(_ pairs: Value) -> Value {
-        .object(JSObject(pairs.elements.map { ($0[0].description, $0[1]) }))
+        .object(ValueObject(pairs.elements.map { ($0[0].description, $0[1]) }))
     }
-    // Object.entries as [[k, v]]
+    // The [key, value] pairs, in order.
     public var entriesArray: Value { Value(ownEntries.map { Value([.string($0.0), $0.1]) }) }
     public var keysArray: Value { .strings(ownKeys) }
     public var valuesArray: Value { Value(ownEntries.map { $0.1 }) }
 
-    // structuredClone: keeps shared references shared (and cycles intact), clones Sets, Maps and Buffers.
+    // A deep copy that keeps shared references shared and cycles intact, and copies sets, maps and byte buffers.
     public func deepClone() -> Value {
         if !hasSharedReferences() { return treeClone() }
         var seen: [ObjectIdentifier: Value] = [:]
@@ -454,21 +453,21 @@ extension Value {
             switch v {
             case .array(let a):
                 if let c = seen[ObjectIdentifier(a)] { return c }
-                let n = JSArray(); let r = Value.array(n); seen[ObjectIdentifier(a)] = r
+                let n = ValueArray(); let r = Value.array(n); seen[ObjectIdentifier(a)] = r
                 n.items = a.items.map(clone); return r
             case .object(let o):
                 if let c = seen[ObjectIdentifier(o)] { return c }
-                let n = JSObject(); let r = Value.object(n); seen[ObjectIdentifier(o)] = r
+                let n = ValueObject(); let r = Value.object(n); seen[ObjectIdentifier(o)] = r
                 for k in o.keys { n[k] = clone(o[k]) }; return r
             case .set(let s):
                 if let c = seen[ObjectIdentifier(s)] { return c }
-                let n = JSSet(); let r = Value.set(n); seen[ObjectIdentifier(s)] = r
+                let n = ValueSet(); let r = Value.set(n); seen[ObjectIdentifier(s)] = r
                 for x in s.values { n.add(clone(x)) }; return r
             case .map(let m):
                 if let c = seen[ObjectIdentifier(m)] { return c }
-                let n = JSMap(); let r = Value.map(n); seen[ObjectIdentifier(m)] = r
+                let n = ValueMap(); let r = Value.map(n); seen[ObjectIdentifier(m)] = r
                 for (k, x) in m.entries { n.set(clone(k), clone(x)) }; return r
-            case .bytes(let b): return .bytes(JSBytes(b.data))
+            case .bytes(let b): return .bytes(ValueBytes(b.data))
             default: return v
             }
         }
@@ -478,14 +477,14 @@ extension Value {
     // Plain recursive copy for trees (the common case: values parsed from JSON).
     private func treeClone() -> Value {
         switch self {
-        case .array(let a): return .array(JSArray(a.items.map { $0.treeClone() }))
+        case .array(let a): return .array(ValueArray(a.items.map { $0.treeClone() }))
         case .object(let o):
-            let n = JSObject()
+            let n = ValueObject()
             for k in o.keys { n[k] = o[k].treeClone() }
             return .object(n)
-        case .set(let s): return .set(JSSet(s.values.map { $0.treeClone() }))
-        case .map(let m): return .map(JSMap(m.entries.map { ($0.0.treeClone(), $0.1.treeClone()) }))
-        case .bytes(let b): return .bytes(JSBytes(b.data))
+        case .set(let s): return .set(ValueSet(s.values.map { $0.treeClone() }))
+        case .map(let m): return .map(ValueMap(m.entries.map { ($0.0.treeClone(), $0.1.treeClone()) }))
+        case .bytes(let b): return .bytes(ValueBytes(b.data))
         default: return self
         }
     }
@@ -514,7 +513,7 @@ extension Value {
     }
 }
 
-// MARK: - String conversion (JS ToString)
+// MARK: - String conversion
 
 extension Value: CustomStringConvertible {
     public var description: String {
@@ -522,7 +521,7 @@ extension Value: CustomStringConvertible {
         case .undefined: return "undefined"
         case .null: return "null"
         case .bool(let b): return b ? "true" : "false"
-        case .number(let d): return jsNumberString(d)
+        case .number(let d): return numberString(d)
         case .bigint(let i): return String(i)
         case .string(let s): return s
         case .array(let a): return a.items.map { $0.nullish ? "" : $0.description }.joined(separator: ",")
@@ -538,13 +537,13 @@ extension Value: CustomStringConvertible {
     }
 }
 
-// JS Number.prototype.toString() for base 10.
-public func jsNumberString(_ d: Double) -> String {
+// The shortest decimal form that round-trips, in exponent notation below 1e-6 and from 1e21 up.
+public func numberString(_ d: Double) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
     if d == 0 { return "0" }
     let negative = d < 0
-    // Swift's description yields the shortest round-tripping digits; normalize to JS exponent rules.
+    // Swift's description gives the shortest round-trip digits; this applies the exponent thresholds.
     var s = "\(abs(d))"
     var exponent = 0
     if let e = s.firstIndex(where: { $0 == "e" || $0 == "E" }) {
@@ -588,12 +587,12 @@ public func jsNumberString(_ d: Double) -> String {
 
 // MARK: - Errors
 
-// A thrown JS value. Error objects are plain objects carrying `message`, `name`, an optional `code`, and a `__error` marker.
-public struct JSError: Error, CustomStringConvertible {
+// A thrown engine value. Error objects are plain objects carrying `message`, `name`, an optional `code` and a `__error` marker.
+public struct EngineError: Error, CustomStringConvertible {
     public let value: Value
     public init(_ value: Value) { self.value = value }
     public init(_ message: String, code: Value = .undefined, name: String = "Error", extra: [(String, Value)] = []) {
-        let o = JSObject()
+        let o = ValueObject()
         o["message"] = .string(message)
         o["name"] = .string(name)
         if !code.isUndefined { o["code"] = code }
@@ -602,23 +601,23 @@ public struct JSError: Error, CustomStringConvertible {
         o.hidden = ["message", "name", "__error", "stack"]
         value = .object(o)
     }
-    public static func type(_ message: String) -> JSError { JSError(message, name: "TypeError") }
-    public static func range(_ message: String) -> JSError { JSError(message, name: "RangeError") }
+    public static func type(_ message: String) -> EngineError { EngineError(message, name: "TypeError") }
+    public static func range(_ message: String) -> EngineError { EngineError(message, name: "RangeError") }
 
     public var message: String { value["message"].asString ?? value.description }
     public var code: Value { value["code"] }
     public var description: String { value.description }
 }
 
-// Normalize any Swift error into the JS error value the engine inspects (`error.code`, `error.message`).
-public func jsErrorValue(_ error: Error) -> Value {
-    if let e = error as? JSError { return e.value }
-    return JSError("\(error)").value
+// Normalizes any Swift error into the error object the engine inspects (`error.code`, `error.message`).
+public func errorObject(_ error: Error) -> Value {
+    if let e = error as? EngineError { return e.value }
+    return EngineError("\(error)").value
 }
 
-// `throw Object.assign(new Error(message), { code, ... })`
-public func jsThrow(_ message: String, code: String? = nil, _ extra: [(String, Value)] = []) -> JSError {
-    JSError(message, code: code.map { .string($0) } ?? .undefined, extra: extra)
+// An error with a message, an optional code and any extra properties.
+public func makeError(_ message: String, code: String? = nil, _ extra: [(String, Value)] = []) -> EngineError {
+    EngineError(message, code: code.map { .string($0) } ?? .undefined, extra: extra)
 }
 
 extension Value {
@@ -629,7 +628,7 @@ extension Value {
 // MARK: - Collection conveniences (Set, Map, Array)
 
 extension Value {
-    // Set.prototype.has / Map.prototype.has
+    // Set or map membership.
     public func has(_ v: Value) -> Bool {
         switch self {
         case .set(let s): return s.has(v)
@@ -638,14 +637,14 @@ extension Value {
         }
     }
     public func has(_ s: String) -> Bool { has(.string(s)) }
-    // Set.prototype.add
+    // Adds to a set.
     @discardableResult public func add(_ v: Value) -> Value { asSet?.add(v); return self }
-    // Map.prototype.get
+    // Reads a map entry.
     public func get(_ k: Value) -> Value { asMap?.get(k) ?? .undefined }
     public func get(_ k: String) -> Value { get(.string(k)) }
-    // Map.prototype.set
+    // Writes a map entry.
     @discardableResult public func put(_ k: Value, _ v: Value) -> Value { asMap?.set(k, v); return self }
-    // Set/Map.prototype.delete
+    // Removes a set member or map entry.
     @discardableResult public func delete(_ k: Value) -> Bool {
         switch self {
         case .set(let s): return s.delete(k)
@@ -653,9 +652,9 @@ extension Value {
         default: return false
         }
     }
-    // Array.prototype.push
+    // Appends to an array.
     public func push(_ vs: Value...) { asArray?.items.append(contentsOf: vs) }
-    // Array.prototype.includes / String.prototype.includes
+    // Array membership or substring test.
     public func includes(_ v: Value) -> Bool {
         switch self {
         case .array(let a): return a.items.contains { $0 === v || ($0.asNumber?.isNaN == true && v.asNumber?.isNaN == true) }
@@ -663,6 +662,6 @@ extension Value {
         default: return false
         }
     }
-    // Array.prototype.join
+    // Joins array elements' string forms.
     public func join(_ sep: String = ",") -> String { elements.map { $0.nullish ? "" : $0.description }.joined(separator: sep) }
 }

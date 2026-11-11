@@ -17,7 +17,7 @@ extension Engine.Restarts {
         deq(first.receipt.sessions.map { $0.id }, [Value(cold)])
         throwsError("Synthetic interrupted continuation") {
             try finishHeld(h.paths, ["processes": [], "report": fn { args in
-                if args[0] == "retire" && Self.arg(args, 1) == "checking" { throw JSError("Synthetic interrupted continuation") }
+                if args[0] == "retire" && Self.arg(args, 1) == "checking" { throw EngineError("Synthetic interrupted continuation") }
                 return .undefined
             }])
         }
@@ -140,7 +140,7 @@ extension Engine.Restarts {
         }
         let result = try undo(h.paths, ["io": ["inspect": fn { _ in rows }, "command": fn { _ in
             Issue.record("stale receipt must not restart")
-            throw JSError("stale receipt must not restart")
+            throw EngineError("stale receipt must not restart")
         }]])
         fs.mkdir = original
         ok(before)

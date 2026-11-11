@@ -31,11 +31,11 @@ extension Engine.Restarts {
         let h = try home(), mock = taskHarness(), plan = try restartPlan(nil, h.paths, mock.rows)
         try mkdirp(h.paths.state)
         let file = path.join(h.paths.state.str, "restart-events.jsonl")
-        try NodeFS.nativeWriteFile(file, Data(String(repeating: "{}\n", count: 1024 * 1024 / 3).utf8), "w", 0o600)
+        try FileSystem.nativeWriteFile(file, Data(String(repeating: "{}\n", count: 1024 * 1024 / 3).utf8), "w", 0o600)
         for attempt in 0..<3 {
             mock.rows = [desktopFixture()[0]]
             _ = try withDesktopRestart(.spread(plan, ["kind": Value(attempt == 1 ? "user@example.com" : attempt == 2 ? "undo" : "refresh")]), h.paths, fn { _ in
-                if attempt == 1 { throw JSError("Synthetic private title user@example.com prompt approval-token server-response") }
+                if attempt == 1 { throw EngineError("Synthetic private title user@example.com prompt approval-token server-response") }
                 return nil
             }, NOOP, mock.io)
         }
@@ -53,7 +53,7 @@ extension Engine.Restarts {
         let planned = try executeMove([from], to, h.paths, ["io": mock.io])
         let original = fs.open
         let failing: (String, Int32, Int) throws -> HandoffCore.FileHandle = { file, flags, mode in
-            if file.contains("restart-events.jsonl") { throw JSError("fixture diagnostic storage unavailable") }
+            if file.contains("restart-events.jsonl") { throw EngineError("fixture diagnostic storage unavailable") }
             return try original(file, flags, mode)
         }
         fs.open = failing

@@ -21,7 +21,7 @@ extension Engine.Restarts {
             fs.link = { a, b in
                 if mode.hasPrefix("retry") && b == h.recordFile("T", SOURCE) {
                     attempts += 1
-                    if attempts == 1 { throw JSError("Synthetic temporary failure") }
+                    if attempts == 1 { throw EngineError("Synthetic temporary failure") }
                 }
                 try native(a, b)
             }

@@ -81,7 +81,7 @@ extension Engine.Cloud {
         let active: Value = ["account": Value(f.h.acct.P), "org": Value(f.h.org.P), "state": "known", "at": Value(isoString(now - 1000))]
         let options = Value.spread(f.options, ["active": active, "cloud": fn { args in
             attempts += 1
-            if !ready { throw jsThrow("Claude Desktop login is still updating", code: "CLOUD_AUTH_PENDING") }
+            if !ready { throw makeError("Claude Desktop login is still updating", code: "CLOUD_AUTH_PENDING") }
             return try f.client.call(Self.arg(args, 0))
         }])
         let first = try sweep(f.h.paths, options)
@@ -108,7 +108,7 @@ extension Engine.Cloud {
         let f = try pendingOrganizations(orgs: ["P"])
         var now = dateNow(), attempts = 0
         process.now = { now }
-        let options = Value.spread(f.options, ["cloud": fn { _ in attempts += 1; throw jsThrow("history exceeds the event limit", code: "CLOUD_HISTORY_LIMIT") }])
+        let options = Value.spread(f.options, ["cloud": fn { _ in attempts += 1; throw makeError("history exceeds the event limit", code: "CLOUD_HISTORY_LIMIT") }])
         let first = try sweep(f.h.paths, options), receipt = first.result.receipt, source = receipt.cloudChecks[0]
         let presentation = try pendingPresentation(receipt, source, ["signedIn": true], "cloud")
         eq(presentation.pendingState, "limit")

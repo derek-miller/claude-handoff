@@ -2,15 +2,13 @@ import CryptoKit
 import Darwin
 import Foundation
 
-// engine.js lines 593-1251: account discovery, analysis cache, tree manifests, locking, the Desktop login,
-// and the claude.ai client. The label patch (unsnappy … desktopProfiles and the blocks inside `logins`) cites
-// line numbers in the locally patched copy (Claude Handoff.app/Contents/Resources/engine.js) as `// L<n> (patched)`.
+// Account discovery, the analysis cache, tree manifests, locking, the Desktop login and the claude.ai client.
 
 // MARK: - Local helpers
 
-// `v.k` where JS would throw a TypeError on null/undefined.
+// `v.k`, throwing a TypeError when `v` is null or undefined.
 fileprivate func member(_ v: Value, _ k: String) throws -> Value {
-    if v.nullish { throw JSError.type("Cannot read properties of \(v.isNull ? "null" : "undefined") (reading '\(k)')") }
+    if v.nullish { throw EngineError.type("Cannot read properties of \(v.isNull ? "null" : "undefined") (reading '\(k)')") }
     return v[k]
 }
 
@@ -18,8 +16,8 @@ fileprivate func isDirectoryStat(_ st: Value) throws -> Bool { try st["isDirecto
 fileprivate func isFileStat(_ st: Value) throws -> Bool { try st["isFile"].call().truthy }
 fileprivate func isSymlinkStat(_ st: Value) throws -> Bool { try st["isSymbolicLink"].call().truthy }
 
-// Math.max(...xs) with ToNumber coercion; NaN wins.
-fileprivate func jsMax(_ xs: [Double]) -> Double {
+// The largest number, or NaN if any is NaN.
+fileprivate func nanMax(_ xs: [Double]) -> Double {
     var out = -Double.infinity
     for x in xs {
         if x.isNaN { return .nan }
@@ -28,10 +26,10 @@ fileprivate func jsMax(_ xs: [Double]) -> Double {
     return out
 }
 
-// Math.round
-fileprivate func jsRound(_ x: Double) -> Double { x.isFinite ? (x + 0.5).rounded(.down) : x }
+// Rounds half up; infinities and NaN pass through.
+fileprivate func roundHalfUp(_ x: Double) -> Double { x.isFinite ? (x + 0.5).rounded(.down) : x }
 
-// String.prototype.trimEnd
+// Drops trailing whitespace.
 fileprivate func trimEnd(_ s: String) -> String {
     var scalars = Array(s.unicodeScalars)
     while let last = scalars.last, CharacterSet.whitespacesAndNewlines.contains(last) || last == "\u{FEFF}" { scalars.removeLast() }
@@ -40,7 +38,7 @@ fileprivate func trimEnd(_ s: String) -> String {
     return out
 }
 
-// Buffer.from(hex, 'hex'): stops at the first invalid pair.
+// Hex-decodes, stopping at the first invalid pair.
 fileprivate func hexData(_ s: String) -> Data {
     var out = Data()
     let u = Array(s.utf8)
@@ -83,7 +81,7 @@ fileprivate func decimalLessOrEqual(_ a: String, _ b: String) -> Bool {
     return x <= y
 }
 
-// Insertion-ordered string set (JS Set<string>).
+// Insertion-ordered string set.
 fileprivate final class OrderedStrings {
     var items: [String] = []
     var seen: Set<String> = []
@@ -94,31 +92,27 @@ fileprivate final class OrderedStrings {
 
 // MARK: - Folders and trees
 
-// L593
 func dirs(_ root: Value = .undefined) throws -> Value {
     let entries = (try? fs.readdir(root.description)) ?? []
     return defaultSorted(entries.filter { $0.isDirectory && UUID.test($0.name) }.map(\.name)).value
 }
 
-// L598
 func mappedPath(_ file: Value = .undefined) throws -> Value {
     let f = file.description
     return Value(path.join(try fs.realpath(path.dirname(f)), path.basename(f)))
 }
 
-// L599
 func sameTree(_ expected: Value = .undefined, _ current: Value = .undefined) throws -> Value {
     Value(current.truthy && expected["fingerprint"] === current["fingerprint"] && (!expected["canonicalRoot"].truthy || expected["canonicalRoot"] === current["canonicalRoot"]))
 }
 
-// L601
 func tree(_ root: Value = .undefined, _ canonicalRoot: Value = .undefined) throws -> Value {
     var out: [Value] = []
     let rootPath = root.description, canonical = canonicalRoot.description
     func walk(_ dir: String) throws {
         let before = try fs.lstat(dir, bigint: true)
         if try !isDirectoryStat(before) || fs.realpath(dir) != path.resolve(dir) {
-            throw JSError("unsupported entry \(path.join(rootPath, path.relative(canonical, dir)))")
+            throw EngineError("unsupported entry \(path.join(rootPath, path.relative(canonical, dir)))")
         }
         let entries = try fs.readdir(dir).enumerated().sorted { a, b in
             let c = localeCompare(a.element.name, b.element.name)
@@ -126,23 +120,22 @@ func tree(_ root: Value = .undefined, _ canonicalRoot: Value = .undefined) throw
         }.map(\.element)
         for e in entries {
             let p = path.join(dir, e.name)
-            if e.isDirectory { try walk(p) } else if e.isFile || e.isSymbolicLink { out.append(Value(p)) } else { throw JSError("unsupported entry \(p)") }
+            if e.isDirectory { try walk(p) } else if e.isFile || e.isSymbolicLink { out.append(Value(p)) } else { throw EngineError("unsupported entry \(p)") }
         }
         if try statIdentity(fs.lstat(dir, bigint: true)) !== statIdentity(before) || fs.realpath(dir) != path.resolve(dir) {
-            throw JSError("sidecars changed while reading")
+            throw EngineError("sidecars changed while reading")
         }
     }
     var detail: Value = .null
     do { detail = try fs.lstat(canonical, bigint: false) } catch {
-        let error = jsErrorValue(error)
-        if error["code"] !== "ENOENT" { throw JSError(error) }
+        let error = errorObject(error)
+        if error["code"] !== "ENOENT" { throw EngineError(error) }
     }
     if detail.truthy { try walk(canonical) }
-    if try mappedPath(root) !== canonicalRoot { throw JSError("sidecar root mapping changed while reading") }
+    if try mappedPath(root) !== canonicalRoot { throw EngineError("sidecar root mapping changed while reading") }
     return out.value
 }
 
-// L620
 func treeFingerprint(_ root: Value = .undefined) throws -> Value {
     let canonicalRoot = try mappedPath(root)
     let files = try tree(root, canonicalRoot)
@@ -151,18 +144,17 @@ func treeFingerprint(_ root: Value = .undefined) throws -> Value {
     for file in files.elements {
         let f = file.description
         let detail = try fs.lstat(f, bigint: true)
-        if try !isFileStat(detail) && !isSymlinkStat(detail) { throw JSError("unsupported entry \(f)") }
+        if try !isFileStat(detail) && !isSymlinkStat(detail) { throw EngineError("unsupported entry \(f)") }
         let identity = try statIdentity(detail)
         signatures.put(file, identity)
         let print: Value = try isSymlinkStat(detail) ? Value("link:\(identity):\(sha(try fs.readlink(f)))") : identity
-        if try statIdentity(fs.lstat(f, bigint: true)) !== identity { throw JSError("sidecars changed while reading") }
+        if try statIdentity(fs.lstat(f, bigint: true)) !== identity { throw EngineError("sidecars changed while reading") }
         dependencies.append(["rel": Value(path.relative(canonicalRoot.description, f)), "fingerprint": print])
     }
-    if try mappedPath(root) !== canonicalRoot { throw JSError("sidecar root mapping changed while reading") }
+    if try mappedPath(root) !== canonicalRoot { throw EngineError("sidecar root mapping changed while reading") }
     return ["files": files, "signatures": signatures, "fingerprint": Value(sha(stable(dependencies.value))), "canonicalRoot": canonicalRoot]
 }
 
-// L637
 func manifest(_ root: Value = .undefined, _ cache: Value = .undefined) throws -> Value {
     let cache = cache.isUndefined ? Value.null : cache
     let before = try treeFingerprint(root)
@@ -174,7 +166,7 @@ func manifest(_ root: Value = .undefined, _ cache: Value = .undefined) throws ->
         for file in files.elements {
             let f = file.description
             let detail = try fs.lstat(f, bigint: true)
-            if try statIdentity(detail) !== before["signatures"].get(file) { throw JSError("sidecars changed while reading") }
+            if try statIdentity(detail) !== before["signatures"].get(file) { throw EngineError("sidecars changed while reading") }
             let rel = Value(path.relative(before["canonicalRoot"].description, f))
             if try isSymlinkStat(detail) {
                 let data = try fs.readlink(f)
@@ -186,17 +178,15 @@ func manifest(_ root: Value = .undefined, _ cache: Value = .undefined) throws ->
             }
         }
     }
-    if try !sameTree(before, treeFingerprint(root)).truthy { throw JSError("sidecars changed while reading") }
+    if try !sameTree(before, treeFingerprint(root)).truthy { throw EngineError("sidecars changed while reading") }
     if cache.truthy && !prior.truthy { _ = try cacheStore(cache, "manifests", root, signature, ["rows": rows]) }
     return try manifestOf(rows, before["fingerprint"], before["canonicalRoot"])
 }
 
-// L660
 func sidecarIdentity(_ row: Value = .undefined) throws -> Value {
     row["type"] === "symlink" ? Value("link:\(row["sha"]):\(row["resolved"])") : row["sha"]
 }
 
-// L662
 func manifestOf(_ rows: Value = .undefined, _ fingerprint: Value = .undefined, _ canonicalRoot: Value = .undefined) throws -> Value {
     let fingerprint = fingerprint.isUndefined ? Value.null : fingerprint
     let canonicalRoot = canonicalRoot.isUndefined ? Value.null : canonicalRoot
@@ -208,12 +198,10 @@ func manifestOf(_ rows: Value = .undefined, _ fingerprint: Value = .undefined, _
 
 // MARK: - Analysis cache
 
-// L674
 func emptyCache() throws -> Value {
     ["version": Value(CACHE_VERSION), "semanticVersion": Value(SEMANTIC_VERSION), "histories": .newObject(), "manifests": .newObject(), "remote": .newObject()]
 }
 
-// L676
 func openAnalysisCache(_ paths: Value = .undefined, _ writable: Value = .undefined) throws -> Value {
     let file = Value(path.join(paths["state"].description, "cache.json"))
     let stored = (try? readJson(file)) ?? .null
@@ -224,7 +212,6 @@ func openAnalysisCache(_ paths: Value = .undefined, _ writable: Value = .undefin
     return ["file": file, "writable": writable, "data": valid ? stored : try emptyCache(), "used": used, "fingerprints": .newMap(), "stats": stats]
 }
 
-// L691
 func fingerprint(_ file: Value = .undefined, _ cache: Value = .undefined) throws -> Value {
     if cache["fingerprints"].has(file) { return cache["fingerprints"].get(file) }
     let detail = try fs.stat(file.description, bigint: true)
@@ -233,35 +220,31 @@ func fingerprint(_ file: Value = .undefined, _ cache: Value = .undefined) throws
     return value
 }
 
-// L699
 let cacheNames: Value = [
     "histories": ["historyHits", "historyMisses"],
     "manifests": ["manifestHits", "manifestMisses"],
     "remote": ["remoteHits", "remoteMisses"],
 ]
 
-// L705
 func cacheLookup(_ cache: Value = .undefined, _ bucket: Value = .undefined, _ key: Value = .undefined, _ signature: Value = .undefined) throws -> Value {
     cache["used"][bucket].add(key)
     let item = cache["data"][bucket][key]
     if item["signature"] === signature {
         let name = cacheNames[bucket][0]
-        cache["stats"][name] = Value(jsNumber(cache["stats"][name]) + 1)
+        cache["stats"][name] = Value(toNumber(cache["stats"][name]) + 1)
         return item["value"]
     }
     let name = cacheNames[bucket][1]
-    cache["stats"][name] = Value(jsNumber(cache["stats"][name]) + 1)
+    cache["stats"][name] = Value(toNumber(cache["stats"][name]) + 1)
     return .null
 }
 
-// L716
 func cacheStore(_ cache: Value = .undefined, _ bucket: Value = .undefined, _ key: Value = .undefined, _ signature: Value = .undefined, _ value: Value = .undefined) throws -> Value {
     cache["used"][bucket].add(key)
     cache["data"][bucket][key] = ["signature": signature, "value": value]
     return .undefined
 }
 
-// L721
 func saveAnalysisCache(_ cache: Value = .undefined) throws -> Value {
     if !cache["writable"].truthy { return .undefined }
     func kept(_ bucket: String) -> Value {
@@ -279,7 +262,6 @@ func saveAnalysisCache(_ cache: Value = .undefined) throws -> Value {
 
 // MARK: - Files
 
-// L734
 public func writeNew(_ file: Value = .undefined, _ text: Value = .undefined, _ created: Value = .undefined) throws -> Value {
     let created = fnOr(created)
     let f = file.description
@@ -299,7 +281,6 @@ public func writeNew(_ file: Value = .undefined, _ text: Value = .undefined, _ c
     return .undefined
 }
 
-// L749
 func quarantine(_ items: Value = .undefined, _ dest: Value = .undefined, _ before: Value = .undefined) throws -> Value {
     let before = fnOr(before)
     for p in items.elements {
@@ -312,21 +293,19 @@ func quarantine(_ items: Value = .undefined, _ dest: Value = .undefined, _ befor
     return .undefined
 }
 
-// L759
-// The JS holds the lock through a long-lived `/usr/bin/lockf` (or perl flock) child; flock(2) on the same
-// file is what those helpers use, so the native engine takes it directly for the duration of `work`.
+// Holds an exclusive flock(2) on state/lock for the duration of `work`, the same lock `/usr/bin/lockf` takes.
 func locked(_ paths: Value = .undefined, _ work: Value = .undefined) throws -> Value {
     try fs.mkdirp(paths["state"].description)
     let lockFile = path.join(paths["state"].description, "lock")
     let handle: FileHandle
     do { handle = try fs.open(lockFile, O_WRONLY | O_CREAT | O_APPEND, 0o666) } catch {
-        throw jsThrow("lock helper failed, exit 73", code: "LOCK_FAILED")
+        throw makeError("lock helper failed, exit 73", code: "LOCK_FAILED")
     }
     if flock(handle.fd, LOCK_EX | LOCK_NB) != 0 {
         let err = errno
         try? handle.close()
-        if err == EWOULDBLOCK { throw jsThrow("another run holds the lock", code: "LOCK_BUSY") }
-        throw jsThrow("lock helper failed, exit 73", code: "LOCK_FAILED")
+        if err == EWOULDBLOCK { throw makeError("another run holds the lock", code: "LOCK_BUSY") }
+        throw makeError("lock helper failed, exit 73", code: "LOCK_FAILED")
     }
     defer {
         _ = flock(handle.fd, LOCK_UN)
@@ -337,13 +316,11 @@ func locked(_ paths: Value = .undefined, _ work: Value = .undefined) throws -> V
 
 // MARK: - Desktop records
 
-// L782
 func recordFiles(_ dir: Value = .undefined) throws -> Value {
     let d = dir.description
     return defaultSorted(try fs.names(d).filter { $0.hasPrefix("local_") && $0.hasSuffix(".json") }).map { path.join(d, $0) }.value
 }
 
-// L784
 func folderRecords(_ dir: Value = .undefined, _ snapshots: Value = .undefined, _ check: Value = .undefined) throws -> Value {
     let snapshots = snapshots.isUndefined ? Value.null : snapshots
     let check = fnOr(check)
@@ -356,17 +333,16 @@ func folderRecords(_ dir: Value = .undefined, _ snapshots: Value = .undefined, _
         let signature = snapshots.truthy ? try fingerprint(file) : Value.null
         let cached = previous["records"].get(file)
         let record = cached["signature"] === signature ? cached["record"] : ((try? readJson(file)) ?? .null)
-        if !record.truthy || !record.isObjectLike || record.isArray { throw JSError("unreadable Desktop record: \(file)") }
-        if try snapshots.truthy && fingerprint(file) !== signature { throw JSError("Desktop record changed while reading: \(file)") }
+        if !record.truthy || !record.isObjectLike || record.isArray { throw EngineError("unreadable Desktop record: \(file)") }
+        if try snapshots.truthy && fingerprint(file) !== signature { throw EngineError("Desktop record changed while reading: \(file)") }
         recordsMap.put(file, ["signature": signature, "record": record])
         productive()
     }
-    if try snapshots.truthy && fingerprint(dir) !== before { throw JSError("Desktop folder changed while reading: \(dir)") }
+    if try snapshots.truthy && fingerprint(dir) !== before { throw EngineError("Desktop folder changed while reading: \(dir)") }
     snapshots.put(dir, ["signature": before, "records": recordsMap])
     return recordsMap.asMap!.entries.map { file, entry -> Value in ["file": file, "record": entry["record"]] }.value
 }
 
-// L804
 func records(_ root: Value = .undefined) throws -> Value {
     var out: [Value] = []
     for account in try dirs(root).elements {
@@ -380,50 +356,45 @@ func records(_ root: Value = .undefined) throws -> Value {
 
 // MARK: - Scheduled tasks
 
-// L815
 func taskSessions(_ file: Value = .undefined) throws -> Value {
     let data: Value
     do { data = try readJson(file) } catch {
-        if jsErrorValue(error)["code"] === "ENOENT" { let s = Value.newSet(); s["registry"] = .null; return s }
-        throw JSError("unreadable scheduled task registry \(file)")
+        if errorObject(error)["code"] === "ENOENT" { let s = Value.newSet(); s["registry"] = .null; return s }
+        throw EngineError("unreadable scheduled task registry \(file)")
     }
-    if !data.truthy || !data.isObjectLike || data.isArray { throw JSError("invalid scheduled task registry \(file)") }
-    if !data["scheduledTasks"].isUndefined && !data["scheduledTasks"].isArray { throw JSError("invalid scheduled task registry \(file)") }
+    if !data.truthy || !data.isObjectLike || data.isArray { throw EngineError("invalid scheduled task registry \(file)") }
+    if !data["scheduledTasks"].isUndefined && !data["scheduledTasks"].isArray { throw EngineError("invalid scheduled task registry \(file)") }
     if TASK_STATE_KEYS.contains(where: { key in !data[key].isUndefined && (!data[key].truthy || !data[key].isObjectLike || data[key].isArray) }) {
-        throw JSError("invalid scheduled task state \(file)")
+        throw EngineError("invalid scheduled task state \(file)")
     }
     let tasks = data["scheduledTasks"] ?? Value.newArray()
     if tasks.elements.contains(where: { task in
         !task.truthy || !task.isObjectLike || task.isArray || !task["id"].isString || !task["id"].truthy ||
             (!task["notifySessionId"].isUndefined && !task["notifySessionId"].isNull && !LOCAL_RECORD.test(task["notifySessionId"].description))
-    }) { throw JSError("invalid scheduled task registry \(file)") }
-    if Set(tasks.elements.map { $0["id"].description }).count != tasks.length { throw JSError("scheduled task id collision in \(file)") }
+    }) { throw EngineError("invalid scheduled task registry \(file)") }
+    if Set(tasks.elements.map { $0["id"].description }).count != tasks.length { throw EngineError("scheduled task id collision in \(file)") }
     let s = Value.newSet(tasks.elements.map { $0["notifySessionId"] }.filter(\.truthy))
     s["registry"] = data
     return s
 }
 
-// L833
 func taskState(_ registry: Value = .undefined, _ ids: Value = .undefined) throws -> Value {
     .fromEntries(TASK_STATE_KEYS.map { key in
         (key, Value.fromEntries((registry[key] ?? Value.newObject()).ownEntries.filter { ids.includes(Value($0.0)) }))
     })
 }
 
-// L834
 func taskStateConflict(_ source: Value = .undefined, _ target: Value = .undefined) throws -> Value {
     Value(TASK_STATE_KEYS.contains { key in
         target[key].ownEntries.contains { id, value in !source[key].hasOwn(id) || stable(source[key][id]) != stable(value) }
     })
 }
 
-// L835
 func sortedTasks(_ tasks: Value = .undefined) throws -> Value {
-    guard tasks.isArray else { throw JSError.type("Cannot read properties of \(tasks.nullish ? tasks.description : "object") (reading 'toSorted')") }
-    return Value(stable(jsSorted(tasks.elements) { a, b in Double(localeCompare(a["id"].description, b["id"].description)) }.value))
+    guard tasks.isArray else { throw EngineError.type("Cannot read properties of \(tasks.nullish ? tasks.description : "object") (reading 'toSorted')") }
+    return Value(stable(stableSorted(tasks.elements) { a, b in Double(localeCompare(a["id"].description, b["id"].description)) }.value))
 }
 
-// L836
 func staleTaskProblem(_ source: Value = .undefined, _ twin: Value = .undefined, _ registry: Value = .undefined, _ records: Value = .undefined, _ unreadable: Value = .undefined) throws -> Value {
     let ignored = ["enabled", "lastRunAt", "lastScheduledFor", "notifySessionId"]
     let keys = defaultSorted(unique(source.ownKeys + twin.ownKeys))
@@ -445,7 +416,6 @@ func staleTaskProblem(_ source: Value = .undefined, _ twin: Value = .undefined, 
     return .null
 }
 
-// L848
 func taskRegistrationKind(_ family: Value = .undefined, _ registry: Value = .undefined, _ target: Value = .undefined, _ sourcePresent: Value = .undefined) throws -> Value {
     let sourcePresent = sourcePresent.isUndefined ? Value(false) : sourcePresent
     let tasks = registry["scheduledTasks"] ?? Value.newArray()
@@ -456,10 +426,9 @@ func taskRegistrationKind(_ family: Value = .undefined, _ registry: Value = .und
     if try owned.length > 0 && sortedTasks(owned) === sortedTasks(family["tasks"]) { return "published" }
     if twin { return "twin" }
     if owned.length == 0 && !(target.truthy && family["replaced"]["length"].truthy) { return "absent" }
-    throw JSError("scheduled task registrations changed")
+    throw EngineError("scheduled task registrations changed")
 }
 
-// L859
 func schedulerBusy(_ paths: Value = .undefined, _ namespaces: Value = .undefined, _ table: Value = .undefined) throws -> Value {
     let table = table.isUndefined ? try processTable(paths["claudeApp"]) : table
     if !table.elements.contains(where: { desktopExecutable($0["executable"]).truthy }) { return false }
@@ -468,7 +437,6 @@ func schedulerBusy(_ paths: Value = .undefined, _ namespaces: Value = .undefined
     return Value(try namespaces.elements.contains { try sameAccount($0, current).truthy })
 }
 
-// L865
 func coldBlocked(_ record: Value = .undefined, _ owners: Value = .undefined) throws -> Value {
     Value(owners.elements.contains { owner in
         let ts = owner["taskSessions"]
@@ -477,7 +445,6 @@ func coldBlocked(_ record: Value = .undefined, _ owners: Value = .undefined) thr
     })
 }
 
-// L867
 func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found: Value = .undefined) throws -> Value {
     var families: [Value] = []
     for account in from.elements {
@@ -495,7 +462,7 @@ func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found:
             seeds.add("task:\(task["id"])")
             connect("task:\(task["id"])", task["notifySessionId"].truthy ? "record:\(task["notifySessionId"])" : "task:\(task["id"])")
         }
-        // Returns the `&&` chain's value, which JS stores on `row.coldRun`.
+        // Returns the `&&` chain's value, which is stored on `row.coldRun`.
         func coldRun(_ row: Value) throws -> Value {
             let deleted = row["deletedTask"]
             if !deleted.truthy { return deleted }
@@ -522,8 +489,8 @@ func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found:
                 for next in graph[key]?.items ?? [] { keys.add(next) }
                 i += 1
             }
-            let ids = keys.items.filter { $0.hasPrefix("task:") }.map { jsSlice($0, 5) }
-            let recordIds = keys.items.filter { $0.hasPrefix("record:") }.map { jsSlice($0, 7) }
+            let ids = keys.items.filter { $0.hasPrefix("task:") }.map { sliceString($0, 5) }
+            let recordIds = keys.items.filter { $0.hasPrefix("record:") }.map { sliceString($0, 7) }
             let idsValue = ids.value, recordIdsValue = recordIds.value
             let members = try found.elements.filter { row in try sameAccount(row["account"], account).truthy && recordIdsValue.includes(row["record"]["sessionId"]) }
             if members.isEmpty { continue }
@@ -567,23 +534,22 @@ func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found:
 
 // MARK: - Account labels (patched)
 
-// L909 (patched)
 func unsnappy(_ src: Data) throws -> Data {
     let s = [UInt8](src)
     var pos = 0, len = 0, shift = 0
     func next() throws -> Int {
-        guard pos < s.count else { throw JSError("bad snappy block") }
+        guard pos < s.count else { throw EngineError("bad snappy block") }
         defer { pos += 1 }
         return Int(s[pos])
     }
     while true {
         let b = try next()
-        guard shift < 63 else { throw JSError("bad snappy block") }
+        guard shift < 63 else { throw EngineError("bad snappy block") }
         len += (b & 0x7f) << shift
         if b < 0x80 { break }
         shift += 7
     }
-    guard len <= 1 << 30 else { throw JSError.range("Array buffer allocation failed") }
+    guard len <= 1 << 30 else { throw EngineError.range("Array buffer allocation failed") }
     var out = [UInt8](repeating: 0, count: len)
     var o = 0
     while pos < s.count {
@@ -609,23 +575,22 @@ func unsnappy(_ src: Data) throws -> Data {
             off = ((tag >> 5) << 8) | (try next())
         } else if kind == 2 {
             n = (tag >> 2) + 1
-            guard pos + 2 <= s.count else { throw JSError.range("The value of \"offset\" is out of range.") }
+            guard pos + 2 <= s.count else { throw EngineError.range("The value of \"offset\" is out of range.") }
             off = Int(s[pos]) | Int(s[pos + 1]) << 8
             pos += 2
         } else {
             n = (tag >> 2) + 1
-            guard pos + 4 <= s.count else { throw JSError.range("The value of \"offset\" is out of range.") }
+            guard pos + 4 <= s.count else { throw EngineError.range("The value of \"offset\" is out of range.") }
             off = Int(s[pos]) | Int(s[pos + 1]) << 8 | Int(s[pos + 2]) << 16 | Int(s[pos + 3]) << 24
             pos += 4
         }
-        if off == 0 || off > o || o + n > len { throw JSError("bad snappy block") }
+        if off == 0 || off > o || o + n > len { throw EngineError("bad snappy block") }
         for _ in 0..<n { out[o] = out[o - off]; o += 1 }
     }
     return Data(out)
 }
 
-// L934 (patched)
-// Desktop's IndexedDB values use a newer V8 wire version than node:v8 deserialize accepts.
+// Desktop's IndexedDB values use V8's serialization format, at a wire version newer than common decoders accept.
 // Dates are kept as their time value (no enumerable keys either way); very sparse array indexes land in properties.
 func readV8(_ buf: [UInt8], _ start: Int) throws -> Value {
     var p = start
@@ -642,7 +607,7 @@ func readV8(_ buf: [UInt8], _ start: Int) throws -> Value {
         }
     }
     func double() throws -> Double {
-        guard p >= 0, p + 8 <= buf.count else { throw JSError.range("The value of \"offset\" is out of range.") }
+        guard p >= 0, p + 8 <= buf.count else { throw EngineError.range("The value of \"offset\" is out of range.") }
         var bits: UInt64 = 0
         for i in 0..<8 { bits |= UInt64(buf[p + i]) << (8 * UInt64(i)) }
         p += 8
@@ -666,9 +631,9 @@ func readV8(_ buf: [UInt8], _ start: Int) throws -> Value {
     func value() throws -> Value {
         depth += 1
         defer { depth -= 1 }
-        if depth > 10_000 { throw JSError.range("Maximum call stack size exceeded") }
+        if depth > 10_000 { throw EngineError.range("Maximum call stack size exceeded") }
         while true {
-            guard let byte = at(p), p < buf.count else { throw JSError("truncated V8 value") }
+            guard let byte = at(p), p < buf.count else { throw EngineError("truncated V8 value") }
             p += 1
             let t = Character(UnicodeScalar(UInt8(byte)))
             switch t {
@@ -708,8 +673,8 @@ func readV8(_ buf: [UInt8], _ start: Int) throws -> Value {
                 return o
             case "A":
                 let n = varint()
-                // Every element consumes at least one byte, so a longer array is truncated (JS throws the same way).
-                if n > Double(buf.count - p) { throw JSError("truncated V8 value") }
+                // Every element consumes at least one byte, so a longer array is truncated (V8's own deserializer throws the same way).
+                if n > Double(buf.count - p) { throw EngineError("truncated V8 value") }
                 let a = Value(Array(repeating: Value.undefined, count: Int(n)))
                 refs.append(a)
                 for i in 0..<Int(n) { a[i] = try value() }
@@ -725,7 +690,7 @@ func readV8(_ buf: [UInt8], _ start: Int) throws -> Value {
                 p += 1
                 _ = varint(); _ = varint()
                 return a
-            default: throw JSError("unsupported V8 tag \(t)")
+            default: throw EngineError("unsupported V8 tag \(t)")
             }
         }
     }
@@ -736,27 +701,24 @@ fileprivate extension Double {
     var clampedInt: Int { self.isNaN ? 0 : self >= Double(Int.max / 2) ? Int.max / 2 : self <= Double(Int.min / 2) ? Int.min / 2 : Int(self) }
 }
 
-// L979 (patched)
 func idbValue(_ blob: Data) throws -> Value {
     let b = [UInt8](blob)
     func at(_ s: [UInt8], _ i: Int) -> Int? { i < s.count ? Int(s[i]) : nil }
     let raw = at(b, 0) == 0xff && at(b, 1) == 0x11 && at(b, 2) == 0x02 ? [UInt8](try unsnappy(Data(b.dropFirst(3)))) : b
     var p = 0
     if at(raw, 0) == 0xff && at(raw, 2) == 0xfe { p = 15 } else if at(raw, 0) == 0xff && at(raw, 2) == 0xff { p = 2 }
-    if at(raw, p) != 0xff { throw JSError("not a V8 value") }
+    if at(raw, p) != 0xff { throw EngineError("not a V8 value") }
     p += 1
     while (at(raw, p) ?? 0) & 0x80 != 0 { p += 1 }
     return try readV8(raw, p + 1)
 }
 
-// L990 (patched)
 func orgLabel(_ o: Value = .undefined) throws -> Value {
     let caps = o["capabilities"] ?? Value.newArray()
-    guard caps.isArray || caps.isString else { throw JSError.type("(o.capabilities ?? []).includes is not a function") }
+    guard caps.isArray || caps.isString else { throw EngineError.type("(o.capabilities ?? []).includes is not a function") }
     return o["raven_type"].truthy || caps.includes("raven") ? Value("\(o["name"]) Team") : caps.includes("chat") ? "Personal" : o["name"]
 }
 
-// L993 (patched)
 // The signed-in Desktop account's profile lives only in claude.ai's persisted query cache.
 func desktopProfiles(_ dir: Value = .undefined) throws -> Value {
     let emails = Value.newMap()
@@ -786,7 +748,6 @@ func desktopProfiles(_ dir: Value = .undefined) throws -> Value {
     return ["emails": emails, "orgs": orgs]
 }
 
-// L923
 func logins(_ paths: Value = .undefined) throws -> Value {
     let emails = Value.newMap()
     let orgs = Value.newMap()
@@ -810,7 +771,7 @@ func logins(_ paths: Value = .undefined) throws -> Value {
     for e in (try? fs.readdir(switchAccounts)) ?? [] where e.isDirectory { try take(path.join(switchAccounts, e.name, ".claude.json")) }
     for f in (try? fs.names(paths["backups"].description)) ?? [] where f.hasPrefix(".claude.json.backup") { try take(path.join(paths["backups"].description, f)) }
     try take(paths["login"].description)
-    // L1033 (patched): Desktop only caches the signed-in account, so remember every one seen for later runs.
+    // Desktop only caches the signed-in account, so remember every one seen for later runs.
     let remembered = (try? readJson(paths["labels"])) ?? Value.newObject()
     let seen = try desktopProfiles(paths["webCache"])
     let rememberedEmails = try member(remembered, "emails"), rememberedOrgs = remembered["orgs"]
@@ -832,9 +793,9 @@ func logins(_ paths: Value = .undefined) throws -> Value {
             if try member(r, "emailAddress").truthy { emails.put(account, r["emailAddress"]) }
         }
     }
-    // L1051 (patched): Accounts emptied by earlier moves leave no other trace, but their receipts still name them.
+    // Accounts emptied by earlier moves leave no other trace, but their receipts still name them.
     let receiptFiles = try receipts(paths)
-    guard let receiptList = receiptFiles.asArray else { throw JSError.type("receipts(...).reverse is not a function") }
+    guard let receiptList = receiptFiles.asArray else { throw EngineError.type("receipts(...).reverse is not a function") }
     receiptList.items.reverse()
     for file in receiptList.items {
         guard let handle = try? fs.open(path.join(paths["state"].description, file.description), "r") else { continue }
@@ -875,26 +836,23 @@ func logins(_ paths: Value = .undefined) throws -> Value {
 
 // MARK: - Presentation
 
-// L952
 func ago(_ ms: Value = .undefined) throws -> Value {
     if !ms.truthy { return "-" }
-    let s = max(0, dateNow() - jsNumber(ms)) / 1000
+    let s = max(0, dateNow() - toNumber(ms)) / 1000
     let (n, unit): (Double, String) = s < 3600 ? (s / 60, "m") : s < 86400 ? (s / 3600, "h") : s < 86400 * 30 ? (s / 86400, "d") : (s / 86400 / 30, "mo")
-    let r = jsRound(n)
-    return Value("\(jsNumberString(r.isNaN ? .nan : max(1, r)))\(unit) ago")
+    let r = roundHalfUp(n)
+    return Value("\(numberString(r.isNaN ? .nan : max(1, r)))\(unit) ago")
 }
 
-// L959
 func mode(_ values: Value = .undefined) throws -> Value {
-    let tally = JSMap()
-    for v in values.elements where v.truthy { tally.set(v, Value(jsNumber(tally.get(v) ?? 0) + 1)) }
-    let sorted = jsSorted(tally.entries.map { Value([$0.0, $0.1]) }) { a, b in jsNumber(b[1]) - jsNumber(a[1]) }
+    let tally = ValueMap()
+    for v in values.elements where v.truthy { tally.set(v, Value(toNumber(tally.get(v) ?? 0) + 1)) }
+    let sorted = stableSorted(tally.entries.map { Value([$0.0, $0.1]) }) { a, b in toNumber(b[1]) - toNumber(a[1]) }
     return sorted.first?[0] ?? "-"
 }
 
 // MARK: - Desktop identity
 
-// L965
 func desktopLaunch(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value {
     let app = path.join(paths["claudeApp"].description, "Contents/MacOS/Claude")
     let apps = table.elements.filter { desktopExecutable($0["executable"]).truthy || $0["executable"] === Value(app) }
@@ -902,7 +860,6 @@ func desktopLaunch(_ paths: Value = .undefined, _ table: Value = .undefined) thr
     return started.isFinite && started <= dateNow() ? ["pid": apps[0]["pid"], "started": Value(started)] : .null
 }
 
-// L971
 public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value {
     let launch = try desktopLaunch(paths, table), result = Value.newMap()
     if !launch.truthy { return result }
@@ -926,7 +883,7 @@ public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefine
             let time = entry != nil ? dateParse(entry![1]!.replacingOccurrences(of: " ", with: "T", options: [], range: entry![1]!.range(of: " "))) : .nan
             if time.isFinite && time < launch["started"].asNumber! { continue }
             let seconds: Value
-            if let entry, index < rows.count - 1, time <= dateNow(), isSafeInteger(Value(jsNumber(Value(entry[2]!)))) { seconds = Value(jsNumber(Value(entry[2]!))) } else { seconds = .null }
+            if let entry, index < rows.count - 1, time <= dateNow(), isSafeInteger(Value(toNumber(Value(entry[2]!)))) { seconds = Value(toNumber(Value(entry[2]!))) } else { seconds = .null }
             let key = Value(record)
             result.put(key, !result.has(key) || result.get(key) === seconds ? seconds : .null)
         }
@@ -936,7 +893,6 @@ public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefine
     return result
 }
 
-// L1001
 public func signedIn(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value {
     func unknown(_ state: String = "unknown", _ time: Double? = nil) -> Value {
         ["account": .null, "org": .null, "state": Value(state), "source": time == nil ? "unknown" : "log", "at": time.map { Value(isoString($0)) } ?? .null]
@@ -956,8 +912,8 @@ public func signedIn(_ paths: Value = .undefined, _ table: Value = .undefined) t
         let desktop = (try? readJson(paths["desktop"])) ?? Value.newObject()
         let logs = paths["logs"].description
         let logNames: [Value] = try fs.names(logs).filter { re(#"^main(?:[1-9][0-9]*)?\.log$"#).test($0) }.map { Value($0) }
-        let files = jsSorted(logNames) { a, b in
-            jsNumber(Value(jsSlice(a.description, 4, -4))) - jsNumber(Value(jsSlice(b.description, 4, -4)))
+        let files = stableSorted(logNames) { a, b in
+            toNumber(Value(sliceString(a.description, 4, -4))) - toNumber(Value(sliceString(b.description, 4, -4)))
         }
         let entryPattern = re(#"^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,3})?) \[[A-Za-z0-9_]+\] (.*)$"#)
         for file in files {
@@ -981,7 +937,7 @@ public func signedIn(_ paths: Value = .undefined, _ table: Value = .undefined) t
                 let account = match[1]!.lowercased(), org = match[2]!.lowercased()
                 let last = try member(desktop, "lastKnownAccountUuid")
                 if last.truthy {
-                    guard let text = last.asString else { throw JSError.type("desktop.lastKnownAccountUuid.toLowerCase is not a function") }
+                    guard let text = last.asString else { throw EngineError.type("desktop.lastKnownAccountUuid.toLowerCase is not a function") }
                     if text.lowercased() != account { return unknown("unknown", time) }
                 }
                 return ["account": Value(account), "org": Value(org), "state": "known", "source": "log", "at": Value(isoString(time))]
@@ -993,15 +949,13 @@ public func signedIn(_ paths: Value = .undefined, _ table: Value = .undefined) t
 
 // MARK: - Desktop login material
 
-// L1038
 func plistValue(_ file: Value = .undefined, _ key: Value = .undefined) throws -> Value {
     let result = childProcess.spawnSync("/usr/libexec/PlistBuddy", ["-c", "Print :\(key)", file.description], SpawnOptions(timeout: 10_000))
-    if result.error != nil || result.status != 0 || result.stdout.jsTrim.isEmpty { throw JSError("cannot read \(path.basename(file.description))") }
-    return Value(result.stdout.jsTrim)
+    if result.error != nil || result.status != 0 || result.stdout.trimmingWhitespace.isEmpty { throw EngineError("cannot read \(path.basename(file.description))") }
+    return Value(result.stdout.trimmingWhitespace)
 }
 
-// L1044
-// `pattern` is the regex source (the JS passes a RegExp literal); the first capture group is returned.
+// `pattern` is the regex source; the first capture group is returned.
 func binaryMatch(_ file: Value = .undefined, _ pattern: Value = .undefined) throws -> Value {
     let regex = re(pattern.description)
     let handle = try fs.open(file.description, "r")
@@ -1014,12 +968,11 @@ func binaryMatch(_ file: Value = .undefined, _ pattern: Value = .undefined) thro
         productive()
         let text = carry + (String(data: chunk, encoding: .isoLatin1) ?? "")
         if let match = regex.match(text) { found = match[1] ?? "undefined"; return }
-        carry = jsSlice(text, -128)
+        carry = sliceString(text, -128)
     }
     return found.map { Value($0) } ?? .null
 }
 
-// L1056
 func desktopUserAgent(_ paths: Value = .undefined) throws -> Value {
     let app = paths["claudeApp"].description
     let appInfo = path.join(app, "Contents/Info.plist")
@@ -1027,22 +980,20 @@ func desktopUserAgent(_ paths: Value = .undefined) throws -> Value {
     let claude = try plistValue(Value(appInfo), "CFBundleShortVersionString")
     let electron = try plistValue(Value(path.join(framework, "Resources/Info.plist")), "CFBundleVersion")
     let chrome = try binaryMatch(Value(path.join(framework, "Electron Framework")), #"Chrome/([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"#)
-    if !chrome.truthy { throw JSError("cannot determine Claude Desktop browser version") }
+    if !chrome.truthy { throw EngineError("cannot determine Claude Desktop browser version") }
     return Value("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Claude/\(claude) Chrome/\(chrome) Electron/\(electron) Safari/537.36")
 }
 
-// L1066
 func decryptCookie(_ host: Value = .undefined, _ encrypted: Value = .undefined, _ key: Value = .undefined, _ version: Value = .undefined) throws -> Value {
     let data = encrypted.asData ?? Data()
-    if data.isEmpty || !["v10", "v11"].contains(String(decoding: data.prefix(3), as: UTF8.self)) { throw JSError("unsupported Claude cookie encryption") }
+    if data.isEmpty || !["v10", "v11"].contains(String(decoding: data.prefix(3), as: UTF8.self)) { throw EngineError("unsupported Claude cookie encryption") }
     let plain = try aes128cbcDecrypt(Data(data.dropFirst(3)), key: key.asData ?? Data(), iv: Data(repeating: 0x20, count: 16))
-    if jsNumber(version) < 24 { return Value(String(decoding: plain, as: UTF8.self)) }
+    if toNumber(version) < 24 { return Value(String(decoding: plain, as: UTF8.self)) }
     let digest = Data(SHA256.hash(data: Data(host.description.utf8)))
-    if plain.prefix(digest.count) != digest { throw JSError("Claude cookie host verification failed") }
+    if plain.prefix(digest.count) != digest { throw EngineError("Claude cookie host verification failed") }
     return Value(String(decoding: plain.dropFirst(digest.count), as: UTF8.self))
 }
 
-// L1076
 func desktopCookies(_ paths: Value = .undefined) throws -> Value {
     let options = SpawnOptions(timeout: 10_000)
     let cookies = paths["cookies"].description
@@ -1050,8 +1001,8 @@ func desktopCookies(_ paths: Value = .undefined) throws -> Value {
     let rowsResult = childProcess.spawnSync("/usr/bin/sqlite3", ["-readonly", "-separator", "\t", cookies,
         "SELECT host_key,name,hex(CAST(value AS BLOB)),hex(encrypted_value) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') ORDER BY length(path) DESC,creation_utc;"], options)
     let secretResult = childProcess.spawnSync("/usr/bin/security", ["find-generic-password", "-w", "-s", "Claude Safe Storage"], options)
-    if [versionResult, rowsResult, secretResult].contains(where: { $0.error != nil || $0.status != 0 }) { throw JSError("cannot read Claude Desktop login") }
-    let version = jsNumber(Value(versionResult.stdout.jsTrim))
+    if [versionResult, rowsResult, secretResult].contains(where: { $0.error != nil || $0.status != 0 }) { throw EngineError("cannot read Claude Desktop login") }
+    let version = toNumber(Value(versionResult.stdout.trimmingWhitespace))
     let password = trimEnd(secretResult.stdout)
     let key = pbkdf2(Data(password.utf8), salt: Data("saltysalt".utf8), iterations: 1003, keyLength: 16)
     let values = Value.newMap()
@@ -1063,30 +1014,28 @@ func desktopCookies(_ paths: Value = .undefined) throws -> Value {
         if let plainHex, !plainHex.isEmpty {
             value = String(decoding: hexData(plainHex), as: UTF8.self)
         } else {
-            guard let encryptedHex else { throw JSError.type("The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined") }
+            guard let encryptedHex else { throw EngineError.type("The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined") }
             value = try decryptCookie(Value(host), Value(hexData(encryptedHex)), Value(key), Value(version)).description
         }
         if !value.isEmpty && !re("[;\r\n]").test(value) { values.put(Value(name!), Value(value)) }
     }
-    if !values.has("sessionKey") { throw jsThrow("Claude Desktop login is still updating", code: "CLOUD_AUTH_PENDING") }
+    if !values.has("sessionKey") { throw makeError("Claude Desktop login is still updating", code: "CLOUD_AUTH_PENDING") }
     return values
 }
 
-// L1096
 func wireRemoteId(_ id: Value = .undefined) throws -> Value {
     let text = (id ?? "").description
-    if !re(#"^(?:cse|session)_[A-Za-z0-9_-]+$"#).test(text) { throw JSError("invalid Remote Control session id") }
+    if !re(#"^(?:cse|session)_[A-Za-z0-9_-]+$"#).test(text) { throw EngineError("invalid Remote Control session id") }
     return Value(re("^cse_").replace(id.description, "session_"))
 }
 
-// L1101
 func remoteId(_ id: Value = .undefined) throws -> Value {
     (try? wireRemoteId(id)) ?? .null
 }
 
 // MARK: - claude.ai client
 
-// The HTTP transport behind cloudClient, swappable like the global `fetch` the JS tests replace.
+// The HTTP transport behind cloudClient; tests replace it.
 // Request: { url, method, headers, body?, redirect: 'error', timeout? (ms) | signal? }.
 // Response: { status, ok, headers: { lowercased-name: value }, body: bytes }.
 public var cloudFetch: (Value) throws -> Value = { request in try nativeCloudFetch(request) }
@@ -1099,7 +1048,7 @@ fileprivate final class RefuseRedirects: NSObject, URLSessionTaskDelegate {
 fileprivate final class FetchBox { var data: Data?; var response: URLResponse?; var error: Error? }
 
 fileprivate func nativeCloudFetch(_ request: Value) throws -> Value {
-    guard let url = URL(string: request["url"].description) else { throw JSError.type("Failed to parse URL from \(request["url"])") }
+    guard let url = URL(string: request["url"].description) else { throw EngineError.type("Failed to parse URL from \(request["url"])") }
     var req = URLRequest(url: url)
     req.httpMethod = request["method"].nullish ? "GET" : request["method"].description
     req.httpShouldHandleCookies = false
@@ -1120,28 +1069,27 @@ fileprivate func nativeCloudFetch(_ request: Value) throws -> Value {
         if done.wait(timeout: .now() + .milliseconds(Int(timeout))) == .timedOut {
             task.cancel()
             done.wait()
-            throw JSError("The operation was aborted due to timeout", code: Value(23), name: "TimeoutError")
+            throw EngineError("The operation was aborted due to timeout", code: Value(23), name: "TimeoutError")
         }
     } else { done.wait() }
     if let error = box.error as? URLError, error.code == .timedOut {
-        throw JSError("The operation was aborted due to timeout", code: Value(23), name: "TimeoutError")
+        throw EngineError("The operation was aborted due to timeout", code: Value(23), name: "TimeoutError")
     }
-    guard box.error == nil, let http = box.response as? HTTPURLResponse else { throw JSError.type("fetch failed") }
+    guard box.error == nil, let http = box.response as? HTTPURLResponse else { throw EngineError.type("fetch failed") }
     // redirect: 'error'
-    if [301, 302, 303, 307, 308].contains(http.statusCode) { throw JSError.type("fetch failed") }
+    if [301, 302, 303, 307, 308].contains(http.statusCode) { throw EngineError.type("fetch failed") }
     let headers = Value.newObject()
     for (k, v) in http.allHeaderFields { headers[String(describing: k).lowercased()] = Value(String(describing: v)) }
     return ["status": Value(http.statusCode), "ok": Value((200...299).contains(http.statusCode)), "headers": headers, "body": Value(box.data ?? Data())]
 }
 
-// L1105
 public func cloudClient(_ paths: Value = .undefined, _ expected: Value = .undefined, _ io: Value = .undefined) throws -> Value {
     let expected = expected.isUndefined ? Value.null : expected
     let io = io.isUndefined ? Value.newObject() : io
     let memory = try io["memory"] ?? operationMemory()
     let current = try io["active"] ?? signedIn(paths)
-    if current["state"] === "logged-out" { throw JSError("Claude Desktop is signed out") }
-    if try expected.truthy && current["state"] === "known" && !sameLogin(expected, current).truthy { throw JSError("sign Claude Desktop into \(try loginLabel(expected))") }
+    if current["state"] === "logged-out" { throw EngineError("Claude Desktop is signed out") }
+    if try expected.truthy && current["state"] === "known" && !sameLogin(expected, current).truthy { throw EngineError("sign Claude Desktop into \(try loginLabel(expected))") }
     let selected = expected.truthy ? expected : (current["state"] === "known" ? current : .null)
     let cookies = try io["cookies"] ?? desktopCookies(paths)
     let cookie = cookies.elements.map { "\($0[0])=\($0[1])" }.joined(separator: "; ")
@@ -1162,66 +1110,66 @@ public func cloudClient(_ paths: Value = .undefined, _ expected: Value = .undefi
         if options["signal"].nullish { request["timeout"] = 15_000 }
         let response = try cloudFetch(request)
         if !response["ok"].truthy {
-            throw jsThrow("Claude \(endpoint.components(separatedBy: "?")[0]) returned \(response["status"])", code: response["status"] === 401 ? "CLOUD_AUTH_PENDING" : "CLOUD_HTTP_ERROR")
+            throw makeError("Claude \(endpoint.components(separatedBy: "?")[0]) returned \(response["status"])", code: response["status"] === 401 ? "CLOUD_AUTH_PENDING" : "CLOUD_HTTP_ERROR")
         }
         if org.truthy && endpoint.hasPrefix("/v1/code/") {
             let responseOrg = response["headers"]["anthropic-organization-id"] ?? .null
-            if responseOrg !== org { throw JSError("Claude Remote Control organization changed") }
+            if responseOrg !== org { throw EngineError("Claude Remote Control organization changed") }
         }
         if response["status"] === 204 { return .null }
-        // A fetch body is an async iterable of byte chunks; this transport delivers the whole body as one chunk.
+        // The memory budget reads a body as a list of chunks; this transport delivers the whole body as one.
         let body = response["body"]
         return try memory["read"].call(Value.spread(response, ["body": body.nullish ? body : [body]]))
     }
     let account = try raw("/api/account")
-    if !UUID.test((account["uuid"] ?? "").description) { throw JSError("Claude Desktop account could not be verified") }
+    if !UUID.test((account["uuid"] ?? "").description) { throw EngineError("Claude Desktop account could not be verified") }
     if selected["account"].truthy && account["uuid"] !== selected["account"] {
         let mismatch = try expected.truthy && !sameLogin(selected, current).truthy
-        throw jsThrow(mismatch ? "sign Claude Desktop into \(try loginLabel(expected))" : "Claude Desktop login is still updating. Try again in a moment.",
+        throw makeError(mismatch ? "sign Claude Desktop into \(try loginLabel(expected))" : "Claude Desktop login is still updating. Try again in a moment.",
                       code: try sameLogin(selected, current).truthy ? "CLOUD_AUTH_PENDING" : "CLOUD_ACCOUNT_MISMATCH")
     }
     let organizations = try raw("/api/organizations")
     let preferredOrg = selected["org"] ?? cookies.get("lastActiveOrg")
     let organization = organizations.isArray ? try organizations.elements.first { try member($0, "uuid") === preferredOrg } ?? .undefined : .null
-    if !organization.truthy { throw JSError("Claude Desktop organization could not be verified") }
+    if !organization.truthy { throw EngineError("Claude Desktop organization could not be verified") }
     let org = organization["uuid"]
     func request(_ endpoint: String, _ options: Value = .newObject()) throws -> Value { try raw(endpoint, options, org) }
     func session(_ id: Value) throws -> Value {
         let body = try request("/v1/code/sessions/\(try wireRemoteId(id))")
         let value = body["response_shape"] ?? body
-        if !value.truthy || !value.isObjectLike || value.isArray { throw JSError("Remote Control session response changed") }
+        if !value.truthy || !value.isObjectLike || value.isArray { throw EngineError("Remote Control session response changed") }
         return value
     }
     func eventRows(_ id: Value) throws -> Value {
         var out: [Value] = []
         var cursor: Value = .null
         var lastSequence: String?
-        let seen = JSSet()
+        let seen = ValueSet()
         for _ in 0...2000 {
             var query: [(String, String)] = [("limit", "500"), ("sort_order", "asc")]
             if cursor.truthy { query.append(("cursor", cursor.description)) }
             let body = try request("/v1/code/sessions/\(try wireRemoteId(id))/events?\(searchParams(query))")
-            if !body["data"].isArray || body["data"].length > 500 { throw JSError("Remote Control history response changed") }
+            if !body["data"].isArray || body["data"].length > 500 { throw EngineError("Remote Control history response changed") }
             let data = body["data"].elements
-            if out.count + data.count > 1_000_000 { throw jsThrow("Remote Control history exceeded 1,000,000 events", code: "CLOUD_HISTORY_LIMIT") }
+            if out.count + data.count > 1_000_000 { throw makeError("Remote Control history exceeded 1,000,000 events", code: "CLOUD_HISTORY_LIMIT") }
             if data.contains(where: { event in
                 !event.truthy || !event.isObjectLike || !event["event_type"].isString || !event["payload"].truthy || !event["payload"].isObjectLike
-            }) { throw JSError("Remote Control event response changed") }
+            }) { throw EngineError("Remote Control event response changed") }
             for event in data {
                 let n = event["sequence_num"]
                 let sequence: String? = n.isNumber && isSafeInteger(n) && n.asNumber! >= 0 ? String(Int64(n.asNumber!))
                     : n.isString && re(#"^[0-9]+$"#).test(n.asString!) ? n.asString! : nil
-                guard let sequence else { throw JSError("Remote Control event sequence changed") }
-                if let lastSequence, decimalLessOrEqual(sequence, lastSequence) { throw JSError("Remote Control event sequence changed") }
+                guard let sequence else { throw EngineError("Remote Control event sequence changed") }
+                if let lastSequence, decimalLessOrEqual(sequence, lastSequence) { throw EngineError("Remote Control event sequence changed") }
                 lastSequence = sequence
             }
             out.append(contentsOf: data)
             if data.count < 500 { return out.value }
             cursor = body["resume_cursor"]
-            if !cursor.truthy || seen.has(cursor) { throw JSError("Remote Control history cursor did not advance") }
+            if !cursor.truthy || seen.has(cursor) { throw EngineError("Remote Control history cursor did not advance") }
             seen.add(cursor)
         }
-        throw jsThrow("Remote Control history exceeded 1,000,000 events", code: "CLOUD_HISTORY_LIMIT")
+        throw makeError("Remote Control history exceeded 1,000,000 events", code: "CLOUD_HISTORY_LIMIT")
     }
     let post: Value = ["method": "POST", "headers": ["content-type": "application/json"], "body": "{}"]
     return [
@@ -1231,8 +1179,8 @@ public func cloudClient(_ paths: Value = .undefined, _ expected: Value = .undefi
         "list": Value { _ in
             let query = searchParams([("statuses", "active"), ("limit", "100"), ("statuses", "paused")])
             let body = try request("/v1/code/sessions?\(query)")
-            if !body["data"].isArray { throw JSError("Remote Control session list response changed") }
-            if body["data"].length >= 100 { throw JSError("Remote Control session list reached its safety limit") }
+            if !body["data"].isArray { throw EngineError("Remote Control session list response changed") }
+            if body["data"].length >= 100 { throw EngineError("Remote Control session list reached its safety limit") }
             return body["data"]
         },
         "eventRows": Value { args in try eventRows(args.first ?? .undefined) },
@@ -1244,12 +1192,10 @@ public func cloudClient(_ paths: Value = .undefined, _ expected: Value = .undefi
 
 // MARK: - Accounts
 
-// L1201
 func priorSessions(_ record: Value = .undefined) throws -> Value {
     record["priorCliSessionIds"].isArray ? record["priorCliSessionIds"] : .newArray()
 }
 
-// L1202
 func desktopSession(_ file: Value = .undefined, _ record: Value = .undefined) throws -> Value {
     [
         "file": file,
@@ -1264,7 +1210,6 @@ func desktopSession(_ file: Value = .undefined, _ record: Value = .undefined) th
     ]
 }
 
-// L1214
 public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefined) throws -> Value {
     let processes = processes.isUndefined ? Value.null : processes
     let found = try logins(paths)
@@ -1284,18 +1229,18 @@ public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefine
             if !r.truthy { unreadable.append(file); continue }
             sessions.append(try desktopSession(file, r))
         }
-        let activeAt = jsMax([0] + sessions.map { jsNumber($0["activeAt"]) })
+        let activeAt = nanMax([0] + sessions.map { toNumber($0["activeAt"]) })
         let email = emails.get(account) ?? .null
         let orgName = orgs.get(org) ?? .null
         let taskFile = Value(path.join(dir.description, "scheduled-tasks.json"))
         var scheduled = Value.newSet()
         var taskError: Value = .null
-        do { scheduled = try taskSessions(taskFile) } catch { taskError = jsErrorValue(error)["message"] }
+        do { scheduled = try taskSessions(taskFile) } catch { taskError = errorObject(error)["message"] }
         let label = "\(email.nullish ? Value(short(account)) : email) · \(orgName.nullish ? Value(short(org)) : orgName)"
         var base = "0 | -"
         if !sessions.isEmpty {
             let names = try sessions.map { s -> Value in
-                guard let cwd = s["cwd"].asString else { throw JSError.type("The \"path\" argument must be of type string. Received \(s["cwd"].typeOf)") }
+                guard let cwd = s["cwd"].asString else { throw EngineError.type("The \"path\" argument must be of type string. Received \(s["cwd"].typeOf)") }
                 return Value(path.basename(cwd))
             }
             base = "\(sessions.count) | \(try ago(Value(activeAt))) | \(try mode(names.value))"
@@ -1305,16 +1250,16 @@ public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefine
         out.append([
             "account": account, "org": org, "dir": dir, "email": email, "orgName": orgName, "sessions": sessionsValue, "allSessions": sessionsValue,
             "unreadable": unreadable.value, "taskFile": taskFile, "taskSessions": scheduled, "taskError": taskError, "activeAt": Value(activeAt),
-            "focusedAt": Value(jsMax([0] + sessions.map { jsNumber($0["focusedAt"]) })), "label": Value(label), "stats": Value(stats), "active": false,
+            "focusedAt": Value(nanMax([0] + sessions.map { toNumber($0["focusedAt"]) })), "label": Value(label), "stats": Value(stats), "active": false,
             "signedIn": try sameLogin(["account": account], cur), "identityState": cur["state"],
         ])
     }
     let sessions = out.flatMap { $0["sessions"].elements }
     var claims: [HashKey: Int] = [:]
     for session in sessions { for id in unique([session["id"]] + (try priorSessions(session["record"])).elements) { claims[HashKey(id), default: 0] += 1 } }
-    let parents = JSSet(sessions.map { $0["record"]["forkedFromSessionId"] })
-    let tasks: JSSet? = out.contains { $0["taskError"].truthy } ? nil
-        : JSSet(out.flatMap { ($0["taskSessions"]["registry"]["scheduledTasks"] ?? Value.newArray()).elements.map { $0["id"] } })
+    let parents = ValueSet(sessions.map { $0["record"]["forkedFromSessionId"] })
+    let tasks: ValueSet? = out.contains { $0["taskError"].truthy } ? nil
+        : ValueSet(out.flatMap { ($0["taskSessions"]["registry"]["scheduledTasks"] ?? Value.newArray()).elements.map { $0["id"] } })
     for session in sessions {
         let record = session["record"]
         Value.assign(session, [
@@ -1327,8 +1272,8 @@ public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefine
     for rows in labels.values where rows.count > 1 { for row in rows { Value.assign(row, ["label": Value("\(row["label"]) · \(short(row["org"]))")]) } }
     let mine = out.filter { $0["account"] === cur["account"] }
     if let chosen = mine.first(where: { $0["org"] === cur["org"] }) { Value.assign(chosen, ["active": true, "stats": Value("\(chosen["stats"]) | active")]) }
-    return jsSorted(out) { a, b in
-        let d = jsNumber(b["activeAt"]) - jsNumber(a["activeAt"])
+    return stableSorted(out) { a, b in
+        let d = toNumber(b["activeAt"]) - toNumber(a["activeAt"])
         return d.isNaN ? 0 : d
     }.value
 }
@@ -1337,7 +1282,7 @@ public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefine
 // empty folder for that pair in both session trees. Only folders with no sessions and no scheduled tasks qualify.
 func holdsNothing(_ dir: String) -> Bool {
     let names: [String]
-    do { names = try fs.names(dir) } catch { return jsErrorValue(error).code === "ENOENT" }
+    do { names = try fs.names(dir) } catch { return errorObject(error).code === "ENOENT" }
     for name in names {
         guard name == "scheduled-tasks.json", let registry = try? fs.readJSON(path.join(dir, name)),
               case .array(let tasks) = registry["scheduledTasks"], tasks.items.isEmpty else { return false }
@@ -1363,17 +1308,17 @@ public func tidy(_ paths: Value = .undefined, _ pair: Value = .null) throws -> V
     let latest = try latestReceipt(paths)
     if latest.truthy {
         let unfinished = try latest.corrupt.truthy || needsRecovery(latest.receipt).truthy || deferredWorkflow(paths, latest).truthy
-        if unfinished { throw JSError("Finish or undo the last move before tidying", code: "MOVE_UNFINISHED") }
+        if unfinished { throw EngineError("Finish or undo the last move before tidying", code: "MOVE_UNFINISHED") }
     }
     let all = try accounts(paths)
     let dest = path.join(paths["state"].description, "leftovers", stamp())
     var rows = try leftovers(paths, all).elements
     if pair.truthy {
-        guard let row = all.elements.first(where: { $0["account"] === pair["account"] && $0["org"] === pair["org"] }) else { throw JSError("No such account", code: "NO_ACCOUNT") }
-        if row["active"].truthy { throw JSError("Claude is signed in to \(row["label"])", code: "ACCOUNT_ACTIVE") }
-        if row["sessions"].length > 0 || row["unreadable"].length > 0 { throw JSError("\(row["label"]) still holds sessions", code: "ACCOUNT_NOT_EMPTY") }
+        guard let row = all.elements.first(where: { $0["account"] === pair["account"] && $0["org"] === pair["org"] }) else { throw EngineError("No such account", code: "NO_ACCOUNT") }
+        if row["active"].truthy { throw EngineError("Claude is signed in to \(row["label"])", code: "ACCOUNT_ACTIVE") }
+        if row["sessions"].length > 0 || row["unreadable"].length > 0 { throw EngineError("\(row["label"]) still holds sessions", code: "ACCOUNT_NOT_EMPTY") }
         let dirs = [paths["records"], paths["agentSessions"]].map { path.join($0.description, row["account"].description, row["org"].description) }
-        if !dirs.allSatisfy(holdsNothing) { throw JSError("\(row["label"]) still holds scheduled tasks or other files", code: "ACCOUNT_NOT_EMPTY") }
+        if !dirs.allSatisfy(holdsNothing) { throw EngineError("\(row["label"]) still holds scheduled tasks or other files", code: "ACCOUNT_NOT_EMPTY") }
         rows = [row]
     }
     let claude = path.dirname(paths["records"].description)

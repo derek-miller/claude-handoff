@@ -13,11 +13,11 @@ enum CrashHook { case link, rename, writeFile, unlink, mkdir }
 
 final class CrashFence {
     private(set) var crashed = false
-    private let saved: NodeFS
+    private let saved: FileSystem
 
     init(on hook: CrashHook, when trigger: @escaping ([String]) throws -> Bool) {
         saved = fs
-        let native = saved, fenced = NodeFS()
+        let native = saved, fenced = FileSystem()
         let guardLive = { [unowned self] in if self.crashed { throw Crash() } }
         let fire = { [unowned self] (args: [String]) throws in
             if try trigger(args) { self.crashed = true; throw Crash() }

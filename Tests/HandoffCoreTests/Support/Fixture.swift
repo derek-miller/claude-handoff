@@ -200,7 +200,7 @@ func fixtureSnapshot(_ h: Home, _ directories: [String]? = nil) throws -> Value 
             var isDir: ObjCBool = false
             FileManager.default.fileExists(atPath: file, isDirectory: &isDir)
             if isDir.boolValue { try visit(file) }
-            else if dir != state || JSRegExp.cached(#"^\d.*\.json(?:\.journal)?$"#).test(name) { out[file] = Value(sha(try readData(file))) }
+            else if dir != state || TextPattern.cached(#"^\d.*\.json(?:\.journal)?$"#).test(name) { out[file] = Value(sha(try readData(file))) }
         }
     }
     for dir in directories ?? [h.paths.records.str, h.paths.pool.str, state] { try visit(dir) }

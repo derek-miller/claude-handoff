@@ -1,8 +1,8 @@
 import Darwin
 import Foundation
 
-// Node-style filesystem errors: `code` is the errno name and the message matches Node's wording.
-public func fsError(_ err: Int32, _ syscall: String, _ path: String? = nil, _ dest: String? = nil) -> JSError {
+// Filesystem errors carry the errno name as `code` and a message of the form `ENOENT: no such file or directory, open '<path>'`.
+public func fsError(_ err: Int32, _ syscall: String, _ path: String? = nil, _ dest: String? = nil) -> EngineError {
     let (code, text) = errnoName(err)
     var message = "\(code): \(text), \(syscall)"
     if let path { message += " '\(path)'" }
@@ -10,7 +10,7 @@ public func fsError(_ err: Int32, _ syscall: String, _ path: String? = nil, _ de
     var extra: [(String, Value)] = [("errno", Value(-Int(err))), ("syscall", Value(syscall))]
     if let path { extra.append(("path", Value(path))) }
     if let dest { extra.append(("dest", Value(dest))) }
-    return JSError(message, code: Value(code), extra: extra)
+    return EngineError(message, code: Value(code), extra: extra)
 }
 
 func errnoName(_ err: Int32) -> (String, String) {
@@ -38,9 +38,9 @@ func errnoName(_ err: Int32) -> (String, String) {
     }
 }
 
-// Mirrors the subset of Node's Stats object the engine reads. With `bigint`, numeric fields are BigInt and *Ns fields exist.
+// The stat fields the engine reads. With `bigint`, numeric fields are BigInt and the *Ns nanosecond fields exist.
 public func statValue(_ s: stat, bigint: Bool) -> Value {
-    let o = JSObject()
+    let o = ValueObject()
     func n(_ x: Int64) -> Value { bigint ? .bigint(x) : .number(Double(x)) }
     o["dev"] = n(Int64(s.st_dev))
     o["mode"] = n(Int64(s.st_mode))
@@ -82,7 +82,7 @@ public struct Dirent {
     public var isSymbolicLink: Bool { type == DT_LNK }
 }
 
-// An open file descriptor, like Node's FileHandle.
+// An open file descriptor.
 public final class FileHandle {
     public let fd: Int32
     public let path: String
@@ -125,24 +125,24 @@ public final class FileHandle {
     }
 }
 
-// Every filesystem call goes through this table so tests can interpose, the way the JS tests patch node:fs.
-public final class NodeFS {
-    public var readFile: (String) throws -> Data = NodeFS.nativeReadFile
-    public var writeFile: (String, Data, String, Int) throws -> Void = NodeFS.nativeWriteFile
-    public var stat: (String, Bool) throws -> Value = { p, big in try NodeFS.nativeStat(p, big, follow: true) }
-    public var lstat: (String, Bool) throws -> Value = { p, big in try NodeFS.nativeStat(p, big, follow: false) }
-    public var readdir: (String) throws -> [Dirent] = NodeFS.nativeReaddir
-    public var mkdir: (String, Bool, Int) throws -> Void = NodeFS.nativeMkdir
+// Every filesystem call goes through this table so tests can interpose.
+public final class FileSystem {
+    public var readFile: (String) throws -> Data = FileSystem.nativeReadFile
+    public var writeFile: (String, Data, String, Int) throws -> Void = FileSystem.nativeWriteFile
+    public var stat: (String, Bool) throws -> Value = { p, big in try FileSystem.nativeStat(p, big, follow: true) }
+    public var lstat: (String, Bool) throws -> Value = { p, big in try FileSystem.nativeStat(p, big, follow: false) }
+    public var readdir: (String) throws -> [Dirent] = FileSystem.nativeReaddir
+    public var mkdir: (String, Bool, Int) throws -> Void = FileSystem.nativeMkdir
     public var rename: (String, String) throws -> Void = { a, b in if Darwin.rename(a, b) != 0 { throw fsError(errno, "rename", a, b) } }
     public var link: (String, String) throws -> Void = { a, b in if Darwin.link(a, b) != 0 { throw fsError(errno, "link", a, b) } }
     public var symlink: (String, String) throws -> Void = { a, b in if Darwin.symlink(a, b) != 0 { throw fsError(errno, "symlink", a, b) } }
     public var unlink: (String) throws -> Void = { a in if Darwin.unlink(a) != 0 { throw fsError(errno, "unlink", a) } }
     public var rmdir: (String) throws -> Void = { a in if Darwin.rmdir(a) != 0 { throw fsError(errno, "rmdir", a) } }
-    public var rm: (String, Bool, Bool) throws -> Void = NodeFS.nativeRm
-    public var realpath: (String) throws -> String = NodeFS.nativeRealpath
-    public var readlink: (String) throws -> Data = NodeFS.nativeReadlink
+    public var rm: (String, Bool, Bool) throws -> Void = FileSystem.nativeRm
+    public var realpath: (String) throws -> String = FileSystem.nativeRealpath
+    public var readlink: (String) throws -> Data = FileSystem.nativeReadlink
     public var copyFile: (String, String) throws -> Void = { a, b in if copyfile(a, b, nil, copyfile_flags_t(COPYFILE_ALL)) != 0 { throw fsError(errno, "copyfile", a, b) } }
-    public var open: (String, Int32, Int) throws -> FileHandle = NodeFS.nativeOpen
+    public var open: (String, Int32, Int) throws -> FileHandle = FileSystem.nativeOpen
     public var handleStat: (FileHandle, Bool) throws -> Value = { h, big in
         var s = Darwin.stat()
         if fstat(h.fd, &s) != 0 { throw fsError(errno, "fstat") }
@@ -178,7 +178,7 @@ public final class NodeFS {
         return out
     }
 
-    // flag follows Node: "w", "wx", "a", "ax".
+    // flag is "w", "wx", "a" or "ax": write or append, with x failing if the file exists.
     public static func nativeWriteFile(_ p: String, _ data: Data, _ flag: String, _ mode: Int) throws {
         var flags: Int32 = O_WRONLY | O_CREAT
         if flag.hasPrefix("a") { flags |= O_APPEND } else { flags |= O_TRUNC }
@@ -243,7 +243,7 @@ public final class NodeFS {
             throw fsError(errno, "lstat", p)
         }
         if s.st_mode & S_IFMT == S_IFDIR {
-            guard recursive else { throw JSError("Path is a directory: rm returned EISDIR (is a directory) \(p)", code: "ERR_FS_EISDIR") }
+            guard recursive else { throw EngineError("Path is a directory: rm returned EISDIR (is a directory) \(p)", code: "ERR_FS_EISDIR") }
             for e in try nativeReaddir(p) { try nativeRm((p as NSString).appendingPathComponent(e.name), true, force) }
             if Darwin.rmdir(p) != 0 { throw fsError(errno, "rmdir", p) }
         } else if Darwin.unlink(p) != 0 {
@@ -273,10 +273,10 @@ public final class NodeFS {
 }
 
 // The process-wide filesystem table.
-public var fs = NodeFS()
+public var fs = FileSystem()
 
-// Convenience wrappers with Node's default arguments.
-extension NodeFS {
+// Convenience wrappers with the common default arguments.
+extension FileSystem {
     public func readText(_ p: String) throws -> String { String(decoding: try readFile(p), as: UTF8.self) }
     public func readJSON(_ p: String) throws -> Value { try JSON.parse(try readFile(p)) }
     public func write(_ p: String, _ text: String, flag: String = "w", mode: Int = 0o666) throws { try writeFile(p, Data(text.utf8), flag, mode) }
@@ -285,7 +285,7 @@ extension NodeFS {
     public func names(_ p: String) throws -> [String] { try readdir(p).map(\.name) }
     public func mkdirp(_ p: String, mode: Int = 0o777) throws { try mkdir(p, true, mode) }
     public func rm(_ p: String, recursive: Bool = false, force: Bool = false) throws { try rm(p, recursive, force) }
-    // Node's string flags for open(): r, r+, w, wx, a, ax.
+    // String flags for open(): r, r+, w, wx, a, ax.
     public func open(_ p: String, _ flag: String, mode: Int = 0o666) throws -> FileHandle {
         let flags: Int32
         switch flag {

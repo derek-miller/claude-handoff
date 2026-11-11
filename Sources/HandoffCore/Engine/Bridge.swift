@@ -2,9 +2,9 @@ import CryptoKit
 import Darwin
 import Foundation
 
-// engine.js lines 2347-2900: bridge metadata appends and recovery, rehoming, failure projection, verification.
+// Bridge metadata appends and recovery, rehoming, failure projection and verification.
 
-// MARK: - Section-local helpers
+// MARK: - Local helpers
 
 // Opaque Swift objects (file handles, running hashes) carried through Values. The box is a function that, when called,
 // deposits its object in a slot; JSON.stringify drops functions, so these never leak into written JSON.
@@ -14,7 +14,7 @@ fileprivate func unboxed<T: AnyObject>(_ v: Value, _ type: T.Type) throws -> T {
     unboxSlot = nil
     defer { unboxSlot = nil }
     if v.isFunction { _ = try v.call() }
-    guard let object = unboxSlot as? T else { throw JSError.type("\(v.typeOf) is not a \(T.self)") }
+    guard let object = unboxSlot as? T else { throw EngineError.type("\(v.typeOf) is not a \(T.self)") }
     return object
 }
 
@@ -34,12 +34,12 @@ fileprivate func hashOf(_ v: Value) throws -> RunningHash { try unboxed(v, Runni
 
 fileprivate func str(_ v: Value) -> String { v.description }
 fileprivate func isFileStat(_ st: Value) throws -> Bool { try st["isFile"].call().truthy }
-// Buffer.byteLength(string)
+// UTF-8 byte length of a value's string form.
 fileprivate func byteLength(_ v: Value) -> Double { Double(v.description.utf8.count) }
-// Math.max / Math.min with NaN propagation.
-fileprivate func jsMax(_ a: Double, _ b: Double) -> Double { a.isNaN || b.isNaN ? .nan : Swift.max(a, b) }
-fileprivate func jsMin(_ a: Double, _ b: Double) -> Double { a.isNaN || b.isNaN ? .nan : Swift.min(a, b) }
-// Buffer#subarray(start, end) index semantics.
+// max and min that return NaN when either side is NaN.
+fileprivate func nanMax(_ a: Double, _ b: Double) -> Double { a.isNaN || b.isNaN ? .nan : Swift.max(a, b) }
+fileprivate func nanMin(_ a: Double, _ b: Double) -> Double { a.isNaN || b.isNaN ? .nan : Swift.min(a, b) }
+// A byte range: negative indices count from the end, and both ends are clamped.
 fileprivate func subarray(_ data: Data, _ start: Double, _ end: Double? = nil) -> Data {
     let n = data.count
     func rel(_ x: Double) -> Int {
@@ -52,20 +52,20 @@ fileprivate func subarray(_ data: Data, _ start: Double, _ end: Double? = nil) -
     let base = data.startIndex
     return Data(data[(base + s)..<(base + e)])
 }
-// JS regexps here use `$` without the m flag (end of input only), so ICU patterns use \z.
+// These patterns must match only at the end of input; ICU's `$` also matches before a final newline, so they use \z.
 fileprivate let DIGITS = re(#"^[0-9]+\z"#)
 fileprivate let SIGNED = re(#"^-?[0-9]+\z"#)
 fileprivate let HEX64 = re(#"^[a-f0-9]{64}\z"#)
-// node:path throws TypeError for non-string arguments.
+// Path helpers throw a TypeError for non-string arguments.
 fileprivate func strictJoin(_ parts: [Value]) throws -> String {
     for part in parts where !part.isString {
-        throw JSError.type("The \"path\" argument must be of type string. Received \(part.typeOf == "object" && part.isNull ? "null" : part.typeOf)")
+        throw EngineError.type("The \"path\" argument must be of type string. Received \(part.typeOf == "object" && part.isNull ? "null" : part.typeOf)")
     }
     return path.join(parts.map { $0.description })
 }
-// Map.groupBy(items, key) → JSMap of arrays.
-fileprivate func groupBy(_ items: [Value], _ key: (Value) throws -> Value) rethrows -> JSMap {
-    let groups = JSMap()
+// Groups items by key into a map of arrays.
+fileprivate func groupBy(_ items: [Value], _ key: (Value) throws -> Value) rethrows -> ValueMap {
+    let groups = ValueMap()
     for item in items {
         let k = try key(item)
         let existing = groups.get(k)
@@ -73,7 +73,7 @@ fileprivate func groupBy(_ items: [Value], _ key: (Value) throws -> Value) rethr
     }
     return groups
 }
-// try { body() } finally { cleanup() } — a cleanup error replaces the body's outcome, as in JS.
+// try { body() } finally { cleanup() } — a cleanup error replaces the body's outcome.
 fileprivate func withFinally(_ body: () throws -> Value, _ cleanup: () throws -> Void) throws -> Value {
     let result: Result<Value, Error>
     do { result = .success(try body()) } catch { result = .failure(error) }
@@ -83,22 +83,18 @@ fileprivate func withFinally(_ body: () throws -> Value, _ cleanup: () throws ->
 
 // MARK: - Bridge metadata
 
-// L2347
 func bridgeClear(_ sessionId: Value = .undefined) throws -> Value {
     ["type": "bridge-session", "sessionId": sessionId, "bridgeSessionId": "", "lastSequenceNum": 0]
 }
-// L2348
 func bridgeError(_ text: Value = .undefined) throws -> Value {
-    jsThrow("Local bridge metadata: \(text)", code: "BRIDGE_RECOVERY").value
+    makeError("Local bridge metadata: \(text)", code: "BRIDGE_RECOVERY").value
 }
-fileprivate func bridgeFailure(_ text: String) throws -> JSError { JSError(try bridgeError(Value(text))) }
-// L2349
+fileprivate func bridgeFailure(_ text: String) throws -> EngineError { EngineError(try bridgeError(Value(text))) }
 func bridgeEntry(_ entry: Value = .undefined, _ sessionId: Value = .undefined) throws -> Value {
     Value(entry.truthy && entry.typeOf == "object" && !entry.isArray &&
         entry["type"] === "bridge-session" && entry.sessionId === sessionId && (entry.bridgeSessionId ?? entry.bridge_session_id).isString)
 }
 
-// L2352
 func bridgePlans(_ row: Value = .undefined, _ aliases: Value = .undefined) throws -> Value {
     let aliases = aliases.isUndefined ? Value.newArray() : aliases
     if row.bridgeAppend.nullish && row.bridgeUndo.nullish { return .newArray() }
@@ -113,21 +109,21 @@ func bridgePlans(_ row: Value = .undefined, _ aliases: Value = .undefined) throw
             (made0.truthy ? Value(path.basename(made0.description, ".json")) : .null)
         let recordIds = plan.recordIds
         if !recordIds.isArray || recordIds.length == 0 || recordIds.elements.contains(where: { !$0.isString || !LOCAL_RECORD.test($0.description) }) ||
-            JSSet(recordIds.elements).size != recordIds.length || ([recordId] + aliases.elements).contains(where: { $0.truthy && !recordIds.includes($0) }) { try invalid() }
+            ValueSet(recordIds.elements).size != recordIds.length || ([recordId] + aliases.elements).contains(where: { $0.truthy && !recordIds.includes($0) }) { try invalid() }
         if ["transcript", "canonical"].contains(where: { key in !plan[key].isString || !path.isAbsolute(plan[key].description) || path.basename(plan[key].description) != "\(id).jsonl" }) ||
             ["dev", "ino"].contains(where: { key in !plan[key].isString || !DIGITS.test(plan[key].description) }) ||
-            !isSafeInteger(plan["length"]) || jsNumber(plan["length"]) < 0 ||
+            !isSafeInteger(plan["length"]) || toNumber(plan["length"]) < 0 ||
             ["sha", "afterSha"].contains(where: { key in !plan[key].isString || !HEX64.test(plan[key].description) }) { try invalid() }
-        let signature: [String] = plan.fingerprint.isString ? plan.fingerprint.description.jsSplit(":") : []
+        let signature: [String] = plan.fingerprint.isString ? plan.fingerprint.description.splitting(":") : []
         if signature.count != 5 || signature[0..<3].joined(separator: ":") != "\(plan.dev):\(plan.ino):\(plan["length"])" ||
             signature[3...].contains(where: { !SIGNED.test($0) }) { try invalid() }
         let bytes = jsonText(index != 0 ? plans[0].original : try bridgeClear(id), 0)
-        if plan["bytes"] !== Value(bytes) && plan["bytes"] !== Value("\n\(bytes)") || !isSafeInteger(Value(jsNumber(plan["length"]) + byteLength(plan["bytes"]))) { try invalid() }
+        if plan["bytes"] !== Value(bytes) && plan["bytes"] !== Value("\n\(bytes)") || !isSafeInteger(Value(toNumber(plan["length"]) + byteLength(plan["bytes"]))) { try invalid() }
         if (row.targetTranscript ?? row.transcript ?? plan.transcript) !== plan.transcript || index != 0 &&
             (["transcript", "canonical", "dev", "ino"].contains(where: { plan[$0] !== plans[0][$0] }) || stable(plan.recordIds) != stable(plans[0].recordIds) ||
-             stable(plan.original) != stable(plans[0].original) || jsNumber(plan["length"]) < jsNumber(plans[0]["length"]) + byteLength(plans[0]["bytes"])) { try invalid() }
+             stable(plan.original) != stable(plans[0].original) || toNumber(plan["length"]) < toNumber(plans[0]["length"]) + byteLength(plans[0]["bytes"])) { try invalid() }
         if !plan.continuation.nullish {
-            let continuation = plan.continuation, offset = jsNumber(continuation["length"]) - jsNumber(plan["length"])
+            let continuation = plan.continuation, offset = toNumber(continuation["length"]) - toNumber(plan["length"])
             if !isSafeInteger(Value(offset)) || offset < 0 || offset >= byteLength(plan["bytes"]) ||
                 !continuation.sha.isString || !HEX64.test(continuation.sha.description) ||
                 continuation["bytes"] !== Value(subarray(Data(plan["bytes"].description.utf8), offset).base64EncodedString()) ||
@@ -138,7 +134,6 @@ func bridgePlans(_ row: Value = .undefined, _ aliases: Value = .undefined) throw
     return plans
 }
 
-// L2384
 func bridgeFile(_ plan: Value = .undefined, _ writable: Value = .undefined, _ work: Value = .undefined) throws -> Value {
     if try mappedPath(plan.transcript) !== plan.canonical || Value(try fs.realpath(str(plan.canonical))) !== plan.canonical { throw try bridgeFailure("transcript path changed") }
     let before = try fs.lstat(str(plan.canonical), bigint: true)
@@ -152,7 +147,6 @@ func bridgeFile(_ plan: Value = .undefined, _ writable: Value = .undefined, _ wo
     }, { try handle.close() })
 }
 
-// L2395
 func bridgeStable(_ plan: Value = .undefined, _ handle: Value = .undefined, _ signature: Value = .undefined, _ inspect: Value = .undefined) throws -> Value {
     if inspect.truthy {
         let live = try workers(try inspect.call())
@@ -166,23 +160,22 @@ func bridgeStable(_ plan: Value = .undefined, _ handle: Value = .undefined, _ si
     return .undefined
 }
 
-// L2407
 func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ parse: Value = .undefined) throws -> Value {
     let parse = parse.isUndefined ? Value(true) : parse
     let file = try handleOf(handle)
-    let detail = try file.stat(bigint: true), size = jsNumber(detail["size"]), signature = try statIdentity(detail)
+    let detail = try file.stat(bigint: true), size = toNumber(detail["size"]), signature = try statIdentity(detail)
     if !isSafeInteger(Value(size)) { throw try bridgeFailure("transcript size is unsupported") }
     let memory = try operationMemory()
     let hash = RunningHash(), prefix = RunningHash()
     var tail = Data()
     let bufferLength = 64.0 * 1024, limit = byteLength(plan["bytes"] ?? "")
-    let planLength = jsNumber(plan["length"])
+    let planLength = toNumber(plan["length"])
     var parts: [Data] = [], length = 0, last: Value = .null, prefixLast: Value = .null, invalid = false, newline = false
     func consume(_ end: Double) throws {
         _ = try memory.check.call(Value(Double(length * 4)))
         var joined = Data(capacity: length)
         for part in parts { joined.append(part) }
-        let text = String(decoding: joined, as: UTF8.self).jsTrim
+        let text = String(decoding: joined, as: UTF8.self).trimmingWhitespace
         parts = []; length = 0
         if text.isEmpty { return }
         do {
@@ -195,14 +188,14 @@ func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ pars
     }
     var at = 0.0
     while at < size {
-        let chunk = try file.read(length: Int(jsMin(bufferLength, size - at)), position: Int64(at))
+        let chunk = try file.read(length: Int(nanMin(bufferLength, size - at)), position: Int64(at))
         let bytesRead = chunk.count
         if bytesRead == 0 { throw try bridgeFailure("transcript changed while reading") }
         productive()
         _ = try memory.check.call(Value(Double(bytesRead)))
         hash.update(chunk)
-        if at < planLength { prefix.update(subarray(chunk, 0, jsMin(Double(bytesRead), planLength - at))) }
-        let startTail = jsMax(0, planLength - at), endTail = jsMin(Double(bytesRead), planLength + limit - at)
+        if at < planLength { prefix.update(subarray(chunk, 0, nanMin(Double(bytesRead), planLength - at))) }
+        let startTail = nanMax(0, planLength - at), endTail = nanMin(Double(bytesRead), planLength + limit - at)
         if endTail > startTail { tail.append(subarray(chunk, startTail, endTail)) }
         if parse.truthy {
             var start = 0
@@ -221,7 +214,7 @@ func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ pars
     }
     if length != 0 { try consume(size) }
     _ = try bridgeStable(plan, handle, signature)
-    let o = JSObject()
+    let o = ValueObject()
     o["length"] = Value(size)
     o["fingerprint"] = signature
     o["sha"] = Value(hash.copy().digest())
@@ -237,7 +230,6 @@ func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ pars
     return .object(o)
 }
 
-// L2455
 func bridgePlan(_ base: Value = .undefined, _ state: Value = .undefined, _ entry: Value = .undefined) throws -> Value {
     if !(try bridgeEntry(entry, base.sessionId)).truthy { throw try bridgeFailure("invalid bridge metadata entry") }
     let bytes = "\(state["length"].truthy && !state.newline.truthy ? "\n" : "")\(JSON.text(entry))\n"
@@ -247,7 +239,6 @@ func bridgePlan(_ base: Value = .undefined, _ state: Value = .undefined, _ entry
     ])
 }
 
-// L2462
 func bridgeSource(_ s: Value = .undefined, _ to: Value = .undefined, _ `guard`: Value = .undefined) throws -> Value {
     let canonical = try mappedPath(s.transcript), detail = try fs.lstat(str(canonical), bigint: true)
     let records = try ([s] + `guard`.sources.elements + `guard`.targets.elements).filter { $0.id === s.id }.map { try desktopRecordOf($0) }
@@ -257,7 +248,7 @@ func bridgeSource(_ s: Value = .undefined, _ to: Value = .undefined, _ `guard`: 
     return try bridgeFile(base, false, Value { args in
         let handle = args.first ?? .undefined
         let state = try bridgeRead(base, handle, Value(s.bridge !== false && s.contentSha !== s.bridgeAppend.afterSha))
-        if state.fingerprint !== s.transcriptFingerprint || s.contentSha.truthy && state.sha !== s.contentSha { throw JSError("source changed since inventory") }
+        if state.fingerprint !== s.transcriptFingerprint || s.contentSha.truthy && state.sha !== s.contentSha { throw EngineError("source changed since inventory") }
         let last = state["last"]
         let pointer = last.bridgeSessionId ?? last.bridge_session_id
         let destinationOwned = last.ownerAccountUuid === to.account && last.ownerOrganizationUuid === to.org
@@ -270,7 +261,6 @@ func bridgeSource(_ s: Value = .undefined, _ to: Value = .undefined, _ `guard`: 
     })
 }
 
-// L2481
 func appendBridge(_ plan: Value = .undefined, _ inspect: Value = .undefined, _ recovering: Value = .undefined, _ save: Value = .undefined) throws -> Value {
     let recovering = recovering.isUndefined ? Value(false) : recovering
     let save = save.isUndefined ? Value.null : save
@@ -279,7 +269,7 @@ func appendBridge(_ plan: Value = .undefined, _ inspect: Value = .undefined, _ r
         return try bridgeFile(plan, true, Value { args in
             let handle = args.first ?? .undefined
             let state = try bridgeRead(plan, handle, false), bytes = Data(plan["bytes"].description.utf8)
-            let extra = jsNumber(state["length"]) - jsNumber(plan["length"])
+            let extra = toNumber(state["length"]) - toNumber(plan["length"])
             if recovering.truthy {
                 if !(try bridgeWitness(plan, state)).truthy { throw try bridgeFailure("append recovery witness changed") }
                 if extra >= Double(bytes.count) { return state }
@@ -294,26 +284,25 @@ func appendBridge(_ plan: Value = .undefined, _ inspect: Value = .undefined, _ r
             try file.writeFile(recovering.truthy ? subarray(bytes, extra) : bytes)
             try file.sync()
             let after = try bridgeRead(plan, handle, false)
-            if after["length"] !== Value(jsNumber(plan["length"]) + byteLength(plan["bytes"])) || after.sha !== plan.afterSha ||
+            if after["length"] !== Value(toNumber(plan["length"]) + byteLength(plan["bytes"])) || after.sha !== plan.afterSha ||
                 after.prefixSha !== plan.sha || after.tail.asData != Data(plan["bytes"].description.utf8) { throw try bridgeFailure("unexpected content after append") }
             _ = try bridgeStable(plan, handle, after.fingerprint, inspect)
             return after
         })
     } catch {
-        let value = jsErrorValue(error)
+        let value = errorObject(error)
         value.bridgeUntouched = Value(!attempted)
-        throw JSError(value)
+        throw EngineError(value)
     }
 }
 
-// L2505
 func bridgeWitness(_ plan: Value = .undefined, _ state: Value = .undefined) throws -> Value {
-    let bytes = Data(plan["bytes"].description.utf8), extra = jsNumber(state["length"]) - jsNumber(plan["length"])
+    let bytes = Data(plan["bytes"].description.utf8), extra = toNumber(state["length"]) - toNumber(plan["length"])
     if state.prefixSha === plan.sha {
         var broken = state.intendedSha !== plan.afterSha
         if !broken && plan.continuation.truthy {
             let witness = try hashOf(state.prefixHash).copy()
-                .update(subarray(bytes, 0, jsNumber(plan.continuation["length"]) - jsNumber(plan["length"]))).digest()
+                .update(subarray(bytes, 0, toNumber(plan.continuation["length"]) - toNumber(plan["length"]))).digest()
             broken = Value(witness) !== plan.continuation.sha
         }
         if broken { throw try bridgeFailure("invalid bridge recovery receipt witness") }
@@ -321,7 +310,6 @@ func bridgeWitness(_ plan: Value = .undefined, _ state: Value = .undefined) thro
     return Value(extra >= 0 && state.prefixSha === plan.sha && state.tail.asData == subarray(bytes, 0, extra))
 }
 
-// L2512
 func bridgeRecovery(_ row: Value = .undefined, _ optional: Value = .undefined, _ aliases: Value = .undefined) throws -> Value {
     let optional = optional.isUndefined ? Value(false) : optional
     let aliases = aliases.isUndefined ? Value.newArray() : aliases
@@ -331,7 +319,7 @@ func bridgeRecovery(_ row: Value = .undefined, _ optional: Value = .undefined, _
     do { state = try bridgeFile(plan, false, Value { args in try bridgeRead(plan, args.first ?? .undefined) }) }
     catch { if optional.truthy && !row.bridgeUndo.truthy { return .null }; throw error }
     if state.prefixSha === plan.sha && stable(state.prefixLast) != stable(plan.original) { throw try bridgeFailure("invalid original bridge witness") }
-    let witnessed = try bridgeWitness(plan, state), extra = jsNumber(state["length"]) - jsNumber(plan["length"])
+    let witnessed = try bridgeWitness(plan, state), extra = toNumber(state["length"]) - toNumber(plan["length"])
     if !witnessed.truthy {
         if optional.truthy && !row.bridgeUndo.truthy { return .null }
         throw try bridgeFailure("transcript restoration witness changed")
@@ -351,7 +339,6 @@ func bridgeRecovery(_ row: Value = .undefined, _ optional: Value = .undefined, _
     return ["plan": plan, "state": state, "partial": Value(extra < byteLength(plan["bytes"]))]
 }
 
-// L2538
 func restoreBridge(_ row: Value = .undefined, _ save: Value = .undefined, _ inspect: Value = .undefined, _ optional: Value = .undefined, _ allowLater: Value = .undefined) throws -> Value {
     let optional = optional.isUndefined ? Value(false) : optional
     let allowLater = allowLater.isUndefined ? Value(true) : allowLater
@@ -359,7 +346,7 @@ func restoreBridge(_ row: Value = .undefined, _ save: Value = .undefined, _ insp
     if !recovery.truthy { return .undefined }
     let plan = recovery.plan, partial = recovery.partial, restoring = recovery.restoring
     if restoring.truthy { return try appendBridge(row.bridgeUndo, inspect, true, save) }
-    if !allowLater.truthy && jsNumber(recovery.state["length"]) > jsNumber(plan["length"]) + byteLength(plan["bytes"]) { throw try bridgeFailure("newer transcript content prevents bridge restoration") }
+    if !allowLater.truthy && toNumber(recovery.state["length"]) > toNumber(plan["length"]) + byteLength(plan["bytes"]) { throw try bridgeFailure("newer transcript content prevents bridge restoration") }
     if partial.truthy { _ = try appendBridge(plan, inspect, true, save) }
     let ready = try bridgeRecovery(row, optional)
     if !ready.truthy { return .undefined }
@@ -369,7 +356,6 @@ func restoreBridge(_ row: Value = .undefined, _ save: Value = .undefined, _ insp
     return .undefined
 }
 
-// L2552
 func bridgeProblems(_ rows: Value = .undefined, _ optional: Value = .undefined) throws -> Value {
     let optional = optional.isUndefined ? Value(false) : optional
     let problems = Value.newArray()
@@ -378,12 +364,11 @@ func bridgeProblems(_ rows: Value = .undefined, _ optional: Value = .undefined) 
         do {
             let aliases = related.get(row.targetId ?? row.id).elements.map { $0.targetRecordId ?? $0.recordSnapshot.sessionId }
             _ = try bridgeRecovery(row, optional, Value(aliases))
-        } catch { problems.push(Value("\(row.title) | \(jsErrorValue(error)["message"])")) }
+        } catch { problems.push(Value("\(row.title) | \(errorObject(error)["message"])")) }
     }
     return problems
 }
 
-// L2563
 func bridgeIntact(_ row: Value = .undefined) throws -> Value {
     if !row.bridgeAppend.truthy { return true }
     let plan = row.bridgeAppend
@@ -397,19 +382,18 @@ func bridgeIntact(_ row: Value = .undefined) throws -> Value {
 
 // MARK: - Rehome
 
-// L2572
 func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Value = .undefined, _ `guard`: Value = .undefined) throws -> Value {
     let source = try bridgeSource(s, to, `guard`)
     let transcriptFingerprint = source.fingerprint, append = source.append
     let sidecarRoot = path.join(path.dirname(str(s.transcript)), str(s.id))
     let sidecarTree = try treeFingerprint(Value(sidecarRoot))
-    if try !s.sidecar.fingerprint.truthy || !(try sameTree(s.sidecar, sidecarTree)).truthy { throw JSError("source sidecars changed since inventory") }
+    if try !s.sidecar.fingerprint.truthy || !(try sameTree(s.sidecar, sidecarTree)).truthy { throw EngineError("source sidecars changed since inventory") }
     let sourceSidecars = Value.spread(s.sidecar, ["fingerprint": sidecarTree.fingerprint, "canonicalRoot": sidecarTree.canonicalRoot])
     let sourceRecord = try readFile(s.file, "utf8")
     let current = try JSON.parse(sourceRecord.description)
-    if try current.cliSessionId !== s.id || !(try validDesktopRecord(["file": s.file, "record": current])).truthy { throw JSError("source Desktop record changed identity") }
-    if try recordSemantic(current) !== s.recordSemantic { throw JSError("source Desktop record changed since inventory") }
-    if current.forkedFromSessionId !== s.record.forkedFromSessionId { throw JSError("source Desktop lineage changed since inventory") }
+    if try current.cliSessionId !== s.id || !(try validDesktopRecord(["file": s.file, "record": current])).truthy { throw EngineError("source Desktop record changed identity") }
+    if try recordSemantic(current) !== s.recordSemantic { throw EngineError("source Desktop record changed since inventory") }
+    if current.forkedFromSessionId !== s.record.forkedFromSessionId { throw EngineError("source Desktop lineage changed since inventory") }
     let taskSessionsMap = `guard`.taskSessions
     if !s.taskFamily.truthy {
         var owned = current.notifySessionId.truthy
@@ -419,18 +403,18 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
                 owned = try coldBlocked(current, owners).truthy
             }
         }
-        if owned { throw JSError("source Desktop ownership changed since inventory") }
+        if owned { throw EngineError("source Desktop ownership changed since inventory") }
     }
     let sourceTasks = taskSessionsMap.get(s.account.taskFile)
-    if sourceTasks.nullish { throw JSError.type("Cannot read properties of \(sourceTasks) (reading 'has')") }
-    if sourceTasks.has(current.sessionId) { throw JSError("source scheduled task ownership changed since inventory") }
+    if sourceTasks.nullish { throw EngineError.type("Cannot read properties of \(sourceTasks) (reading 'has')") }
+    if sourceTasks.has(current.sessionId) { throw EngineError("source scheduled task ownership changed since inventory") }
     let targetTasks = taskSessionsMap.get(to.taskFile).registry.scheduledTasks ?? .newArray()
     if targetTasks.elements.contains(where: { task in
         task.notifySessionId === current.sessionId &&
             !s.taskFamily.replaced.elements.contains(where: { row in stable(row.task) == stable(task) })
-    }) { throw JSError("target scheduled task collision") }
-    if try ownsWorker(`guard`.workers, s.id, current.sessionId).truthy { throw JSError("running worker") }
-    let title = or(or(Value((current.title ?? "").description.jsTrim), s.title), "Untitled")
+    }) { throw EngineError("target scheduled task collision") }
+    if try ownsWorker(`guard`.workers, s.id, current.sessionId).truthy { throw EngineError("running worker") }
+    let title = or(or(Value((current.title ?? "").description.trimmingWhitespace), s.title), "Untitled")
     let record = path.join(str(to.dir), path.basename(str(s.file)))
     let sourceRecordSha = sha(sourceRecord)
     let placed = Value.spread(try without(current, .strings(ACCOUNT_ERROR_KEYS)), ["bridgeSessionIds": .newArray()])
@@ -448,9 +432,9 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
     let afterTranscriptFingerprint = try fingerprint(s.transcript)
     let afterRecord = try readFile(s.file, "utf8")
     let afterSidecars = try treeFingerprint(Value(sidecarRoot))
-    if afterTranscriptFingerprint !== transcriptFingerprint { throw JSError("source changed during move") }
-    if sha(afterRecord) != sourceRecordSha { throw JSError("source Desktop record changed during move") }
-    if !(try sameTree(sourceSidecars, afterSidecars)).truthy { throw JSError("source sidecars changed during move") }
+    if afterTranscriptFingerprint !== transcriptFingerprint { throw EngineError("source changed during move") }
+    if sha(afterRecord) != sourceRecordSha { throw EngineError("source Desktop record changed during move") }
+    if !(try sameTree(sourceSidecars, afterSidecars)).truthy { throw EngineError("source sidecars changed during move") }
     if `guard`.check.isFunction { _ = try `guard`.check.call() }
     var placedFingerprint = transcriptFingerprint
     if append.truthy {
@@ -458,7 +442,7 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
         let after: Value
         do { after = try appendBridge(append, `guard`.inspect) }
         catch {
-            if jsErrorValue(error).bridgeUntouched.truthy { _ = try journal.call(["bridgeAppend": .null], true) }
+            if errorObject(error).bridgeUntouched.truthy { _ = try journal.call(["bridgeAppend": .null], true) }
             throw error
         }
         placedFingerprint = after.fingerprint
@@ -476,7 +460,7 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
         member.transcriptFingerprint = placedFingerprint
         member.sidecar = Value.spread(member.sidecar, ["fingerprint": sourceSidecars.fingerprint])
     }
-    let o = JSObject()
+    let o = ValueObject()
     o["strategy"] = "rehome"
     o["id"] = s.id
     o["targetId"] = s.id
@@ -502,23 +486,18 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
 
 // MARK: - Ownership and failures
 
-// L2657
 func knownOf(_ row: Value = .undefined) throws -> Value {
     ["semantic": row.targetSemantic, "semanticVersion": row.targetSemanticVersion]
 }
-// L2661
 func artifacts(_ row: Value = .undefined) throws -> Value {
     row.strategy === "rehome" ? [row.record] : [row.targetTranscript, row.targetDir, row.record].filter { $0.truthy }.value
 }
-// L2662
 public func retiredCount(_ receipt: Value = .undefined) throws -> Value {
     Value((receipt.superseded ?? .newArray()).elements.filter { $0.source.truthy }.count)
 }
-// L2663
 func retiredFiles(_ receipt: Value = .undefined) throws -> Value {
     .newSet((receipt.superseded ?? .newArray()).elements.filter { $0.source.truthy }.flatMap { row in row.moved.elements.map { $0[0] } })
 }
-// L2664
 func ownership(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ bridges: Value = .undefined) throws -> Value {
     let bridges = bridges.isUndefined ? Value(true) : bridges
     let record = try desktopRecordOf(row)
@@ -533,32 +512,27 @@ func ownership(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ b
     ]
     return Value(parts.compactMap { $0 }.joined(separator: ", "))
 }
-// L2675
 func rehomeOwnership(_ row: Value = .undefined, _ liveWorkers: Value = .undefined) throws -> Value {
     if row.taskFamily.truthy && !row.taskFamily.error.truthy {
         return try row.worker.truthy || ownsWorker(liveWorkers, row.id, try desktopRecordOf(row).sessionId).truthy ? "running worker" : ""
     }
     return try ownership(row, liveWorkers, false)
 }
-// L2677
 public func retirementOwnership(_ inv: Value = .undefined, _ row: Value = .undefined, _ owner: Value = .undefined, _ liveWorkers: Value = .undefined) throws -> Value {
     owner.history.strategy === "rehome" || inv.cloudRequested.truthy ? try rehomeOwnership(row, liveWorkers) : try ownership(row, liveWorkers)
 }
-// L2678
 func sourceIdentity(_ row: Value = .undefined) throws -> Value {
     let rest: Value = ["label": try accountLabel(row.account), "id": row.id, "sessionId": row.record.sessionId, "file": row.file,
                        "title": row.title, "remoteIds": try remoteIdsOf(row)]
     return Value.spread(try accountRef(row.account), rest, row.recordSha.truthy ? ["recordSha": row.recordSha] : [:])
 }
-// L2680
 func failureIdentity(_ item: Value = .undefined) throws -> Value {
     let rows = try (item.members ?? [item]).elements.filter { try $0.account.truthy && validDesktopRecord($0).truthy }
     return ["sources": Value(try rows.map { try sourceIdentity($0) })]
 }
-// L2681
 func inventoryFailure(_ item: Value = .undefined) throws -> Value {
     let title: String
-    if jsNumber(item.members["length"]) > 1 {
+    if toNumber(item.members["length"]) > 1 {
         title = item.members.elements.map { member in "\(member.account.label) | \(or(member.title, Value(path.basename(str(member.file)))))" }.joined(separator: " + ")
     } else {
         title = "\(item.account.label) | \(or(item.title, Value(path.basename(str(item.file)))))"
@@ -566,25 +540,20 @@ func inventoryFailure(_ item: Value = .undefined) throws -> Value {
     let head: Value = ["id": item.id ?? .null, "title": Value(title), "error": item.error ?? "unreadable Desktop record"]
     return Value.spread(head, item.code.truthy ? ["code": item.code] : [:], try failureIdentity(item))
 }
-// L2690
 func taggedCloudFailure(_ cloud: Value = .undefined, _ failure: Value = .undefined) throws -> Value {
     Value.spread(failure, ["cloudAccount": cloud.account, "cloudOrg": cloud.org])
 }
-// L2691
 func cloudTagged(_ row: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
     Value(row.cloudAccount === cloud.account && row.cloudOrg === cloud.org)
 }
-// L2692
 public func inventoryFailures(_ inv: Value = .undefined) throws -> Value {
     let local = try (inv.unreadable.elements + inv.rejected.elements + (inv.blocked ?? .newArray()).elements).map { try inventoryFailure($0) }
     let cloud = try (inv.cloud.blocked ?? .newArray()).elements.map { try taggedCloudFailure(inv.cloud, try inventoryFailure($0)) }
     return Value(local + cloud)
 }
-// L2696
 func localFailureKey(_ row: Value = .undefined) throws -> Value {
     Value("\(row.account)/\(row.org)/\(row.sessionId)")
 }
-// L2697
 func failureCause(_ error: Value = .undefined) throws -> Value {
     let text = error.description
     if text.hasPrefix(TASK_FAMILY_BLOCKED) { return "waiting on task family" }
@@ -593,11 +562,10 @@ func failureCause(_ error: Value = .undefined) throws -> Value {
     if re("task.*(?:collision|differs|enabled|dependency|unreadable|record exists)").test(text) { return "task collision" }
     return "other"
 }
-// L2699
 public func receiptSummary(_ receipt: Value = .undefined) throws -> Value {
     let failed = (receipt.failed ?? .newArray()).elements
     let local = failed.filter { !$0.cloudAccount.truthy }
-    let byKey = JSMap()
+    let byKey = ValueMap()
     for row in local {
         for source in (row.sources ?? .newArray()).elements {
             let entry = Value.spread(source, ["error": row.error, "cause": try failureCause(row.error)])
@@ -612,7 +580,7 @@ public func receiptSummary(_ receipt: Value = .undefined) throws -> Value {
     }
     let keep = try keptCopy(receipt), failedArray = Value(failed)
     let kept = try failed.enumerated().filter { try keep.call($0.element, Value($0.offset), failedArray).truthy }.map { $0.element }
-    let o = JSObject()
+    let o = ValueObject()
     o["moved"] = moved
     o["notMoved"] = Value(notMoved)
     o["groups"] = Value(groups)
@@ -621,14 +589,13 @@ public func receiptSummary(_ receipt: Value = .undefined) throws -> Value {
     return .object(o)
 }
 
-// L2708
 func projectLocalFailures(_ receipt: Value = .undefined, _ paths: Value = .undefined, _ project: Value = .undefined) throws -> Value {
     let project = project.isUndefined ? Value(true) : project
     let local = (receipt.failed ?? .newArray()).elements.filter { !$0.cloudAccount.truthy }
     if local.isEmpty && !(receipt.failed ?? .newArray()).elements.contains(where: { $0.blockedByLocal["length"].truthy }) { return .undefined }
     var candidates: [Value]? = nil
     var pool: Value = .undefined
-    let verified = JSMap()
+    let verified = ValueMap()
     for failure in local {
         if project.truthy && !failure.sources["length"].truthy && failure.id.truthy && receipt.fromAccounts["length"].truthy {
             if candidates == nil {
@@ -638,7 +605,7 @@ func projectLocalFailures(_ receipt: Value = .undefined, _ paths: Value = .undef
                         if !UUID.test(account.account.description) || !UUID.test(account.org.description) { collected.append(.null); continue }
                         let files: Value
                         do { files = try recordFiles(Value(try strictJoin([paths.records, account.account, account.org]))) }
-                        catch { if jsErrorValue(error).code === "ENOENT" { files = .newArray() } else { throw error } }
+                        catch { if errorObject(error).code === "ENOENT" { files = .newArray() } else { throw error } }
                         var rows: [Value] = []
                         for file in files.elements {
                             let raw = try readFile(file), record = try JSON.parse(raw.asData ?? Data())
@@ -713,7 +680,6 @@ func projectLocalFailures(_ receipt: Value = .undefined, _ paths: Value = .undef
 
 // MARK: - Target checks
 
-// L2771
 func changed(_ file: Value = .undefined, _ sessionId: Value = .undefined, _ known: Value = .undefined) throws -> Value {
     if !exists(file) { return false }
     if !known.semantic.truthy || known.semanticVersion !== Value(SEMANTIC_VERSION) { return true }
@@ -722,7 +688,6 @@ func changed(_ file: Value = .undefined, _ sessionId: Value = .undefined, _ know
     return Value(!known.bridge.isUndefined && Value(data.entries.elements.contains { $0["type"] === "bridge-session" }) !== known.bridge)
 }
 
-// L2778
 func targetChanges(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ checkShared: Value = .undefined, _ allowRecordDrift: Value = .undefined) throws -> Value {
     let checkShared = checkShared.isUndefined ? Value(true) : checkShared
     let allowRecordDrift = allowRecordDrift.isUndefined ? Value(false) : allowRecordDrift
@@ -772,11 +737,10 @@ func targetChanges(_ row: Value = .undefined, _ liveWorkers: Value = .undefined,
     return changes
 }
 
-// L2818
 func restoreProblems(_ plan: Value = .undefined, _ root: Value = .undefined, _ parkedOnly: Value = .undefined) throws -> Value {
     let parkedOnly = parkedOnly.isUndefined ? Value(false) : parkedOnly
     let problems = Value.newArray()
-    func pairs(_ v: Value) -> JSMap { JSMap((v ?? .newArray()).elements.map { ($0[0], $0[1]) }) }
+    func pairs(_ v: Value) -> ValueMap { ValueMap((v ?? .newArray()).elements.map { ($0[0], $0[1]) }) }
     for item in plan.elements {
         let hashes = pairs(item.hashes), trees = pairs(item.trees), semantics = pairs(item.semantics)
         let name = or(item.title, item.id)
@@ -809,7 +773,6 @@ func restoreProblems(_ plan: Value = .undefined, _ root: Value = .undefined, _ p
     return problems
 }
 
-// L2851
 func snapshotPlan(_ item: Value = .undefined) throws -> Value {
     let hashes = try (item.hashes ?? .newArray()).elements.map { pair -> Value in [pair[0], Value(sha(try readFile(pair[0])))] }
     let trees = try (item.trees ?? .newArray()).elements.map { pair -> Value in [pair[0], try manifest(pair[0]).sha] }
@@ -821,10 +784,10 @@ func snapshotPlan(_ item: Value = .undefined) throws -> Value {
         let temp = "\(file).tmp"
         let detail: Value
         do { detail = try fs.lstat(temp) }
-        catch { if jsErrorValue(error).code === "ENOENT" { continue }; throw error }
-        if !(try isFileStat(detail)) { throw JSError("Desktop record temp is not a regular file: \(path.basename(temp))") }
+        catch { if errorObject(error).code === "ENOENT" { continue }; throw error }
+        if !(try isFileStat(detail)) { throw EngineError("Desktop record temp is not a regular file: \(path.basename(temp))") }
         let raw = try readFile(Value(temp))
-        if stable(try JSON.parse(raw.asData ?? Data())) != stable(try readJson(file)) { throw JSError("Desktop record has a different pending update: \(path.basename(str(file)))") }
+        if stable(try JSON.parse(raw.asData ?? Data())) != stable(try readJson(file)) { throw EngineError("Desktop record has a different pending update: \(path.basename(str(file)))") }
         plan.hashes.push([Value(temp), Value(sha(raw))])
         plan.required = Value((plan.required ?? .newArray()).elements + [Value(temp)])
         plan.moved = Value(plan.moved.elements + [[Value(temp), Value("\(parked).tmp")]])
@@ -832,7 +795,6 @@ func snapshotPlan(_ item: Value = .undefined) throws -> Value {
     return plan
 }
 
-// L2873
 func verify(_ rows: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined) throws -> Value {
     let report = fnOr(report), check = fnOr(check)
     var bad: [String: Int] = ["transcript": 0, "sidecars": 0, "desktop": 0]

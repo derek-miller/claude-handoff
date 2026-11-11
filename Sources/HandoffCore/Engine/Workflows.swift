@@ -1,15 +1,14 @@
 import Darwin
 import Foundation
 
-// Port of engine.js lines 4646-5165: move / finish / sweep / undo workflows, account selection, the
-// interactive picker and the progress reporter. The Node-era menubar installer is replaced by the native app.
+// The move, finish, sweep and Undo workflows, account selection, the interactive picker and the progress reporter.
 
-// `f?.(...args)`: call when it is a function, otherwise undefined.
+// Calls f when it is a function, otherwise returns undefined.
 fileprivate func optCall(_ f: Value, _ args: Value...) throws -> Value {
     f.isFunction ? try f.callArgs(args) : .undefined
 }
 
-// `promise.catch(() => null)`
+// The body's result, or null if it throws.
 fileprivate func orNull(_ body: () throws -> Value) -> Value {
     do { return try body() } catch { return .null }
 }
@@ -23,13 +22,12 @@ fileprivate func isInteger(_ v: Value) -> Bool {
 // process.stdout.isTTY (the Host table has no stdout TTY probe).
 fileprivate func stdoutIsTTY() -> Bool { isatty(1) != 0 }
 
-// `(row.members ?? [row]).map(source => source.file)`
+// The files of a row's members, or the row's own file when it has none.
 fileprivate func memberFiles(_ row: Value) -> [Value] {
     let members = row["members"]
     return (members.nullish ? [row] : members.elements).map { $0["file"] }
 }
 
-// L4646
 @discardableResult
 public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options: Value = Value.spread(options, ["cloudRequested": Value(options["cloudRequested"] === true || options["cloud"].truthy)])
@@ -131,7 +129,7 @@ public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ 
             for selected in chosen["from"].elements {
                 var current: Value = .undefined
                 for account in latest.elements where try sameAccount(account, selected).truthy { current = account; break }
-                if !current.truthy { throw JSError("\(selected["label"]) is no longer available") }
+                if !current.truthy { throw EngineError("\(selected["label"]) is no longer available") }
                 let known: Value = .newSet(try (current["sessions"].elements + current["unreadable"].elements).map { try desktopFileOf($0) })
                 let files = selected["files"]
                 let sessions = current["sessions"].elements.filter { files.includes($0["file"]) }
@@ -142,7 +140,7 @@ public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ 
             }
             var target: Value = .undefined
             for account in latest.elements where try sameAccount(account, chosen["to"]).truthy { target = account; break }
-            if !target.truthy { throw JSError("Destination account is no longer available") }
+            if !target.truthy { throw EngineError("Destination account is no longer available") }
             let inventoryOptions: Value = [
                 "cloud": cloud, "cloudRequested": options["cloudRequested"], "cloudError": options["cloudError"], "requestedAt": requestedAt,
                 "writeCache": true, "processes": try inspect.call(), "inspect": inspect, "check": check,
@@ -250,7 +248,7 @@ public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ 
                 ]))
                 if prepared.truthy && result.truthy {
                     return Value.spread(result, [
-                        "added": Value(jsNumber(prepared["added"] ?? 0) + jsNumber(result["added"] ?? 0)),
+                        "added": Value(toNumber(prepared["added"] ?? 0) + toNumber(result["added"] ?? 0)),
                         "targetChanged": or(prepared["targetChanged"], result["targetChanged"]),
                     ])
                 }
@@ -283,7 +281,6 @@ public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ 
     })
 }
 
-// L4781
 @discardableResult
 public func finishHeld(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
@@ -303,14 +300,14 @@ public func finishHeld(_ paths: Value = .undefined, _ options: Value = .undefine
     for ref in latest["receipt"]["fromAccounts"].elements {
         var account: Value = .undefined
         for row in all.elements where try sameAccount(row, ref).truthy { account = row; break }
-        if !account.truthy { throw JSError("\(ref["label"]) is no longer available") }
+        if !account.truthy { throw EngineError("\(ref["label"]) is no longer available") }
         var unreadable: [Value] = []
         for row in account["unreadable"].elements where files.has(try desktopFileOf(row)) { unreadable.append(row) }
         from.append(Value.spread(account, ["sessions": Value(account["sessions"].elements.filter { files.has($0["file"]) }), "unreadable": Value(unreadable)]))
     }
     var to: Value = .undefined
     for row in all.elements where try sameAccount(row, latest["receipt"]["toAccount"]).truthy { to = row; break }
-    if !to.truthy { throw JSError("Destination account is no longer available") }
+    if !to.truthy { throw EngineError("Destination account is no longer available") }
     let found: Value = .newSet(try from.flatMap { account in try (account["sessions"].elements + account["unreadable"].elements).map { try desktopFileOf($0) } })
     if files.elements.contains(where: { !found.has($0) }) { return ["ok": false, "reason": "A held source record disappeared. Its move was not marked complete."] }
     var prior: [Value] = latest["receipt"]["failed"].elements
@@ -332,7 +329,6 @@ public func finishHeld(_ paths: Value = .undefined, _ options: Value = .undefine
     ])
 }
 
-// L4810
 @discardableResult
 public func completeActiveCloud(_ result: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
@@ -351,12 +347,11 @@ public func completeActiveCloud(_ result: Value = .undefined, _ paths: Value = .
             "added": result["added"] ?? 0, "targetChanged": or(result["targetChanged"], finished["restart"]), "reason": finished["reason"],
         ])
     } catch {
-        let error = jsErrorValue(error)
+        let error = errorObject(error)
         return Value.spread(result, ["ok": false, "complete": false, "code": error["code"], "reason": error["message"]])
     }
 }
 
-// L4823
 @discardableResult
 public func finishWorkflow(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
@@ -413,12 +408,10 @@ public func finishWorkflow(_ paths: Value = .undefined, _ options: Value = .unde
     return result
 }
 
-// L4859
 func observedRecord(_ record: Value = .undefined) throws -> Value {
     .fromEntries(DURABLE_RECORD_KEYS.map { ($0, record[$0]) })
 }
 
-// L4861
 func inspectPlaced(_ paths: Value = .undefined) throws -> Value {
     let latest = try latestReceipt(paths)
     if !latest.truthy { return ["changed": []] }
@@ -464,13 +457,11 @@ func inspectPlaced(_ paths: Value = .undefined) throws -> Value {
     ]
 }
 
-// L4896
 @discardableResult
 public func verifyPlaced(_ paths: Value = .undefined) throws -> Value {
     try locked(paths, Value { _ in try inspectPlaced(paths) })
 }
 
-// L4898
 @discardableResult
 public func sweep(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
@@ -485,7 +476,7 @@ public func sweep(_ paths: Value = .undefined, _ options: Value = .undefined) th
         let failedText: Value = result["receipt"].nullish ? .undefined : Value(result["receipt"]["failed"].elements.map { row in "\(row["title"]): \(row["error"])" }.joined(separator: ", "))
         let error: Value = result["reason"] ?? problems ?? failedText
         var refreshRequired: Value = Value(!result["receipt"]["held"]["length"].truthy)
-        if refreshRequired.truthy { refreshRequired = Value(jsNumber(result["added"]) > 0) }
+        if refreshRequired.truthy { refreshRequired = Value(toNumber(result["added"]) > 0) }
         if refreshRequired.truthy { refreshRequired = try sameAccount(try signedIn(paths), result["receipt"]["toAccount"]) }
         return [
             "verification": verification, "result": result,
@@ -507,12 +498,11 @@ public func sweep(_ paths: Value = .undefined, _ options: Value = .undefined) th
             "error": result["ok"] === false ? or(failedText, "Pending cloud work needs attention") : .null, "ok": Value(result["ok"] !== false),
         ]
     } catch {
-        let error = jsErrorValue(error)
+        let error = errorObject(error)
         return ["verification": verification, "pending": true, "ok": false, "code": error["code"], "error": error["message"]]
     }
 }
 
-// L4919
 @discardableResult
 public func undo(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
@@ -529,7 +519,6 @@ public func undo(_ paths: Value = .undefined, _ options: Value = .undefined) thr
     ]))
 }
 
-// L4931
 func undoFiles(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
     if options["receiptFile"].truthy, try latestReceipt(paths)["file"] !== options["receiptFile"] { return ["ok": false, "reason": "The operation receipt changed"] }
@@ -583,7 +572,6 @@ func undoFiles(_ paths: Value = .undefined, _ options: Value = .undefined) throw
     return try finishUndo(receipt, file, paths, Value.spread(options, ["inspect": inspect]))
 }
 
-// L4979
 public func describe(_ list: Value = .undefined) throws -> Value {
     let emails: Value = .newSet(list.elements.map { $0["email"] ?? Value(short($0["account"])) })
     if emails.length == 1 {
@@ -592,7 +580,6 @@ public func describe(_ list: Value = .undefined) throws -> Value {
     return Value(list.elements.map { $0["label"].description }.joined(separator: ", "))
 }
 
-// L4984
 public func find(_ all: Value = .undefined, _ sel: Value = .undefined) throws -> Value {
     func hay(_ a: Value) -> String { "\(a["email"] ?? "") \(a["account"]) \(a["orgName"] ?? "") \(a["org"])".lowercased() }
     let terms = re(#"\s+"#).split(sel.description.lowercased())
@@ -601,16 +588,15 @@ public func find(_ all: Value = .undefined, _ sel: Value = .undefined) throws ->
         return terms.allSatisfy { $0.isEmpty || text.contains($0) }
     }
     if hits.count == 1 { return hits[0] }
-    throw JSError(!hits.isEmpty ? "\"\(sel)\" matches \(hits.map { $0["label"].description }.joined(separator: ", "))" : "\"\(sel)\" matches no account")
+    throw EngineError(!hits.isEmpty ? "\"\(sel)\" matches \(hits.map { $0["label"].description }.joined(separator: ", "))" : "\"\(sel)\" matches no account")
 }
 
-// L4991
 public func step(_ state: Value = .undefined, _ key: Value = .undefined) throws -> Value {
     let cursor = state["cursor"], chosen = state["chosen"], size = state["size"], multi = state["multi"]
-    if key === "up" { return Value.spread(state, ["cursor": Value((jsNumber(cursor) + jsNumber(size) - 1).truncatingRemainder(dividingBy: jsNumber(size)))]) }
-    if key === "down" { return Value.spread(state, ["cursor": Value((jsNumber(cursor) + 1).truncatingRemainder(dividingBy: jsNumber(size)))]) }
+    if key === "up" { return Value.spread(state, ["cursor": Value((toNumber(cursor) + toNumber(size) - 1).truncatingRemainder(dividingBy: toNumber(size)))]) }
+    if key === "down" { return Value.spread(state, ["cursor": Value((toNumber(cursor) + 1).truncatingRemainder(dividingBy: toNumber(size)))]) }
     if key === "space" && multi.truthy {
-        let next = JSSet(chosen.elements)
+        let next = ValueSet(chosen.elements)
         if next.has(cursor) { next.delete(cursor) } else { next.add(cursor) }
         return Value.spread(state, ["chosen": .set(next)])
     }
@@ -679,10 +665,9 @@ fileprivate func decodeKeys(_ bytes: [UInt8]) -> [PickKey] {
     return keys
 }
 
-// L5004
 public func pick(_ title: Value = .undefined, _ rows: Value = .undefined, _ multi: Value = .undefined) throws -> Value {
     let rowList = rows.elements
-    if rowList.isEmpty { throw JSError("no accounts to choose from") }
+    if rowList.isEmpty { throw EngineError("no accounts to choose from") }
     let hint = multi.truthy ? "↑↓ move · space select · enter next" : "↑↓ move · enter confirm"
     let width = rowList.map { $0["label"].length }.max() ?? 0
     var state: Value = ["cursor": 0, "chosen": .newSet(), "size": Value(rowList.count), "multi": multi]
@@ -718,22 +703,21 @@ public func pick(_ title: Value = .undefined, _ rows: Value = .undefined, _ mult
     reading: while true {
         let n = Darwin.read(0, &buffer, buffer.count)
         if n < 0 && errno == EINTR { continue }
-        // Input closed: Node would wait forever; treat it as an abort.
-        if n <= 0 { throw JSError("aborted", code: 130) }
+        // Input closed: treat it as an abort rather than waiting forever.
+        if n <= 0 { throw EngineError("aborted", code: 130) }
         for key in decodeKeys(Array(buffer[0..<n])) {
             if (key.ctrl && key.name == "c") || key.name == "escape" || key.name == "q" {
-                throw JSError("aborted", code: 130)
+                throw EngineError("aborted", code: 130)
             }
             state = try step(state, key.name.map { Value($0) } ?? .undefined)
             if state["done"].truthy { break reading }
             process.stdout("\(erase)\(lines().joined(separator: "\n"))\n")
         }
     }
-    let indices = state["chosen"].elements.map { jsNumber($0) }.sorted()
+    let indices = state["chosen"].elements.map { toNumber($0) }.sorted()
     return Value(indices.map { rowList[Int($0)] })
 }
 
-// L5046
 public func reporter(_ json: Value = .undefined) throws -> Value {
     var lastLive = 0.0
     return Value { args in
@@ -744,7 +728,7 @@ public func reporter(_ json: Value = .undefined) throws -> Value {
         let edge = stage === "sessions" || extra["completed"] === 0 || extra["completed"] === extra["total"]
         if extra["live"].truthy && !edge && now - lastLive < 100 { return .undefined }
         if extra["live"].truthy { lastLive = now }
-        let fields = JSObject()
+        let fields = ValueObject()
         fields["stage"] = stage
         fields["text"] = text
         if extra["live"].truthy { fields["live"] = true }
@@ -753,7 +737,7 @@ public func reporter(_ json: Value = .undefined) throws -> Value {
         if extra["sourceId"].isString { fields["sourceId"] = extra["sourceId"] }
         if extra["sourceLabel"].isString { fields["sourceLabel"] = extra["sourceLabel"] }
         let total = extra["sessionTotal"], remaining = extra["remainingCount"]
-        if isSafeInteger(total) && jsNumber(total) >= 0 && isSafeInteger(remaining) && jsNumber(remaining) >= 0 && jsNumber(remaining) <= jsNumber(total) {
+        if isSafeInteger(total) && toNumber(total) >= 0 && isSafeInteger(remaining) && toNumber(remaining) >= 0 && toNumber(remaining) <= toNumber(total) {
             fields["sessionTotal"] = total
             fields["remainingCount"] = remaining
         }
@@ -771,7 +755,7 @@ public func reporter(_ json: Value = .undefined) throws -> Value {
     }
 }
 
-// L5073-5165 xml / plist / compileMenubar / menubar: the Node-era installer (xml, plist, compileMenubar, launchd agent) is replaced by the native app.
+// The menu bar app ships as Claude Handoff.app, so `menubar` only refuses.
 public func menubar(_ paths: Value = .undefined, _ remove: Value = .undefined, _ snapshot: Value = .undefined) throws -> Value {
-    throw JSError("the menubar app ships as Claude Handoff.app; install it from the release DMG")
+    throw EngineError("the menubar app ships as Claude Handoff.app; install it from the release DMG")
 }

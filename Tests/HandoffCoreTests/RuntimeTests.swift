@@ -1,12 +1,13 @@
 import XCTest
 @testable import HandoffCore
 
-// Expected strings come from Node 22 so the runtime keeps JSON.stringify / node:path semantics.
+// Expected strings were produced by Node 22's JSON.stringify and path module: the JSON and paths the engine
+// writes must match what Claude Desktop and Claude Code produce, byte for byte.
 final class RuntimeTests: XCTestCase {
     func testNumberToString() {
         let cases: [Double] = [0, -0.0, 1, -1, 0.1, 1e21, 1e-7, 123456789012345680000, 1.5e-7, 5e-324, 1.7976931348623157e308, 0.000001, 1234.5678, 9007199254740992, 100, 1e20, -1e-6]
         let node = ["0", "0", "1", "-1", "0.1", "1e+21", "1e-7", "123456789012345680000", "1.5e-7", "5e-324", "1.7976931348623157e+308", "0.000001", "1234.5678", "9007199254740992", "100", "100000000000000000000", "-0.000001"]
-        XCTAssertEqual(cases.map(jsNumberString), node)
+        XCTAssertEqual(cases.map(numberString), node)
     }
 
     func testObjectKeyOrderAndOmission() throws {
@@ -50,7 +51,7 @@ final class RuntimeTests: XCTestCase {
     func testSpreadAndErrors() {
         let base: Value = ["a": 1, "b": 2]
         XCTAssertEqual(JSON.text(.spread(base, ["a": 3, "c": 4])), #"{"a":3,"b":2,"c":4}"#)
-        let e = jsThrow("boom", code: "X", [("file", "f")])
+        let e = makeError("boom", code: "X", [("file", "f")])
         XCTAssertEqual(JSON.text(e.value), #"{"code":"X","file":"f"}"#)
         XCTAssertEqual(e.value.description, "Error: boom")
         XCTAssertEqual(e.value.message, "boom")

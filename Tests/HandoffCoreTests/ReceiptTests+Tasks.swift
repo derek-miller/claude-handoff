@@ -33,7 +33,7 @@ extension Engine.Receipts {
                 eq(kept.cancelled, 1)
                 eq(kept.receipt.cloudChecks[0].status, "cancelled")
                 eq(kept.receipt.sessions[0].targetId, Value(SOURCE))
-                ok(try undo(h.paths).changed.some { JSRegExp.cached("desktop record").test($0.str) })
+                ok(try undo(h.paths).changed.some { TextPattern.cached("desktop record").test($0.str) })
                 deq(try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str]), before)
             } else {
                 ok(kept.refused.length > 0, scenario)
@@ -107,7 +107,7 @@ extension Engine.Receipts {
             "list": fn { _ in [remoteSession(["id": "cse_rollback", "title": Value("Session \(SOURCE.suffix(3))")])] },
             "eventRows": fn { _ in remoteRows(entries) },
             "session": fn { _ in reads += 1; return remoteState("active", ["last_event_at": reads >= 6 ? "changed" : "stable"]) },
-            "archive": fn { () in throw JSError("archive should not run") },
+            "archive": fn { () in throw EngineError("archive should not run") },
         ])
         let all = try accounts(h.paths)
         let from: Value = [
@@ -167,7 +167,7 @@ extension Engine.Receipts {
             "eventRows": fn { _ in remoteRows(entries) },
             "session": fn { _ in remoteState(status, ["id": "cse_unapplied"]) },
             "archive": fn { () in
-                if interrupt { throw JSError("connection failed before archive") }
+                if interrupt { throw EngineError("connection failed before archive") }
                 status = "archived"
             },
             "unarchive": fn { () in status = "active" },
@@ -343,7 +343,7 @@ extension Engine.Receipts {
                     eq(interrupted.finalizing, true)
                     eq(interrupted.taskTransfers.length, 1)
                     eq(interrupted.taskTransfers[0].targetExisted, false)
-                    throwsError(where: ["code": "ENOENT"]) { try NodeFS.nativeReadFile(h.targetFile) }
+                    throwsError(where: ["code": "ENOENT"]) { try FileSystem.nativeReadFile(h.targetFile) }
                     deq(try readJSON(h.sourceFile), h.sourceRegistry)
                 }
                 let result = try finishWorkflow(h.paths, ["processes": []])
@@ -462,12 +462,12 @@ extension Engine.Receipts {
                 let name = path.basename(b), sid = String(name.dropFirst(6).dropLast(5)), count = (attempts[sid] ?? 0) + 1
                 if attempts[sid] == nil { order.append(sid) }
                 attempts[sid] = count
-                if sid == failedIds[0] && (!transient || count == 1) || !transient && sid == other { throw JSError("Synthetic publication failure \(sid)") }
+                if sid == failedIds[0] && (!transient || count == 1) || !transient && sid == other { throw EngineError("Synthetic publication failure \(sid)") }
             }
             try link(a, b)
         }
         let result = try run(["io": mock.io, "approve": planned.plan.token, "report": fn { args in reports.append(.spread(["stage": Engine.Receipts.arg(args, 0)], Engine.Receipts.arg(args, 2))); return .undefined }])
-        fs = NodeFS()
+        fs = FileSystem()
         eq(result.recoveryRequired, .undefined, "\(label) \(result.reason)")
         eq(result.ok, Value(transient), "\(label) \(JSON.text(result.summary))")
         eq(result.complete, Value(transient), label)
@@ -569,12 +569,12 @@ extension Engine.Receipts {
         fs.rename = { a, b in
             if let failed, a == h.recordFile("P", failed) {
                 refusals += 1
-                if refusals == 1 || !transient { throw JSError("Synthetic retirement refusal \(failed)") }
+                if refusals == 1 || !transient { throw EngineError("Synthetic retirement refusal \(failed)") }
             }
             try rename(a, b)
         }
         let result = try run(["io": mock.io, "approve": planned.plan.token, "report": fn { args in reports.append(.spread(["stage": Engine.Receipts.arg(args, 0)], Engine.Receipts.arg(args, 2))); return .undefined }])
-        fs = NodeFS()
+        fs = FileSystem()
         eq(result.recoveryRequired, .undefined, "\(label) \(result.reason)")
         eq(result.ok, Value(transient), "\(label) \(JSON.text(result.summary))")
         eq(result.complete, Value(transient), label)
@@ -619,12 +619,12 @@ extension Engine.Receipts {
         var attempts = 0
         let rename = fs.rename
         fs.rename = { a, b in
-            if a == source { attempts += 1; try rename(a, b); throw JSError("Synthetic retirement failure") }
-            if b == source { throw JSError("Synthetic restore failure") }
+            if a == source { attempts += 1; try rename(a, b); throw EngineError("Synthetic retirement failure") }
+            if b == source { throw EngineError("Synthetic restore failure") }
             try rename(a, b)
         }
         let result = try executeMove([from], to, h.paths, ["io": mock.io, "approve": planned.plan.token])
-        fs = NodeFS()
+        fs = FileSystem()
         eq(attempts, 1)
         eq(result.code, "LOCAL_RECOVERY_BLOCKED")
         match(result.reason, "restore failure")

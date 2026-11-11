@@ -93,7 +93,7 @@ extension Engine {
                 eq(first.receipt.writer, Value(VERSION))
                 throwsError("interrupted append") {
                     try finishHeld(h.paths, ["processes": [], "report": fn { args in
-                        if Engine.Receipts.arg(args, 0) == "retire" && Engine.Receipts.arg(args, 1) == "checking" { throw JSError("interrupted append") }
+                        if Engine.Receipts.arg(args, 0) == "retire" && Engine.Receipts.arg(args, 1) == "checking" { throw EngineError("interrupted append") }
                         return .undefined
                     }])
                 }
@@ -383,18 +383,18 @@ extension Engine {
             var parked = 0
             let original = fs.rename
             fs.rename = { a, b in
-                if path.dirname(a) == h.dir("T") && b.contains("/failed/") { parked += 1; if parked == 2 { throw JSError("simulated crash between unwinds") } }
+                if path.dirname(a) == h.dir("T") && b.contains("/failed/") { parked += 1; if parked == 2 { throw EngineError("simulated crash between unwinds") } }
                 try original(a, b)
             }
             throwsError("simulated crash between unwinds") { try executeMove([from], to, h.paths, ["processes": []]) }
-            fs = NodeFS()
+            fs = FileSystem()
             eq(parked, 2)
             let recovery = try finishWorkflow(h.paths, ["processes": []])
             eq(recovery.recoveryRequired, true)
             let receipt = try readReceipt(Value(receiptFiles(h)[0]))
             eq(receipt.finalizing, false)
             deq(receipt.sessions, [])
-            ok(!receipt.failed.some { JSRegExp.cached("missing|changed since").test($0.error.str) }, JSON.text(receipt.failed))
+            ok(!receipt.failed.some { TextPattern.cached("missing|changed since").test($0.error.str) }, JSON.text(receipt.failed))
             let sources = Value.strings([SOURCE, id(720)].map { "local_\($0).json" }.sorted(by: utf16Less))
             deq(Receipts.localRecords(h.dir("P")), sources)
             deq(Receipts.localRecords(h.dir("T")), [])
@@ -408,14 +408,14 @@ extension Engine {
             let (h, from, to) = try Receipts.unwindFixture()
             let placed = Receipts.placedRecords(h.dir("T")) { count in count == 2 ? ["title": "Renamed in the destination"] : ["lastFocusedAt": 1000] }
             let result = try executeMove([from], to, h.paths, ["processes": []])
-            fs = NodeFS()
+            fs = FileSystem()
             let first = placed.value[0], second = placed.value[1]
             ne(result.code, "LOCAL_RECOVERY_BLOCKED")
             eq(result.recoveryRequired, .undefined)
             deq(Receipts.localRecords(h.dir("T")), [Value(second)])
             deq(Receipts.localRecords(h.dir("P")), Value.strings([first, second].sorted(by: utf16Less)))
             deq(result.receipt.sessions.map { Value("local_\($0.id).json") }, [Value(second)])
-            ok(result.receipt.failed.some { "local_\($0.id).json" == second && JSRegExp.cached("changed after placement").test($0.error.str) }, JSON.text(result.receipt.failed))
+            ok(result.receipt.failed.some { "local_\($0.id).json" == second && TextPattern.cached("changed after placement").test($0.error.str) }, JSON.text(result.receipt.failed))
             ok(result.summary.notMoved.some { "local_\($0.id).json" == first })
             eq(Set(result.receipt.failed.elements.map { JSON.text($0) }).count, result.receipt.failed.length)
         }
@@ -448,8 +448,8 @@ extension Engine {
                 }
                 try write(handle, data)
             }
-            do { _ = try undo(h.paths, ["processes": []]) } catch { match(jsErrorValue(error).message, "bridge") }
-            fs = NodeFS()
+            do { _ = try undo(h.paths, ["processes": []]) } catch { match(errorObject(error).message, "bridge") }
+            fs = FileSystem()
             let after = try readData(transcript)
             #expect(injected)
             ok(lines(String(decoding: after, as: UTF8.self)).some { $0.uuid.str == id(3) })
@@ -514,7 +514,7 @@ extension Engine {
         func bridgeAppendCheckpoints(checkpoint: String) throws {
             let h = try bridgeFixture(), transcript = h.transcriptPath, inv = try inventory([h.from], h.to, h.paths, NOOP, ["processes": []])
             var injected = false
-            let synthetic = { jsThrow("Synthetic crash checkpoint", code: "JOURNAL_WRITE") }
+            let synthetic = { makeError("Synthetic crash checkpoint", code: "JOURNAL_WRITE") }
             let write = fs.handleWrite, sync = fs.handleSync
             let watched = { (handle: HandoffCore.FileHandle) in handle.path.hasSuffix(".journal") || handle.path == transcript }
             fs.handleWrite = { handle, data in
@@ -542,7 +542,7 @@ extension Engine {
                 }
             }
             throwsError("Synthetic crash checkpoint") { try move(inv, h.to, h.paths) }
-            fs = NodeFS()
+            fs = FileSystem()
             #expect(injected)
             let receipt = try readReceipt(Value(receiptFiles(h)[0]))
             let plan = receipt.pending.bridgeAppend.nullish ? receipt.sessions[0].bridgeAppend : receipt.pending.bridgeAppend
@@ -665,12 +665,12 @@ extension Engine {
                 fs.rename = { a, b in
                     if b == file, try readJSON(a).sessions[0].bridgeUndo.truthy {
                         try rename(a, b)
-                        throw JSError("Synthetic receipt corruption checkpoint")
+                        throw EngineError("Synthetic receipt corruption checkpoint")
                     }
                     try rename(a, b)
                 }
                 throwsError("Synthetic receipt corruption checkpoint") { try undo(h.paths, ["processes": []]) }
-                fs = NodeFS()
+                fs = FileSystem()
             }
             let receipt = try readReceipt(moved.file), row = receipt.sessions[0]
             Receipts.corrupt(name, row)
@@ -705,21 +705,21 @@ extension Engine {
             fs.handleWrite = { handle, data in
                 guard handle.path == transcript else { return try write(handle, data) }
                 try write(handle, checkpoint.hasPrefix("partial") && !injected ? data.prefix(25) : data)
-                if checkpoint.hasPrefix("partial") && !injected { injected = true; throw JSError("Synthetic Undo interruption") }
+                if checkpoint.hasPrefix("partial") && !injected { injected = true; throw EngineError("Synthetic Undo interruption") }
             }
             fs.handleSync = { handle in
                 try sync(handle)
-                if handle.path == transcript && checkpoint == "synced" && !injected { injected = true; throw JSError("Synthetic Undo interruption") }
+                if handle.path == transcript && checkpoint == "synced" && !injected { injected = true; throw EngineError("Synthetic Undo interruption") }
             }
             fs.rename = { a, b in
                 if checkpoint == "intent" && b == file && !injected, try readJSON(a).sessions[0].bridgeUndo.truthy {
-                    try rename(a, b); injected = true; throw JSError("Synthetic Undo interruption")
+                    try rename(a, b); injected = true; throw EngineError("Synthetic Undo interruption")
                 }
-                if checkpoint == "restored" && a == file && !injected { injected = true; throw JSError("Synthetic Undo interruption") }
+                if checkpoint == "restored" && a == file && !injected { injected = true; throw EngineError("Synthetic Undo interruption") }
                 try rename(a, b)
             }
             throwsError("Synthetic Undo interruption") { try undo(h.paths, ["processes": []]) }
-            fs = NodeFS()
+            fs = FileSystem()
             #expect(injected)
             if checkpoint == "partial twice" {
                 let partial = try readData(transcript)
@@ -732,10 +732,10 @@ extension Engine {
                     eq(plan.continuation["length"], Value(partial.count))
                     repeated = true
                     try write(handle, bytes.prefix(7))
-                    throw JSError("Synthetic continuation interruption")
+                    throw EngineError("Synthetic continuation interruption")
                 }
                 throwsError("Synthetic continuation interruption") { try undo(h.paths, ["processes": []]) }
-                fs = NodeFS()
+                fs = FileSystem()
                 #expect(repeated)
                 eq(try readData(transcript).prefix(partial.count), partial)
             }

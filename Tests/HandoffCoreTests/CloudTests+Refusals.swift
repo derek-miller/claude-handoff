@@ -35,7 +35,7 @@ extension Engine.Cloud {
             deq(refreshed.summary, result.summary)
             let finished = try finishPending(h.paths, ["cloud": .spread(f.cloud, ["list": fn { _ in
                 Issue.record("blocked mirror must wait for Move")
-                throw JSError("blocked mirror must wait for Move")
+                throw EngineError("blocked mirror must wait for Move")
             }])])
             eq(finished.nothing, true)
             eq(finished.receipt.failed.filter { $0.cloudAccount.truthy }.length, mixed ? 2 : 1)

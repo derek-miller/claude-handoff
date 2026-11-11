@@ -23,19 +23,19 @@ enum Sandbox {
     nonisolated(unsafe) static var roots: [String] = []
 
     static func begin() {
-        fs = NodeFS()
+        fs = FileSystem()
         process = Host()
         let home = temporaryDirectory("ct-sandbox-")
         process.homedir = { home }
         childProcess = fixtureChildProcess()
-        cloudFetch = { request in throw JSError("fixture fetch requires a mock: \(request.url)") }
+        cloudFetch = { request in throw EngineError("fixture fetch requires a mock: \(request.url)") }
     }
 
     static func end() {
-        fs = NodeFS()
+        fs = FileSystem()
         process = Host()
         childProcess = ChildProcess()
-        cloudFetch = { request in throw JSError("fixture fetch requires a mock: \(request.url)") }
+        cloudFetch = { request in throw EngineError("fixture fetch requires a mock: \(request.url)") }
         for root in roots { try? FileManager.default.removeItem(atPath: root) }
         roots = []
     }
@@ -45,12 +45,12 @@ enum Sandbox {
         let table = ChildProcess()
         table.spawnSync = { file, args, options in
             if file == "/usr/bin/security" { return SpawnResult(status: 1, stderr: "fixture login unavailable") }
-            if NATIVE_COMMANDS.contains(file) { return SpawnResult(status: nil, error: JSError("fixture native command requires a mock")) }
+            if NATIVE_COMMANDS.contains(file) { return SpawnResult(status: nil, error: EngineError("fixture native command requires a mock")) }
             return ChildProcess.nativeSpawnSync(file, args, options)
         }
         let command = table.command
         table.command = { file, args, timeout in
-            if NATIVE_COMMANDS.contains(file) { return SpawnResult(status: nil, error: JSError("fixture native command requires a mock")) }
+            if NATIVE_COMMANDS.contains(file) { return SpawnResult(status: nil, error: EngineError("fixture native command requires a mock")) }
             return command(file, args, timeout)
         }
         return table

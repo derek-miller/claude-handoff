@@ -1,6 +1,7 @@
 import Foundation
 
-// JSON.parse / JSON.stringify with JavaScript semantics (key order, number formatting, omission rules).
+// JSON parsing and serialization byte-compatible with the files Claude Desktop and Claude Code read and write:
+// insertion key order, shortest round-trip numbers, and undefined and functions omitted.
 public enum JSON {
     public static func parse(_ text: String) throws -> Value {
         var text = text
@@ -11,11 +12,11 @@ public enum JSON {
     }
 
     public static func parse(_ data: Data) throws -> Value {
-        // readFile(file, 'utf8') then JSON.parse: invalid UTF-8 becomes U+FFFD first.
+        // Invalid UTF-8 is replaced with U+FFFD before parsing.
         try parse(String(decoding: data, as: UTF8.self))
     }
 
-    // JSON.stringify(value, null, space). Returns nil where JS returns undefined.
+    // Returns nil for a value with no JSON form (undefined, a function).
     // `sorted` emits JSON.stringify(sortKeys(value)) without building the sorted copy.
     public static func stringify(_ value: Value, space: Int = 0, sorted: Bool = false) throws -> String? {
         var out: [UInt8] = []
@@ -44,11 +45,11 @@ public enum JSON {
     }
 
     @discardableResult
-    // sortKeys turns Sets, Maps and Buffers into plain objects of their own keys (none for Set/Map; indices for Buffer).
+    // Sorting keys turns sets and maps into empty objects and byte buffers into objects keyed by index.
     private static func sortedView(_ v: Value) -> Value {
         switch v {
-        case .set, .map: return .object(JSObject(v.ownKeys.map { ($0, v[$0]) }))
-        case .bytes(let b): return .object(JSObject(b.data.enumerated().map { (Swift.String($0.offset), .number(Double($0.element))) }))
+        case .set, .map: return .object(ValueObject(v.ownKeys.map { ($0, v[$0]) }))
+        case .bytes(let b): return .object(ValueObject(b.data.enumerated().map { (Swift.String($0.offset), .number(Double($0.element))) }))
         default: return v
         }
     }
@@ -59,8 +60,8 @@ public enum JSON {
         case .undefined, .function: return false
         case .null: out.append(contentsOf: Array("null".utf8))
         case .bool(let b): out.append(contentsOf: Array((b ? "true" : "false").utf8))
-        case .number(let d): out.append(contentsOf: Array((d.isFinite ? jsNumberString(d) : "null").utf8))
-        case .bigint: throw JSError.type("Do not know how to serialize a BigInt")
+        case .number(let d): out.append(contentsOf: Array((d.isFinite ? numberString(d) : "null").utf8))
+        case .bigint: throw EngineError.type("Do not know how to serialize a BigInt")
         case .string(let s): quote(s, into: &out)
         case .set, .map, .bytes: out.append(contentsOf: Array("{}".utf8))
         case .array(let a):
@@ -78,8 +79,8 @@ public enum JSON {
             let inner = current + indent
             out.append(0x7B)
             var first = true
-            // Object.fromEntries(sorted) still lists array-index keys first, in numeric order.
-            for k in sorted ? o.keys.filter { JSObject.arrayIndex($0) != nil } + o.keys.filter { JSObject.arrayIndex($0) == nil }.sorted(by: utf16Less) : o.keys {
+            // Integer-like keys always come first, in numeric order, even when the rest are sorted.
+            for k in sorted ? o.keys.filter { ValueObject.arrayIndex($0) != nil } + o.keys.filter { ValueObject.arrayIndex($0) == nil }.sorted(by: utf16Less) : o.keys {
                 let item = sorted ? sortedView(o[k]) : toJSON(o[k])
                 guard serializable(item) else { continue }
                 if !first { out.append(0x2C) }
@@ -135,16 +136,16 @@ public enum JSON {
         var p = 0
         init(_ b: UnsafeBufferPointer<UInt8>) { self.b = b }
 
-        func fail(_ what: String? = nil) -> JSError {
-            if p >= b.count { return JSError("Unexpected end of JSON input", name: "SyntaxError") }
+        func fail(_ what: String? = nil) -> EngineError {
+            if p >= b.count { return EngineError("Unexpected end of JSON input", name: "SyntaxError") }
             let ch = Swift.String(decoding: [b[p]], as: UTF8.self)
-            return JSError(what ?? "Unexpected token '\(ch)' in JSON at position \(p)", name: "SyntaxError")
+            return EngineError(what ?? "Unexpected token '\(ch)' in JSON at position \(p)", name: "SyntaxError")
         }
 
         mutating func ws() { while p < b.count, b[p] == 0x20 || b[p] == 0x0A || b[p] == 0x0D || b[p] == 0x09 { p += 1 } }
 
         mutating func document() throws -> Value {
-            // A UTF-8 BOM is not JSON whitespace in JS either, so it fails like JSON.parse does.
+            // A UTF-8 BOM is not JSON whitespace, so a document starting with one fails to parse.
             ws()
             let v = try value()
             ws()
@@ -173,7 +174,7 @@ public enum JSON {
 
         mutating func object() throws -> Value {
             p += 1
-            let o = JSObject()
+            let o = ValueObject()
             ws()
             if p < b.count, b[p] == 0x7D { p += 1; return .object(o) }
             while true {
@@ -197,14 +198,14 @@ public enum JSON {
             p += 1
             var items: [Value] = []
             ws()
-            if p < b.count, b[p] == 0x5D { p += 1; return .array(JSArray(items)) }
+            if p < b.count, b[p] == 0x5D { p += 1; return .array(ValueArray(items)) }
             while true {
                 ws()
                 items.append(try value())
                 ws()
                 guard p < b.count else { throw fail() }
                 if b[p] == 0x2C { p += 1; continue }
-                if b[p] == 0x5D { p += 1; return .array(JSArray(items)) }
+                if b[p] == 0x5D { p += 1; return .array(ValueArray(items)) }
                 throw fail()
             }
         }

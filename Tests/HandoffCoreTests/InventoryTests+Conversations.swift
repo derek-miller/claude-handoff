@@ -193,7 +193,7 @@ extension Engine.Inventory {
             try writeText(external, "never read this synthetic target")
             let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
             if warm { _ = try inventory([from], to, h.paths, NOOP, ["processes": [], "writeCache": true]) }
-            let physicalFile = try NodeFS.nativeRealpath(file), physicalExternal = try NodeFS.nativeRealpath(external)
+            let physicalFile = try FileSystem.nativeRealpath(file), physicalExternal = try FileSystem.nativeRealpath(external)
             let originalOpen = fs.open, originalLstat = fs.lstat
             var replaced = false
             let replace = { replaced = true; try unlink(file); try symlink(external, file) }
@@ -235,7 +235,7 @@ extension Engine.Inventory {
             }
             try symlink(external, dir)
             let link = dir, inode = try lstat(link).ino
-            let physicalDir = path.join(try NodeFS.nativeRealpath(h.project), SOURCE), physicalExternal = path.join(try NodeFS.nativeRealpath(h.root), "unrelated")
+            let physicalDir = path.join(try FileSystem.nativeRealpath(h.project), SOURCE), physicalExternal = path.join(try FileSystem.nativeRealpath(h.root), "unrelated")
             let before = try fixtureSnapshot(h, [h.dir("P"), h.dir("Z")])
             let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
             let check = { (name: String, key: String) in
@@ -258,7 +258,7 @@ extension Engine.Inventory {
             eq(inv.rejected.length, 1, scenario)
             eq(inv.rejected[0].error, Value("unsupported entry \(dir)"), scenario)
             deq(try fixtureSnapshot(h, [h.dir("P"), h.dir("Z")]), before, scenario)
-            eq(String(decoding: try NodeFS.nativeReadlink(link), as: UTF8.self), external)
+            eq(String(decoding: try FileSystem.nativeReadlink(link), as: UTF8.self), external)
             eq(try lstat(link).ino, inode)
             ok(!exists(h.paths.state.str))
         }
