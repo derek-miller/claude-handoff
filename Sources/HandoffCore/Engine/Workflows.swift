@@ -266,7 +266,7 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
         }
         if !chosen.truthy && options["undo"].truthy { return try undoFiles(paths, Value.spread(options, ["inspect": inspect])) }
         if !chosen.truthy {
-            return try inspect.call().elements.filter { desktopExecutable($0["executable"]).truthy }.count > 1
+            return try processRows(inspect.call()).filter(\.isDesktop).count > 1
                 ? ["ok": false, "reason": "More than one Claude Desktop instance is running. Close the extra instance before restarting."]
                 : ["nothing": true, "ok": true]
         }

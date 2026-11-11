@@ -300,13 +300,12 @@ public func pendingPresentation(_ receipt: Value = .undefined, _ source: Value =
     }
     if mode === "local" {
         let held = try (receipt.held ?? []).elements.filter { row in try row.sources.elements.contains { member in try sameAccount(member, source).truthy } }
-        let owned = try table.elements.filter { worker in
-            try worker.worker.truthy && worker.pid !== worker.desktopPid &&
-                held.contains { row in try ownsWorker(Value.newSet(worker.ids.elements), row.id, row.recordId).truthy }
+        let owned = try processRows(table).filter { worker in
+            try worker.isSeparateWorker && held.contains { row in try ownsWorker(Value.newSet(worker.ids), row.id, row.recordId).truthy }
         }
-        let external = owned.contains { worker in !worker.desktopPid.truthy }
+        let external = owned.contains { !$0.hasDesktop }
         let automatic = held.count > 0 && held.allSatisfy { row in row.release === "worker" } && !scheduler.truthy && !external
-        let open = try held.filter { row in try owned.contains { worker in try ownsWorker(Value.newSet(worker.ids.elements), row.id, row.recordId).truthy } }
+        let open = try held.filter { row in try owned.contains { worker in try ownsWorker(Value.newSet(worker.ids), row.id, row.recordId).truthy } }
         let seconds = ValueSet(open.map { row in timeouts.get(lowerOpt(row.recordId)) })
         let openIds = ValueSet(open.map { $0.id })
         let pendingState: Value = external ? "external" : automatic && owned.count > 0 ? "open" : "held"
@@ -480,9 +479,36 @@ public func processTable(_ app: Value = .undefined) throws -> Value {
     } catch {}
     return try parseProcesses(Value(processes.stdout), Value(commands.stdout), app, registrations.value)
 }
+// A process-table row: a typed view over the row object. Callers and tests supply partial rows, and restart
+// fingerprints and plans store the fields exactly as present, so the object stays the storage.
+struct ProcessRow {
+    let raw: Value
+    init(_ raw: Value) { self.raw = raw }
+    var pid: Double? { raw["pid"].asNumber }
+    var ppid: Double? { raw["ppid"].asNumber }
+    var executable: String? { raw["executable"].asString }
+    var isDesktop: Bool { executable?.hasSuffix("/Claude.app/Contents/MacOS/Claude") ?? false }
+    var isWorker: Bool { raw["worker"].truthy }
+    var ids: [Value] { raw["ids"].elements }
+    var desktopPid: Double? { raw["desktopPid"].asNumber }
+    var hasDesktop: Bool { raw["desktopPid"].truthy }
+    // A worker that is a process of its own, not Desktop itself.
+    var isSeparateWorker: Bool { isWorker && pid != desktopPid }
+    var identity: Value { Value("\(raw["pid"])/\(raw["started"])") }
+}
+
+func processRows(_ table: Value) -> [ProcessRow] { table.elements.map(ProcessRow.init) }
+
+// Workers that share a Desktop-owned root process, with the session ids any of them serve.
+struct WorkerGroup {
+    let root: ProcessRow
+    var ids: [Value]
+    var workers: [ProcessRow]
+}
+
 func workers(_ rows: Value = .undefined) throws -> Value {
     let rows = rows.isUndefined ? try processTable() : rows
-    let set = Value.newSet(rows.elements.filter { $0.worker.truthy && $0.pid !== $0.desktopPid }.flatMap { $0.ids.elements })
+    let set = Value.newSet(processRows(rows).filter(\.isSeparateWorker).flatMap(\.ids))
     set["rows"] = rows
     return set
 }
@@ -492,56 +518,61 @@ func ownsWorker(_ live: Value = .undefined, _ id: Value = .undefined, _ recordId
 }
 func processIdentity(_ row: Value = .undefined) throws -> Value { Value("\(row.pid)/\(row.started)") }
 func restartFingerprint(_ desktop: Value = .undefined, _ rows: Value = .undefined) throws -> Value {
-    let workers: [Value] = rows.elements.filter { $0.worker.truthy && $0.desktopPid === desktop.pid && $0.pid !== desktop.pid }
-        .map { ["pid": $0.pid, "started": $0.started, "ids": $0.ids] }
+    let desktopPid = ProcessRow(desktop).pid
+    let workers: [Value] = processRows(rows).filter { $0.isWorker && $0.desktopPid == desktopPid && $0.pid != desktopPid }
+        .map { ["pid": $0.raw["pid"], "started": $0.raw["started"], "ids": $0.raw["ids"]] }
     let sorted = stableSorted(workers) { a, b in toNumber(a.pid) - toNumber(b.pid) }
     return Value(sha(stable(["desktop": ["pid": desktop.pid, "started": desktop.started], "workers": sorted.value])))
 }
-func processOwns(_ worker: Value = .undefined, _ row: Value = .undefined) throws -> Value {
+func processOwns(_ ids: [Value], _ row: Value = .undefined) throws -> Value {
     let record = try desktopRecordOf(row)
-    return try ownsWorker(Value.newSet(worker.ids.elements), row.id, record.sessionId)
+    return try ownsWorker(Value.newSet(ids), row.id, record.sessionId)
 }
 
-func workerGroups(_ table: Value = .undefined) throws -> Value {
-    let byPid = ValueMap(table.elements.map { ($0.pid, $0) }), groups = ValueMap()
-    for worker in table.elements.filter({ $0.worker.truthy && $0.desktopPid.truthy && $0.pid !== $0.desktopPid }) {
-        var root = worker, parent = byPid.get(worker.ppid)
-        let seen = ValueSet([worker.pid])
-        while parent.truthy && parent.pid !== worker.desktopPid && !seen.has(parent.pid) {
-            seen.add(parent.pid)
-            if parent.worker.truthy { root = parent }
-            parent = byPid.get(parent.ppid)
+func workerGroups(_ table: Value = .undefined) throws -> [WorkerGroup] {
+    let rows = processRows(table)
+    var byPid: [Double: ProcessRow] = [:]
+    for row in rows { if let pid = row.pid { byPid[pid] = row } }
+    var groups: [WorkerGroup] = [], index: [String: Int] = [:]
+    for worker in rows where worker.isWorker && worker.hasDesktop && worker.pid != worker.desktopPid {
+        var root = worker, parent = worker.ppid.flatMap { byPid[$0] }
+        var seen: Set<Double?> = [worker.pid]
+        while let current = parent, current.pid != worker.desktopPid, !seen.contains(current.pid) {
+            seen.insert(current.pid)
+            if current.isWorker { root = current }
+            parent = current.ppid.flatMap { byPid[$0] }
         }
-        let key = try processIdentity(root)
-        let group = groups.get(key) ?? Value.spread(root, ["ids": [], "workers": []])
-        group.ids = unique(group.ids.elements + worker.ids.elements).value
-        group.workers.push(worker)
-        groups.set(key, group)
+        let key = root.identity.description
+        if index[key] == nil { index[key] = groups.count; groups.append(WorkerGroup(root: root, ids: [], workers: [])) }
+        let i = index[key]!
+        groups[i].ids = unique(groups[i].ids + worker.ids)
+        groups[i].workers.append(worker)
     }
-    return groups.values.value
+    return groups
 }
 
 func canRestartWaiting(_ receipt: Value = .undefined, _ table: Value = .undefined) throws -> Value {
     Value(try waitingSessions(receipt).elements.contains { row in
-        let owns = { (worker: Value) throws -> Bool in try ownsWorker(Value.newSet(worker.ids.elements), row.localId, row.recordId).truthy }
-        return try workerGroups(table).elements.contains(where: owns) && !table.elements.contains { worker in try worker.worker.truthy && !worker.desktopPid.truthy && owns(worker) }
+        let owns = { (ids: [Value]) throws -> Bool in try ownsWorker(Value.newSet(ids), row.localId, row.recordId).truthy }
+        return try workerGroups(table).contains { try owns($0.ids) } && !processRows(table).contains { worker in try worker.isWorker && !worker.hasDesktop && owns(worker.ids) }
     })
 }
 
 public func restartPlan(_ inv: Value = .undefined, _ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value { try restartPlan(inv, DataLayout(paths), table) }
 func restartPlan(_ inv: Value = .undefined, _ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
     let table = table.isUndefined ? try processTable(Value(paths.claudeApp)) : table
-    let apps = table.elements.filter { row in desktopExecutable(row.executable).truthy || row.executable === Value(path.join(paths.claudeApp, "Contents/MacOS/Claude")) }
+    let app = path.join(paths.claudeApp, "Contents/MacOS/Claude")
+    let apps = processRows(table).filter { $0.isDesktop || $0.executable == app }.map(\.raw)
     if apps.count != 1 { return .null }
-    let desktop = apps[0]
+    let desktop = apps[0], desktopPid = ProcessRow(desktop).pid
     let all = try accounts(paths)
-    let owned = try workerGroups(table).elements.filter { $0.desktopPid === desktop.pid }
+    let owned = try workerGroups(table).filter { $0.root.desktopPid == desktopPid }
     func matching(_ row: Value) throws -> [Value] {
-        try table.elements.filter { worker in
-            try worker.worker.truthy && worker.pid !== desktop.pid && (row.members ?? [row]).elements.contains { member in try processOwns(worker, member).truthy }
-        }
+        try processRows(table).filter { worker in
+            try worker.isWorker && worker.pid != desktopPid && (row.members ?? [row]).elements.contains { member in try processOwns(worker.ids, member).truthy }
+        }.map(\.raw)
     }
-    func stoppable(_ rows: [Value]) -> Bool { rows.count > 0 && rows.allSatisfy { $0.desktopPid === desktop.pid } }
+    func stoppable(_ rows: [Value]) -> Bool { rows.count > 0 && rows.allSatisfy { ProcessRow($0).desktopPid == desktopPid } }
     func release(_ row: Value) throws -> Value {
         let worker: Value = try stoppable(matching(row)) ? false : row.worker
         var extra: [(String, Value)] = [("schedulerBusy", false), ("worker", worker)]
@@ -587,7 +618,7 @@ func restartPlan(_ inv: Value = .undefined, _ paths: DataLayout, _ table: Value 
     }
     for (row, source) in candidates {
         let matches = try matching(row)
-        if stoppable(matches) || inv.blocked.elements.contains(where: { item in item.file === source.file && item.schedulerBusy.truthy }) && !matches.contains(where: { $0.desktopPid !== desktop.pid }) {
+        if stoppable(matches) || inv.blocked.elements.contains(where: { item in item.file === source.file && item.schedulerBusy.truthy }) && !matches.contains(where: { ProcessRow($0).desktopPid != desktopPid }) {
             _ = try add(row, source, matches)
         }
     }
@@ -611,30 +642,30 @@ func restartPlan(_ inv: Value = .undefined, _ paths: DataLayout, _ table: Value 
     if inv.truthy && held.length == 0 { return .null }
     let known: [Value] = all.elements.flatMap { account in account.sessions.elements.map { session in Value.spread(session, ["account": account]) } }
     let current = try signedIn(paths, table)
-    let affected: [Value] = try owned.map { worker in
-        var matches = try known.filter { row in try processOwns(worker, row).truthy }
+    let affected: [Value] = try owned.map { group in
+        var matches = try known.filter { row in try processOwns(group.ids, row).truthy }
         let direct = matches.filter { row in
-            worker.ids.includes(row.record.sessionId.nullish ? .undefined : .string(re("^local_").replace(row.record.sessionId.description, "")))
+            group.ids.value.includes(row.record.sessionId.nullish ? .undefined : .string(re("^local_").replace(row.record.sessionId.description, "")))
         }
         if !direct.isEmpty { matches = direct }
         let scoped = try matches.filter { row in try sameAccount(row.account, current).truthy }
         if !scoped.isEmpty { matches = scoped }
         let match: Value = matches.count == 1 || ValueSet(matches.map { $0.title }).size == 1 ? matches[0] : .null
-        let named = worker.workers.elements.first { $0.sessionName.truthy } ?? .undefined
-        let withCwd = worker.workers.elements.first { $0.cwd.truthy } ?? .undefined
+        let named = group.workers.first { $0.raw["sessionName"].truthy }?.raw ?? .undefined
+        let withCwd = group.workers.first { $0.raw["cwd"].truthy }?.raw ?? .undefined
         let fields: [(String, Value)] = [
-            ("pid", worker.pid), ("started", worker.started), ("desktopPid", desktop.pid),
+            ("pid", group.root.raw["pid"]), ("started", group.root.raw["started"]), ("desktopPid", desktop.pid),
             ("id", match.id ?? .null), ("recordId", match.record.sessionId ?? .null),
             ("title", or(or(match.title, named.sessionName), "Another open Claude session")),
             ("cwd", match.cwd ?? withCwd.cwd ?? .null),
-            ("pids", worker.workers.elements.map { $0.pid }.value),
+            ("pids", group.workers.map { $0.raw["pid"] }.value),
         ]
         return Value(fields)
     }
     let selected = ValueSet(try held.elements.flatMap { row in try row.workers.elements.map(processIdentity) })
-    let members: [Value] = table.elements.filter { $0.desktopPid === desktop.pid }.map { ["pid": $0.pid, "started": $0.started] }
-    let interrupts = try affected.enumerated().filter { index, _ in
-        !(try owned[index].workers.elements.contains { worker in selected.has(try processIdentity(worker)) })
+    let members: [Value] = processRows(table).filter { $0.desktopPid == desktopPid }.map { ["pid": $0.raw["pid"], "started": $0.raw["started"]] }
+    let interrupts = affected.enumerated().filter { index, _ in
+        !owned[index].workers.contains { selected.has($0.identity) }
     }.map { $0.element }
     let result: [(String, Value)] = [
         ("app", Value(path.resolve(desktop.executable.description, "../../.."))),
@@ -657,8 +688,8 @@ func waitFor(_ predicate: Value = .undefined, _ deadline: Value = .undefined, _ 
 }
 func appProcess(_ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
     let table = table.isUndefined ? try processTable(Value(paths.claudeApp)) : table
-    let executable = Value(path.join(paths.claudeApp, "Contents/MacOS/Claude"))
-    return table.elements.first { $0.executable === executable } ?? .undefined
+    let executable = path.join(paths.claudeApp, "Contents/MacOS/Claude")
+    return processRows(table).first { $0.executable == executable }?.raw ?? .undefined
 }
 func command(_ file: Value = .undefined, _ args: Value = .undefined, _ timeout: Value = .undefined) throws -> Value {
     let result = childProcess.command(file.description, args.elements.map { $0.description }, toNumber(timeout))
@@ -807,8 +838,8 @@ func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work:
             throw makeError("Open Claude sessions changed. Review the restart plan again.", code: "RESTART_PLAN_CHANGED")
         }
         if try plan.held.elements.contains(where: { held in
-            try live.elements.contains { row in
-                try row.worker.truthy && row.desktopPid !== desktop.pid && ownsWorker(Value.newSet(row.ids.elements), held.id, held.recordId).truthy
+            try processRows(live).contains { row in
+                try row.isWorker && row.desktopPid != ProcessRow(desktop).pid && ownsWorker(Value.newSet(row.ids), held.id, held.recordId).truthy
             }
         }) { throw makeError("An external worker now owns a held session. No restart was started.", code: "RESTART_EXTERNAL_WORKER") }
         try report.call("desktop", "Closing Claude Desktop", ["live": true])
