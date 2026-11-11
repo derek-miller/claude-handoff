@@ -342,10 +342,6 @@ struct MovePlan {
     let raw: Value
     init(_ raw: Value) { self.raw = raw }
     var isPresent: Bool { raw.truthy }
-    var apart: Value {
-        get { raw["apart"] }
-        nonmutating set { raw["apart"] = newValue }
-    }
     var blocked: Value {
         get { raw["blocked"] }
         nonmutating set { raw["blocked"] = newValue }
@@ -386,21 +382,9 @@ struct MovePlan {
         get { raw["inspect"] }
         nonmutating set { raw["inspect"] = newValue }
     }
-    var memory: Value {
-        get { raw["memory"] }
-        nonmutating set { raw["memory"] = newValue }
-    }
-    var missing: Value {
-        get { raw["missing"] }
-        nonmutating set { raw["missing"] = newValue }
-    }
     var move: Value {
         get { raw["move"] }
         nonmutating set { raw["move"] = newValue }
-    }
-    var pendingCloud: Value {
-        get { raw["pendingCloud"] }
-        nonmutating set { raw["pendingCloud"] = newValue }
     }
     var rejected: Value {
         get { raw["rejected"] }
@@ -425,14 +409,6 @@ struct MovePlan {
     var toAccount: Value {
         get { raw["toAccount"] }
         nonmutating set { raw["toAccount"] = newValue }
-    }
-    var total: Value {
-        get { raw["total"] }
-        nonmutating set { raw["total"] = newValue }
-    }
-    var twice: Value {
-        get { raw["twice"] }
-        nonmutating set { raw["twice"] = newValue }
     }
     var unreadable: Value {
         get { raw["unreadable"] }
