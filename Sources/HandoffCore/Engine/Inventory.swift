@@ -409,7 +409,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
     try check()
     let soleRecord = { (s: Value) throws -> Bool in
         let record = MoveSource(s).desktopRecord
-        guard s["shared"] === false && !record.raw["forkedFromSessionId"].truthy else { return false }
+        guard s["shared"] === false && !record.forkedFromSessionId.truthy else { return false }
         for id in try priorSessions(record.raw).elements where id !== s["id"] && ctx["index"].has(id) { return false }
         return true
     }
@@ -446,7 +446,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
                         analyzed.set(transcript, detail)
                     }
                     if detail["contentSha"].truthy && !detail["roots"]["size"].truthy && !detail["invalid"].truthy { missing.push(s); return }
-                    let recordId = session.record.raw["sessionId"]
+                    let recordId = session.record.sessionId
                     let taskOwned = Value(source.taskRegistry.notifies(recordId))
                     let worker = try ownsWorker(ctx["workers"], Value(id), recordId)
                     let recordSha = Value(sha(try readFile(Value(session.file))))
@@ -488,7 +488,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
             do {
                 let detail: Value = transcript.truthy ? try history(Value(id), transcript, ctx, session.cwd) : .null
                 if detail["roots"]["size"].truthy {
-                    let recordId = session.record.raw["sessionId"]
+                    let recordId = session.record.sessionId
                     let head: Value = ["record": recordId, "id": Value(id)]
                     let taskOwned = Value(target.taskRegistry.notifies(recordId))
                     let worker = try ownsWorker(ctx["workers"], Value(id), recordId)
@@ -523,7 +523,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
     for source in found.elements {
         source["sole"] = Value(try soleRecord(source) && !source["lineage"]["length"].truthy && !forked.has(source["id"]))
     }
-    let requiredParents = Value.newSet(found.elements.map { MoveSource($0).desktopRecord.raw["forkedFromSessionId"] }.filter { $0.truthy })
+    let requiredParents = Value.newSet(found.elements.map { MoveSource($0).desktopRecord.forkedFromSessionId }.filter { $0.truthy })
     let ranked = stableSorted(found.elements) { a, b in
         comparatorChain([
             toNumber(b["roots"]["size"]) - toNumber(a["roots"]["size"]),
@@ -556,7 +556,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         for target in targets.elements.map(MoveTarget.init) where target.recordId.truthy {
             var all = true
             for member in MoveSource(s).members {
-                let recordId = member.desktopRecord.raw["sessionId"]
+                let recordId = member.desktopRecord.sessionId
                 let ok = try included(member.raw, target.raw).truthy && (!requiredParents.has(recordId) || target.recordId === recordId)
                 if !ok { all = false; break }
             }

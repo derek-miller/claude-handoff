@@ -126,7 +126,6 @@ extension RecordHolder {
     var desktopFile: Value { raw["session"]["file"] ?? raw["file"] }
 }
 
-extension DesktopSession: RecordHolder {}
 
 // A source session in an inventory: the DesktopSession's fields merged with its account, transcript and history
 // analysis, plus the fields planning adds. Copies of one history are grouped as one row listing them in `members`.
@@ -136,10 +135,6 @@ struct MoveSource: RecordHolder {
     var id: Value { raw["id"] }
     var file: Value { raw["file"] }
     var account: Account { Account(raw["account"]) }
-    var transcript: Value { raw["transcript"] }
-    var sidecar: Value { raw["sidecar"] }
-    var roots: Value { raw["roots"] }
-    var title: Value { raw["title"] }
     // Counts of unparseable lines and conflicting duplicate uuids, when any.
     var invalid: Value { raw["invalid"] }
     var conflicts: Value { raw["conflicts"] }
@@ -170,8 +165,5 @@ struct MoveSource: RecordHolder {
 struct MoveTarget: RecordHolder {
     let raw: Value
     init(_ raw: Value) { self.raw = raw }
-    var id: Value { raw["id"] }
     var recordId: Value { raw["record"] }
-    var session: DesktopSession { DesktopSession(raw["session"]) }
-    var account: Account { Account(raw["account"]) }
 }
