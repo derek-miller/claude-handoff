@@ -33,7 +33,7 @@ fileprivate func isStopCode(_ error: Value) -> Bool {
     return code === "MOVE_STALLED" || code === "RESTART_REOPENED"
 }
 
-func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Value = .undefined, _ paths: Value = .undefined, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
+func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Value = .undefined, _ paths: DataLayout, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let check = fnOr(check)
     let snapshots: Value = snapshots.isUndefined ? .null : snapshots
@@ -41,7 +41,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
     try report.call("retire", "checking", ["live": true])
     let retained = Value.newSet()
     let bad = Value.newSet(problems.elements.map { $0["id"] })
-    let dest = path.join(paths["state"].description, "quarantine", at.description)
+    let dest = path.join(paths.state, "quarantine", at.description)
     var plan: [Value] = []
     var landed: [Value] = []
     for row in receipt["sessions"].elements {
@@ -117,7 +117,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
                     receipt["failed"].push(Value.spread(["id": s["id"], "title": s["title"], "error": .string("\(claim) kept in source")], try failureIdentity(s)))
                     return
                 }
-                let moved: Value = [[s["file"], .string(path.join(dest, "sources", path.relative(paths["records"].description, s["file"].description)))]]
+                let moved: Value = [[s["file"], .string(path.join(dest, "sources", path.relative(paths.records, s["file"].description)))]]
                 plan.append(["id": s["id"], "title": s["title"], "by": owner["by"], "source": true, "required": [s["file"]], "hashes": [[s["file"], .null]], "moved": moved])
                 sourceRows.put(s["file"], s)
             }
@@ -657,7 +657,7 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
     return .undefined
 }
 
-func cloudIdentity(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+func cloudIdentity(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let active = try options["active"] ?? signedIn(paths, options["processes"])
     return !options["active"].truthy && active["state"] === "unknown" && options["cloud"].truthy && !options["cloud"].isFunction ? options["cloud"] : active
 }
@@ -703,7 +703,7 @@ func cloudRetryAt(_ receipt: Value = .undefined, _ source: Value = .undefined, _
     return Value(toNumber(last) + (shortWait ? 15_000 : 60_000))
 }
 
-func sourceCloud(_ paths: Value = .undefined, _ source: Value = .undefined, _ supplied: Value = .undefined) throws -> Value {
+func sourceCloud(_ paths: DataLayout, _ source: Value = .undefined, _ supplied: Value = .undefined) throws -> Value {
     let cloud = supplied.isFunction
         ? try supplied.call(Value.spread(try accountRef(source), ["label": try accountLabel(source)]))
         : try supplied ?? cloudClient(paths, source)
@@ -711,13 +711,13 @@ func sourceCloud(_ paths: Value = .undefined, _ source: Value = .undefined, _ su
     return cloud
 }
 
-func receiptCloud(_ receipt: Value = .undefined, _ paths: Value = .undefined, _ supplied: Value = .undefined) throws -> Value {
+func receiptCloud(_ receipt: Value = .undefined, _ paths: DataLayout, _ supplied: Value = .undefined) throws -> Value {
     let row = receipt["remotePending"] ?? receipt["remote"][0]
     if !row.truthy { return .null }
     return try sourceCloud(paths, row, supplied)
 }
 
-func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? [:] : options
     if !receipt["remoteUndoing"]["length"].truthy { return ["problems": [], "pending": []] }
     var restored = 0

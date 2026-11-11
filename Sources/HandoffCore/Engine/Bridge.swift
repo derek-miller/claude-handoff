@@ -584,7 +584,7 @@ public func receiptSummary(_ receipt: Value = .undefined) throws -> Value {
     return .object(o)
 }
 
-func projectLocalFailures(_ receipt: Value = .undefined, _ paths: Value = .undefined, _ project: Value = .undefined) throws -> Value {
+func projectLocalFailures(_ receipt: Value = .undefined, _ paths: DataLayout, _ project: Value = .undefined) throws -> Value {
     let project = project.isUndefined ? Value(true) : project
     let local = (receipt.failed ?? .newArray()).elements.filter { !$0.cloudAccount.truthy }
     if local.isEmpty && !(receipt.failed ?? .newArray()).elements.contains(where: { $0.blockedByLocal["length"].truthy }) { return .undefined }
@@ -599,7 +599,7 @@ func projectLocalFailures(_ receipt: Value = .undefined, _ paths: Value = .undef
                     do {
                         if !UUID.test(account.account.description) || !UUID.test(account.org.description) { collected.append(.null); continue }
                         let files: Value
-                        do { files = try recordFiles(Value(try strictJoin([paths.records, account.account, account.org]))) }
+                        do { files = try recordFiles(Value(try strictJoin([Value(paths.records), account.account, account.org]))) }
                         catch { if errorObject(error).code === "ENOENT" { files = .newArray() } else { throw error } }
                         var rows: [Value] = []
                         for file in files.elements {
@@ -626,13 +626,13 @@ func projectLocalFailures(_ receipt: Value = .undefined, _ paths: Value = .undef
         for source in (failure.sources ?? .newArray()).elements {
             do {
                 if try !(try receipt.fromAccounts.elements.contains(where: { try sameAccount($0, source).truthy })) || !LOCAL_RECORD.test((source.sessionId ?? "").description) ||
-                    source.file !== Value(try strictJoin([paths.records, source.account, source.org, Value("\(source.sessionId).json")])) { continue }
+                    source.file !== Value(try strictJoin([Value(paths.records), source.account, source.org, Value("\(source.sessionId).json")])) { continue }
                 let raw = try readFile(source.file), record = try JSON.parse(raw.asData ?? Data())
                 if record.sessionId !== source.sessionId || record.cliSessionId !== source.id ||
                     Value(sha(raw)) !== (source.recordSha ?? source.observedRecordSha) { continue }
                 let relevant = try (receipt.failed ?? .newArray()).elements.filter { try cloudTagged($0, source).truthy && remoteId($0.id).truthy }
                 if relevant.isEmpty { continue }
-                if pool.nullish { pool = try index(paths.pool) }
+                if pool.nullish { pool = try index(Value(paths.pool)) }
                 let transcript = try locate(pool, source.id, record.cwd)
                 if !transcript.truthy { continue }
                 let before = try fingerprint(transcript), data = try load(transcript)

@@ -52,16 +52,17 @@ fileprivate func errorMessage(_ error: Error) -> Value { errorObject(error)["mes
 
 // MARK: - Receipts
 
-func receipts(_ paths: Value = .undefined) throws -> Value {
+func receipts(_ paths: DataLayout) throws -> Value {
     let names: [String]
-    do { names = try fs.names(paths.state.description) } catch { names = [] }
+    do { names = try fs.names(paths.state) } catch { names = [] }
     return .strings(defaultSorted(names.filter { RECEIPT_FILE.test($0) }))
 }
 
-public func latestReceipt(_ paths: Value = .undefined) throws -> Value {
+public func latestReceipt(_ paths: Value = .undefined) throws -> Value { try latestReceipt(DataLayout(paths)) }
+func latestReceipt(_ paths: DataLayout) throws -> Value {
     let name = try receipts(paths).elements.last ?? .undefined
     if !name.truthy { return .null }
-    let file = Value(path.join(paths.state.description, name.description))
+    let file = Value(path.join(paths.state, name.description))
     let receipt = catchNull { try readReceipt(file) }
     if !receipt.truthy { return ["name": name, "file": file, "corrupt": true] }
     if !receipt.writer.truthy && (receipt.finalizing.truthy && receipt.appendCheckpoint.truthy && receipt.appendCheckpoint.taskTransfers.isUndefined
@@ -73,7 +74,8 @@ public func latestReceipt(_ paths: Value = .undefined) throws -> Value {
     return ["name": name, "file": file, "receipt": receipt, "projected": Value(stable(receipt) != before)]
 }
 
-public func deferredWorkflow(_ paths: Value = .undefined, _ latest: Value = .undefined) throws -> Value {
+public func deferredWorkflow(_ paths: Value = .undefined, _ latest: Value = .undefined) throws -> Value { try deferredWorkflow(DataLayout(paths), latest) }
+func deferredWorkflow(_ paths: DataLayout, _ latest: Value = .undefined) throws -> Value {
     var latest = latest
     if latest.isUndefined { latest = try latestReceipt(paths) }
     if !latest.truthy || latest.corrupt.truthy { return .null }
@@ -236,7 +238,8 @@ func placementJournal(_ file: Value = .undefined, _ receipt: Value = .undefined,
     return ["save": save, "close": close, "compact": compact]
 }
 
-public func recoveryPending(_ paths: Value = .undefined) throws -> Value {
+public func recoveryPending(_ paths: Value = .undefined) throws -> Value { try recoveryPending(DataLayout(paths)) }
+func recoveryPending(_ paths: DataLayout) throws -> Value {
     let latest = try latestReceipt(paths)
     if !latest.truthy || latest.corrupt.truthy { return latest }
     return try needsRecovery(latest.receipt).truthy ? ["name": latest.name, "file": latest.file, "receipt": latest.receipt] : .null
@@ -301,8 +304,8 @@ func restore(_ plan: Value = .undefined, _ root: Value = .undefined, _ before: V
     return .undefined
 }
 
-func prepareUndo(_ receipt: Value = .undefined, _ paths: Value = .undefined) throws -> Value {
-    let dest = path.join(paths.state.description, "quarantine", receipt.at.description)
+func prepareUndo(_ receipt: Value = .undefined, _ paths: DataLayout) throws -> Value {
+    let dest = path.join(paths.state, "quarantine", receipt.at.description)
     var plan: [Value] = []
     for row in receipt.sessions.elements {
         let files: [Value] = row.strategy === "rehome" ? [] : [row.targetTranscript].filter { $0.truthy }
@@ -322,7 +325,7 @@ func prepareUndo(_ receipt: Value = .undefined, _ paths: Value = .undefined) thr
     return Value(plan)
 }
 
-func taskTransferProblems(_ transfers: Value = .undefined, _ paths: Value = .undefined, _ inspect: Value = .undefined, _ partial: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
+func taskTransferProblems(_ transfers: Value = .undefined, _ paths: DataLayout, _ inspect: Value = .undefined, _ partial: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let partial = partial.isUndefined ? Value(false) : partial
     let check = fnOr(check)
     let snapshots = snapshots.isUndefined ? Value.null : snapshots
@@ -334,14 +337,14 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: Value = .und
             let links = Value.newMap(family.links.elements.map { ($0[0], Value(stable($0))) })
             let cliIds = Value.newSet(family.links.elements.map { $0[1] })
             let inspected = try optCall(inspect)
-            let table = try inspected.nullish ? processTable(paths.claudeApp) : inspected
+            let table = try inspected.nullish ? processTable(Value(paths.claudeApp)) : inspected
             let liveWorkers = Value.newSet(flatMapValues(table.elements.filter { $0.worker.truthy }) { $0.ids })
             if try schedulerBusy(paths, [family.from, family.to], table).truthy { problems.append(Value(SCHEDULER_OWNS)) }
             if try sameAccount(family.from, family.to).truthy { throw EngineError("scheduled task namespaces must differ") }
             var selected: [Bool] = []
             for (file, namespace) in [(family.sourceFile, family.from), (family.targetFile, family.to)] {
                 if !UUID.test(namespace.account.description) || !UUID.test(namespace.org.description)
-                    || file !== Value(path.join(paths.records.description, namespace.account.description, namespace.org.description, "scheduled-tasks.json")) {
+                    || file !== Value(path.join(paths.records, namespace.account.description, namespace.org.description, "scheduled-tasks.json")) {
                     throw EngineError("scheduled task namespace mismatch")
                 }
                 let registry = try taskSessions(file).registry
@@ -400,7 +403,7 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: Value = .und
 }
 
 @discardableResult
-func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .undefined, _ present: Value = .undefined, _ paths: Value = .undefined, _ inspect: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
+func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .undefined, _ present: Value = .undefined, _ paths: DataLayout, _ inspect: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let check = fnOr(check)
     let snapshots = snapshots.isUndefined ? Value.null : snapshots
     let families = side === "target" && !present.truthy ? Array(transfers.elements.reversed()) : transfers.elements
@@ -459,9 +462,9 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
     return .undefined
 }
 
-func finishUndo(_ receipt: Value = .undefined, _ file: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+func finishUndo(_ receipt: Value = .undefined, _ file: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
-    let root = Value(path.join(paths.state.description, "quarantine"))
+    let root = Value(path.join(paths.state, "quarantine"))
     let dest = Value(path.join(root.description, receipt.at.description))
     let superseded = receipt.superseded ?? Value.newArray(), undoing = receipt.undoing ?? Value.newArray()
     var problems: [Value] = []
@@ -592,10 +595,11 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
     return Value.newArray()
 }
 
-public func reconcile(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func reconcile(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try reconcile(DataLayout(paths), options) }
+func reconcile(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     var paths = paths
     let options = options.isUndefined ? Value.newObject() : options
-    let file = Value(path.join(paths.state.description, "restart.json"))
+    let file = Value(path.join(paths.state, "restart.json"))
     let restart = catchNull { try readJson(file) }
     let interrupted = restart.truthy && (["closing", "moving", "reopening"] as Value).includes(restart.outcome)
     var result: Value = .undefined
@@ -616,18 +620,18 @@ public func reconcile(_ paths: Value = .undefined, _ options: Value = .undefined
         }
     } catch { thrown = error }
     if interrupted {
-        paths = .spread(paths, ["claudeApp": restart.app ?? paths.claudeApp])
+        paths.claudeApp = (restart.app ?? Value(paths.claudeApp)).description
         let current = paths
         let io = options.io ?? Value.newObject()
         let now = io.now ?? Value { _ in Value(process.monotonic()) }
-        let inspect = io.inspect ?? Value { _ in try processTable(current.claudeApp) }
+        let inspect = io.inspect ?? Value { _ in try processTable(Value(current.claudeApp)) }
         let running = Value { _ in
             do { return Value(try appProcess(current, try inspect.call()).truthy) } catch { return false }
         }
         if try !running.call().truthy {
             let deadline = toNumber(try now.call()) + REOPEN_RESERVE
             let run = io.command ?? Value { a in try command(arg(a, 0), arg(a, 1), arg(a, 2)) }
-            let opened = try run.call("/usr/bin/open", ["-g", "-a", paths.claudeApp], Value(REOPEN_RESERVE))
+            let opened = try run.call("/usr/bin/open", ["-g", "-a", Value(paths.claudeApp)], Value(REOPEN_RESERVE))
             restart.outcome = try opened.status === 0 && waitFor(running, Value(deadline), now, io.wait).truthy ? "interrupted-reopened" : "reopen-failed"
         } else { restart.outcome = "interrupted-app-running" }
         restart.recoveredAt = Value(isoNow())
@@ -641,7 +645,7 @@ public func reconcile(_ paths: Value = .undefined, _ options: Value = .undefined
     return result ?? (interrupted ? ["title": "Interrupted restart", "error": "Desktop is running. Retry the requested operation."] : .null)
 }
 
-func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
     let p = try recoveryPending(paths)
     if !p.truthy { return .null }
@@ -652,7 +656,7 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
     }
     let receipt = p.receipt
     let rollback = receipt.localRecovery.rollback ?? ""
-    let failedDirectory = Value(path.join(paths.state.description, "quarantine", receipt.at.description, "failed",
+    let failedDirectory = Value(path.join(paths.state, "quarantine", receipt.at.description, "failed",
                                           UUID.test(rollback.description) ? receipt.localRecovery.rollback.description : ""))
     let bridgeRows: Value
     if receipt.undoing.truthy { bridgeRows = receipt.sessions ?? Value.newArray() }
@@ -715,7 +719,7 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
     var recovered: [Value] = []
     if receipt.retiring.truthy {
         let plan = receipt.retiring
-        let root = Value(path.join(paths.state.description, "quarantine"))
+        let root = Value(path.join(paths.state, "quarantine"))
         let blocked = try restoreProblems(plan, root, true)
         if blocked.length != 0 { return ["title": "retirement recovery blocked", "error": Value(blocked.join(", ")), "problems": blocked] }
         try restore(plan, root, options.check)
@@ -759,7 +763,7 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
     }
     if receipt.finalizing.truthy {
         let checkpoint = receipt.appendCheckpoint
-        let root = Value(path.join(paths.state.description, "quarantine"))
+        let root = Value(path.join(paths.state, "quarantine"))
         let superseded = Value(sliceArray(receipt.superseded.elements, toInteger(checkpoint.superseded ?? 0)))
         let rollingBack = Value(sliceArray((receipt.sessions ?? Value.newArray()).elements, toInteger(checkpoint.sessions ?? 0)))
         let blocked = try restoreProblems(superseded, root).elements + bridgeProblems(rollingBack).elements

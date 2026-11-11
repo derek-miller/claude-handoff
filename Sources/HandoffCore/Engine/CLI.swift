@@ -67,7 +67,7 @@ public func main(_ argv: [String]) throws {
     let args = try parse(argv)
     if args.help.truthy { return process.stdout(HELP) }
     if args["version"].truthy { return process.stdout("\(VERSION)\n") }
-    let paths = try layout()
+    let paths = DataLayout(home: process.homedir())
     let write = { (s: String) in process.stdout(s) }
     let emit = { (o: Value) in process.stdout(JSON.text(o) + "\n") }
 
@@ -355,7 +355,7 @@ public func main(_ argv: [String]) throws {
                 recoveryProblem = ["receipt": latest.file, "error": error["message"]]
                 deferred = .null
             }
-            let table: Value = deferred.truthy ? try processTable(paths.claudeApp) : []
+            let table: Value = deferred.truthy ? try processTable(Value(paths.claudeApp)) : []
             let identity: Value = deferred.truthy ? try signedIn(paths, table) : .null
             let timeouts: Value = deferred.mode === "local" ? try idleTimeouts(paths, table) : Value.newMap()
             let summary: Value = latest.receipt.truthy ? try receiptSummary(latest.receipt) : .null

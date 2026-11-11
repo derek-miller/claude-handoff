@@ -10,14 +10,14 @@ fileprivate func optCall(_ f: Value, _ args: Value...) throws -> Value {
 
 fileprivate func roundHalfUp(_ x: Double) -> Double { (x + 0.5).rounded(.down) }
 
-func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
+func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
     var context = context.isUndefined ? Value.newObject() : context
     context = Value.spread(context, [
         "at": context.existing["receipt"]["at"] ?? context.at ?? .string(stamp()),
         "snapshots": Value.newMap(),
         "sources": inv.sources,
     ] as Value)
-    let file: Value = context.existing["file"] ?? .string(path.join(paths.state.description, "\(context.at).json"))
+    let file: Value = context.existing["file"] ?? .string(path.join(paths.state, "\(context.at).json"))
     if context.restart.truthy {
         let batches = ValueMap(), grouped = ValueMap()
         for family in ValueSet(inv.move.elements.map { $0.taskFamily }.filter { $0.truthy }).values {
@@ -186,7 +186,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
     let receipt = result["receipt"]
     if receipt.truthy && !context.existing.truthy && receipt.sessions.length == 0 && receipt.superseded.length == 0 && receipt.remote.length == 0 && !receipt.held["length"].truthy,
        try openCloudChecks(receipt).length == 0,
-       !exists(.string(path.join(paths.state.description, "quarantine", context.at.description, "failed"))) {
+       !exists(.string(path.join(paths.state, "quarantine", context.at.description, "failed"))) {
         if result.file.truthy { try fs.rm(result.file.description, recursive: false, force: true) }
         return ["file": .null, "receipt": receipt, "summary": try receiptSummary(receipt), "ok": try receiptOkay(receipt), "validationOnly": true]
     }
@@ -219,7 +219,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
     return Value.spread(result, tail)
 }
 
-func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
+func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
     let context = context.isUndefined ? Value.newObject() : context
     try optCall(context.check, true)
     if context.restart.truthy && inv.cloud["checked"].truthy { throw EngineError("Cloud work cannot run inside the restart window") }
@@ -268,7 +268,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
         if context.restart.truthy { r.restart = context.restart }
         receipt = r
     }
-    let file: Value = .string(path.join(paths.state.description, "\(at).json"))
+    let file: Value = .string(path.join(paths.state, "\(at).json"))
     if context.existing.truthy {
         receipt.appendCheckpoint = ["sessions": Value(receipt.sessions.length), "superseded": Value(receipt.superseded.length),
                                     "taskTransfers": receipt.taskTransfers["length"] ?? 0, "verification": receipt.verification, "held": receipt.held]
@@ -366,7 +366,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
                 let found = try? fs.stat(made[0])
                 if raw.truthy && created.truthy, let found, found.devValue === created.dev && found.inoValue === created.ino {
                     if Value.string(sha(raw)) !== receipt.pending.recordSha { throw EngineError(error) }
-                    _ = try quarantine(.strings(made), .string(path.join(paths.state.description, "quarantine", at.description, "failed")))
+                    _ = try quarantine(.strings(made), .string(path.join(paths.state, "quarantine", at.description, "failed")))
                 }
                 receipt.failed.push(Value.spread(["id": s.id, "title": s.title, "error": error["message"]] as Value, try failureIdentity(s)))
             }
@@ -421,13 +421,13 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
             receipt.localRecovery = ["rollback": .string(randomUUID())]
             try save.call()
         }
-        let failedDirectory = path.join(paths.state.description, "quarantine", at.description, "failed", (receipt.localRecovery["rollback"] ?? "").description)
+        let failedDirectory = path.join(paths.state, "quarantine", at.description, "failed", (receipt.localRecovery["rollback"] ?? "").description)
         for rows in units {
             let ids = ValueSet(rows.elements.map { $0.id }), unitFiles = ValueSet(rows.elements.flatMap { row in (row.members ?? [row]).elements }.map { $0.file })
             let items = sliceArray(receipt.superseded.elements, previousSuperseded).filter { item in
                 item.source.truthy ? unitFiles.has(item.moved[0][0]) : ids.has(item.by)
             }
-            _ = try restore(Value(items), .string(path.join(paths.state.description, "quarantine")))
+            _ = try restore(Value(items), .string(path.join(paths.state, "quarantine")))
             receipt.superseded = Value(receipt.superseded.elements.filter { !items.contains($0) })
             let kept = ValueSet()
             for row in sliceArray(receipt.sessions.elements, previousCount).filter({ ids.has($0.id) }) {
@@ -535,7 +535,8 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     return out
 }
 
-public func finishPending(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func finishPending(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try finishPending(DataLayout(paths), options) }
+func finishPending(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
     return try locked(paths, Value { _ in
         let latest = try latestReceipt(paths)
@@ -567,7 +568,7 @@ public func finishPending(_ paths: Value = .undefined, _ options: Value = .undef
                     "notMoved": notMoved, "problems": receipt.verification["problems"] ?? [], "reason": reason]
         }
         let active = try cloudIdentity(paths, options), now = dateNow(), memory = try selectedMemory(options)
-        let table: Value = options.automatic.truthy ? try options.processes ?? processTable(paths.claudeApp) : []
+        let table: Value = options.automatic.truthy ? try options.processes ?? processTable(Value(paths.claudeApp)) : []
         let eligible = try outstanding.elements.filter { source in try sameLogin(source, active).truthy && cloudScope(options.cloud, source).truthy }
         let candidates = try eligible.filter { source in
             if !options.automatic.truthy { return true }
@@ -671,7 +672,8 @@ public func finishPending(_ paths: Value = .undefined, _ options: Value = .undef
     })
 }
 
-public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try keepLocal(DataLayout(paths), options) }
+func keepLocal(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
     return try locked(paths, Value { _ in
         let recovery = try recoveryPending(paths)
@@ -699,7 +701,7 @@ public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined
         var to: Value = .undefined
         for account in try accounts(paths).elements where try sameAccount(account, receipt.toAccount).truthy { to = account; break }
         let existing = (receipt.superseded ?? []).elements.filter { row in row.source.truthy && !receipt.sessions.elements.contains { $0.targetId === row.by } }
-        refused.append(contentsOf: try restoreProblems(receipt.superseded ?? [], .string(path.join(paths.state.description, "quarantine"))).elements)
+        refused.append(contentsOf: try restoreProblems(receipt.superseded ?? [], .string(path.join(paths.state, "quarantine"))).elements)
         var sourceSessions: [Value] = []
         for source in existing {
             let sourceFile = source.moved[0][1]
@@ -709,7 +711,7 @@ public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined
         }
         if !sourceSessions.isEmpty && to.truthy {
             let auditSource: Value = ["account": "retired", "org": "retired", "label": "retired sources", "sessions": Value(sourceSessions), "unreadable": [],
-                                      "taskFile": .string(path.join(paths.state.description, "keep-local-audit-tasks.json")), "taskSessions": Value.newSet(), "taskError": .null]
+                                      "taskFile": .string(path.join(paths.state, "keep-local-audit-tasks.json")), "taskSessions": Value.newSet(), "taskError": .null]
             do {
                 let audit = try inventory([auditSource], to, paths)
                 let covered = ValueSet(audit.there.elements.flatMap { source in (source.members ?? [source]).elements.map { $0.file } })
@@ -741,7 +743,8 @@ public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined
     })
 }
 
-public func move(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined) throws -> Value {
+public func move(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined) throws -> Value { try move(inv, to, DataLayout(paths), report) }
+func move(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     return try locked(paths, Value { _ in
         let reconciled = try reconcile(paths, ["cloud": inv.cloud["client"]])

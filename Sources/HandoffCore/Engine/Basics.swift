@@ -371,8 +371,8 @@ func recoveryFamilies(_ receipt: Value = .undefined) throws -> Value {
     return sliceArray(transfers.elements, offsetInt).value
 }
 
-func inspector(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
-    options.inspect ?? options.io.inspect ?? Value { _ in try options.processes ?? processTable(paths.claudeApp) }
+func inspector(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
+    options.inspect ?? options.io.inspect ?? Value { _ in try options.processes ?? processTable(Value(paths.claudeApp)) }
 }
 public func keptCopy(_ receipt: Value = .undefined) throws -> Value {
     let linked = ValueSet(try (receipt.failed ?? []).elements.filter { !$0.cloudAccount.truthy }
@@ -528,9 +528,10 @@ func canRestartWaiting(_ receipt: Value = .undefined, _ table: Value = .undefine
     })
 }
 
-public func restartPlan(_ inv: Value = .undefined, _ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value {
-    let table = table.isUndefined ? try processTable(paths.claudeApp) : table
-    let apps = table.elements.filter { row in desktopExecutable(row.executable).truthy || row.executable === Value(path.join(paths.claudeApp.description, "Contents/MacOS/Claude")) }
+public func restartPlan(_ inv: Value = .undefined, _ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value { try restartPlan(inv, DataLayout(paths), table) }
+func restartPlan(_ inv: Value = .undefined, _ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
+    let table = table.isUndefined ? try processTable(Value(paths.claudeApp)) : table
+    let apps = table.elements.filter { row in desktopExecutable(row.executable).truthy || row.executable === Value(path.join(paths.claudeApp, "Contents/MacOS/Claude")) }
     if apps.count != 1 { return .null }
     let desktop = apps[0]
     let all = try accounts(paths)
@@ -654,9 +655,9 @@ func waitFor(_ predicate: Value = .undefined, _ deadline: Value = .undefined, _ 
         try wait.call(Value(nanMin(250, deadline - toNumber(try now.call()))))
     } while true
 }
-func appProcess(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value {
-    let table = table.isUndefined ? try processTable(paths.claudeApp) : table
-    let executable = Value(path.join(paths.claudeApp.description, "Contents/MacOS/Claude"))
+func appProcess(_ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
+    let table = table.isUndefined ? try processTable(Value(paths.claudeApp)) : table
+    let executable = Value(path.join(paths.claudeApp, "Contents/MacOS/Claude"))
     return table.elements.first { $0.executable === executable } ?? .undefined
 }
 func command(_ file: Value = .undefined, _ args: Value = .undefined, _ timeout: Value = .undefined) throws -> Value {
@@ -664,14 +665,14 @@ func command(_ file: Value = .undefined, _ args: Value = .undefined, _ timeout: 
     return ["status": result.status.map { Value(Int($0)) } ?? .null, "timedOut": Value(result.timedOut)]
 }
 
-func restartReceiptId(_ paths: Value = .undefined, _ file: Value = .undefined) throws -> Value {
+func restartReceiptId(_ paths: DataLayout, _ file: Value = .undefined) throws -> Value {
     guard let file = file.asString else { return .null }
-    return path.dirname(file) == paths.state.asString && RECEIPT_FILE.test(path.basename(file)) ? Value(path.basename(file)) : .null
+    return path.dirname(file) == paths.state && RECEIPT_FILE.test(path.basename(file)) ? Value(path.basename(file)) : .null
 }
 
-func appendRestartEvent(_ paths: Value = .undefined, _ event: Value = .undefined) throws -> Value {
+func appendRestartEvent(_ paths: DataLayout, _ event: Value = .undefined) throws -> Value {
     do {
-        let file = path.join(paths.state.description, "restart-events.jsonl")
+        let file = path.join(paths.state, "restart-events.jsonl")
         var detail: FileStat?
         do { detail = try fs.lstat(file) } catch {
             let error = errorObject(error)
@@ -694,7 +695,7 @@ func appendRestartEvent(_ paths: Value = .undefined, _ event: Value = .undefined
     return .undefined
 }
 
-func foldRestartHistory(_ paths: Value = .undefined, _ file: Value = .undefined, _ receipt: Value = .undefined) throws -> Value {
+func foldRestartHistory(_ paths: DataLayout, _ file: Value = .undefined, _ receipt: Value = .undefined) throws -> Value {
     if try needsRecovery(receipt).truthy || !receipt.restartHistory.isUndefined &&
         (!receipt.restartHistory.isArray || receipt.restartHistory.elements.contains { row in !row.truthy || row.typeOf != "object" }) { return .undefined }
     let receiptId = try restartReceiptId(paths, file)
@@ -704,7 +705,7 @@ func foldRestartHistory(_ paths: Value = .undefined, _ file: Value = .undefined,
         var handle: FileHandle?
         defer { try? handle?.close() }
         do {
-            handle = try fs.open(path.join(paths.state.description, name), O_RDONLY | O_NOFOLLOW, 0o666)
+            handle = try fs.open(path.join(paths.state, name), O_RDONLY | O_NOFOLLOW, 0o666)
             let detail = try handle!.stat()
             if !detail.isFile || Double(detail.size) > RESTART_LOG_BYTES { continue }
             let text = String(decoding: try handle!.readFile(), as: UTF8.self)
@@ -720,7 +721,7 @@ func foldRestartHistory(_ paths: Value = .undefined, _ file: Value = .undefined,
     return .undefined
 }
 
-func updateRestartReceipt(_ paths: Value = .undefined, _ file: Value = .undefined, _ update: Value = .undefined) throws -> Value {
+func updateRestartReceipt(_ paths: DataLayout, _ file: Value = .undefined, _ update: Value = .undefined) throws -> Value {
     if !(try restartReceiptId(paths, file)).truthy { return .null }
     func snapshot() throws -> Value {
         try [file.description, "\(file).journal"].map { name -> Value in
@@ -749,13 +750,15 @@ func updateRestartReceipt(_ paths: Value = .undefined, _ file: Value = .undefine
     return receipt
 }
 
-public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .undefined, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value {
+public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .undefined, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value { try withDesktopRestart(plan, DataLayout(paths), work, report, io) }
+func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value {
     let report = fnOr(report)
-    let paths = Value.spread(paths, ["claudeApp": plan.app ?? paths.claudeApp])
+    var paths = paths
+    paths.claudeApp = (plan.app ?? Value(paths.claudeApp)).description
     let nowValue: Value = io.now ?? Value { _ in Value(process.monotonic()) }
     let now = { () throws -> Double in toNumber(try nowValue.call()) }
     let wait: Value = io.wait ?? Value { args in process.sleep(toNumber(arg(args, 0))); return .undefined }
-    let inspect = { () throws -> Value in io.inspect.isUndefined ? try processTable(paths.claudeApp) : try io.inspect.call() }
+    let inspect = { () throws -> Value in io.inspect.isUndefined ? try processTable(Value(paths.claudeApp)) : try io.inspect.call() }
     let safeInspect = { () -> Value in (try? inspect()) ?? .null }
     let run: Value = io.command ?? Value { args in try command(arg(args, 0), arg(args, 1), arg(args, 2)) }
     let reserve = toNumber(io.reserve ?? Value(REOPEN_RESERVE))
@@ -763,10 +766,10 @@ public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .und
     var lastProgress = try now()
     let activity: Value = ["progress": Value { _ in lastProgress = try now(); return .undefined }]
     let shutdownWait = toNumber(io.shutdownWait ?? Value(SHUTDOWN_WAIT))
-    let file = path.join(paths.state.description, "restart.json")
-    let state: Value = ["at": Value(stamp()), "attemptId": Value(randomUUID()), "requestedAt": Value(isoNow()), "app": paths.claudeApp,
+    let file = path.join(paths.state, "restart.json")
+    let state: Value = ["at": Value(stamp()), "attemptId": Value(randomUUID()), "requestedAt": Value(isoNow()), "app": Value(paths.claudeApp),
                         "desktop": plan.desktop, "held": plan.held, "outcome": "closing"]
-    let origin: Value = plan.receiptFile ?? (plan.selection.truthy ? Value(path.join(paths.state.description, "\(state.at).json")) : .null)
+    let origin: Value = plan.receiptFile ?? (plan.selection.truthy ? Value(path.join(paths.state, "\(state.at).json")) : .null)
     let kind: Value = plan.kind === "undo" ? "undo" : plan.resume.truthy || plan.kind === "finish" || plan.kind === "recover" ? "finish" : plan.kind === "move" ? "move" : "restart"
     func diagnostic(_ event: String, _ extra: Value = Value.newObject()) throws {
         let base: [(String, Value)] = [
@@ -793,7 +796,7 @@ public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .und
         if try now() - lastProgress >= stallWait { throw makeError("The move stopped making progress", code: "MOVE_STALLED") }
     }
     let checkValue = Value { args in try check(arg(args, 0).truthy); return .undefined }
-    try fs.mkdir(paths.state.description, true, 0o700)
+    try fs.mkdir(paths.state, true, 0o700)
     try save()
     try diagnostic("start")
     var result: Value = .undefined, failure: Value = .undefined, stopCode: Value = .undefined
@@ -810,7 +813,7 @@ public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .und
         }) { throw makeError("An external worker now owns a held session. No restart was started.", code: "RESTART_EXTERNAL_WORKER") }
         try report.call("desktop", "Closing Claude Desktop", ["live": true])
         let shutdownDeadline = try now() + shutdownWait
-        let quit = try run.call("/usr/bin/osascript", ["-e", Value("tell application \(JSON.text(paths.claudeApp)) to quit")], Value(nanMax(0, shutdownDeadline - now())))
+        let quit = try run.call("/usr/bin/osascript", ["-e", Value("tell application \(JSON.text(Value(paths.claudeApp))) to quit")], Value(nanMax(0, shutdownDeadline - now())))
         let gone = try quit.status === 0 && waitFor(Value { _ in
             Value(!(try inspect().elements.contains { row in
                 try plan.members.elements.contains { prior in try processIdentity(prior) === processIdentity(row) }
@@ -843,7 +846,7 @@ public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .und
         let reopenDeadline = try now() + reserve
         let remaining = try reopenDeadline - now()
         // `open` returns before Desktop is up, so the reopen is reported after it returns.
-        let opened: Value = (try? run.call("/usr/bin/open", ["-g", "-a", paths.claudeApp], Value(nanMax(1, remaining)))) ?? ["status": .null]
+        let opened: Value = (try? run.call("/usr/bin/open", ["-g", "-a", Value(paths.claudeApp)], Value(nanMax(1, remaining)))) ?? ["status": .null]
         _ = try? report.call("reopen", "Opening Claude Desktop", ["live": true])
         let present = try waitFor(Value { _ in
             let rows = safeInspect()
@@ -888,24 +891,47 @@ public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .und
             "ok": Value(state.outcome === "reopened" && !state.error.truthy && result.ok !== false)]
 }
 
+// Where Claude Desktop, Claude Code and Claude Handoff keep their data under one home directory.
+public struct DataLayout {
+    public let home, records, agentSessions, desktop, logs, cookies, pool, login, backups, switchAccounts, webCache, labels, state: String
+    // A restart plan or receipt may name the Desktop app it recorded.
+    public var claudeApp: String
+
+    public init(home: String) {
+        let support = path.join(home, "Library/Application Support")
+        self.home = home
+        records = path.join(support, "Claude/claude-code-sessions")
+        agentSessions = path.join(support, "Claude/local-agent-mode-sessions")
+        desktop = path.join(support, "Claude/config.json")
+        logs = path.join(home, "Library/Logs/Claude")
+        cookies = path.join(support, "Claude/Cookies")
+        claudeApp = "/Applications/Claude.app"
+        pool = path.join(home, ".claude/projects")
+        login = path.join(home, ".claude.json")
+        backups = path.join(home, ".claude/backups")
+        switchAccounts = path.join(home, ".claude-switch/accounts")
+        webCache = path.join(support, "Claude/IndexedDB/https_claude.ai_0.indexeddb.blob")
+        labels = path.join(support, "claude-handoff/labels.json")
+        state = path.join(support, "claude-handoff")
+    }
+
+    // A layout passed in as an object, as the public entry points take it.
+    public init(_ value: Value) {
+        home = value["home"].description; records = value["records"].description; agentSessions = value["agentSessions"].description
+        desktop = value["desktop"].description; logs = value["logs"].description; cookies = value["cookies"].description
+        claudeApp = value["claudeApp"].description; pool = value["pool"].description; login = value["login"].description
+        backups = value["backups"].description; switchAccounts = value["switchAccounts"].description; webCache = value["webCache"].description
+        labels = value["labels"].description; state = value["state"].description
+    }
+
+    public var value: Value {
+        Value([("home", Value(home)), ("records", Value(records)), ("agentSessions", Value(agentSessions)), ("desktop", Value(desktop)),
+               ("logs", Value(logs)), ("cookies", Value(cookies)), ("claudeApp", Value(claudeApp)), ("pool", Value(pool)), ("login", Value(login)),
+               ("backups", Value(backups)), ("switchAccounts", Value(switchAccounts)), ("webCache", Value(webCache)), ("labels", Value(labels)),
+               ("state", Value(state))])
+    }
+}
+
 public func layout(_ home: Value = .undefined) throws -> Value {
-    let home = home.isUndefined ? process.homedir() : home.description
-    let support = path.join(home, "Library/Application Support")
-    let entries: [(String, Value)] = [
-        ("home", Value(home)),
-        ("records", Value(path.join(support, "Claude/claude-code-sessions"))),
-        ("agentSessions", Value(path.join(support, "Claude/local-agent-mode-sessions"))),
-        ("desktop", Value(path.join(support, "Claude/config.json"))),
-        ("logs", Value(path.join(home, "Library/Logs/Claude"))),
-        ("cookies", Value(path.join(support, "Claude/Cookies"))),
-        ("claudeApp", "/Applications/Claude.app"),
-        ("pool", Value(path.join(home, ".claude/projects"))),
-        ("login", Value(path.join(home, ".claude.json"))),
-        ("backups", Value(path.join(home, ".claude/backups"))),
-        ("switchAccounts", Value(path.join(home, ".claude-switch/accounts"))),
-        ("webCache", Value(path.join(support, "Claude/IndexedDB/https_claude.ai_0.indexeddb.blob"))),
-        ("labels", Value(path.join(support, "claude-handoff/labels.json"))),
-        ("state", Value(path.join(support, "claude-handoff"))),
-    ]
-    return Value(entries)
+    DataLayout(home: home.isUndefined ? process.homedir() : home.description).value
 }
