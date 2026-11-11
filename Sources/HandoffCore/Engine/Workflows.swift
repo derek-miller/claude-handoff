@@ -253,7 +253,7 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
                 }
                 return result
             }
-            let restarted = try withDesktopRestart(Value.spread(pendingPlan, ["receiptFile": existing["file"] ?? plan["receiptFile"]]), paths, work, report, options["io"])
+            let restarted = try withDesktopRestart(RestartPlan(Value.spread(pendingPlan, ["receiptFile": existing["file"] ?? plan["receiptFile"]])), paths, work, report, options["io"])
             let code: Value = restarted["code"] === "WORK_REFUSED" ? restarted["result"]["code"] ?? restarted["code"] : restarted["code"]
             return Value.spread(restarted["result"] ?? prepared ?? .newObject(), [
                 "ok": and(restarted["ok"], Value(restarted["result"]["ok"] !== false)),
