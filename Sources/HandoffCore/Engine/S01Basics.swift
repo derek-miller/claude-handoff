@@ -475,7 +475,7 @@ public func parseProcesses(_ processes: Value = .undefined, _ commands: Value = 
         rows.append(["pid": Value(jsNumber(.string(match[1]!))), "ppid": Value(jsNumber(.string(match[2]!))), "started": Value(match[3]!),
                      "executable": Value(executable), "worker": Value(worker), "ids": (identities["\(match[1]!)/\(match[3]!)"] ?? []).value])
     }
-    for row in rows {
+    for row in rows where !registrations.elements.isEmpty {
         let started = dateParse(row.started.description)
         let registered = registrations.elements.first { item in
             item.pid === row.pid && item.pidDomain === "darwin" && started.isFinite &&

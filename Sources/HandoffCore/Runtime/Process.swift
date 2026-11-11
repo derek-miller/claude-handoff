@@ -52,6 +52,8 @@ public final class ChildProcess {
         p.standardInput = options.input == nil ? FileHandleNull.devNull : inp
         var outData = Data(), errData = Data()
         let group = DispatchGroup()
+        let exited = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in exited.signal() }
         do { try p.run() } catch {
             let code = (error as NSError).code == 4 ? ENOENT : EACCES
             return SpawnResult(status: nil, error: fsError(Int32(code), "spawnSync \(file)", file))
@@ -66,9 +68,7 @@ public final class ChildProcess {
         }
         var timedOut = false
         if let timeout = options.timeout, timeout > 0 {
-            let deadline = Date().addingTimeInterval(timeout / 1000)
-            while p.isRunning && Date() < deadline { usleep(5000) }
-            if p.isRunning { timedOut = true; p.terminate() }
+            if exited.wait(timeout: .now() + timeout / 1000) == .timedOut, p.isRunning { timedOut = true; p.terminate() }
         }
         p.waitUntilExit()
         group.wait()
