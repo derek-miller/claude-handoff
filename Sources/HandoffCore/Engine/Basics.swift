@@ -29,7 +29,6 @@ claude-handoff   move Claude Code history between accounts
 
 // MARK: - File-private helpers
 
-// max and min that return NaN when any argument is NaN.
 fileprivate func nanMax(_ xs: Double...) -> Double {
     if xs.contains(where: { $0.isNaN }) { return .nan }
     return xs.max() ?? -.infinity
@@ -38,11 +37,8 @@ fileprivate func nanMin(_ xs: Double...) -> Double {
     if xs.contains(where: { $0.isNaN }) { return .nan }
     return xs.min() ?? .infinity
 }
-// Rounds half up; infinities and NaN pass through.
 fileprivate func roundHalfUp(_ x: Double) -> Double { x.isFinite ? (x + 0.5).rounded(.down) : x }
-// The length, or undefined when v is null or undefined.
 fileprivate func optLength(_ v: Value) -> Value { v.nullish ? .undefined : v["length"] }
-// The lowercased string, or undefined when v is null or undefined.
 fileprivate func lowerOpt(_ v: Value) -> Value { v.nullish ? .undefined : .string(v.description.lowercased()) }
 fileprivate func arg(_ args: [Value], _ i: Int) -> Value { i < args.count ? args[i] : .undefined }
 

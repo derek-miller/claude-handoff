@@ -16,7 +16,6 @@ fileprivate func isDirectoryStat(_ st: Value) throws -> Bool { try st["isDirecto
 fileprivate func isFileStat(_ st: Value) throws -> Bool { try st["isFile"].call().truthy }
 fileprivate func isSymlinkStat(_ st: Value) throws -> Bool { try st["isSymbolicLink"].call().truthy }
 
-// The largest number, or NaN if any is NaN.
 fileprivate func nanMax(_ xs: [Double]) -> Double {
     var out = -Double.infinity
     for x in xs {
@@ -26,10 +25,9 @@ fileprivate func nanMax(_ xs: [Double]) -> Double {
     return out
 }
 
-// Rounds half up; infinities and NaN pass through.
 fileprivate func roundHalfUp(_ x: Double) -> Double { x.isFinite ? (x + 0.5).rounded(.down) : x }
 
-// Drops trailing whitespace.
+// Drops trailing whitespace and newlines, and U+FEFF.
 fileprivate func trimEnd(_ s: String) -> String {
     var scalars = Array(s.unicodeScalars)
     while let last = scalars.last, CharacterSet.whitespacesAndNewlines.contains(last) || last == "\u{FEFF}" { scalars.removeLast() }
@@ -732,7 +730,7 @@ func desktopProfiles(_ dir: Value = .undefined) throws -> Value {
             }
             return
         }
-        // for…in skips array holes, which readV8 leaves as undefined (visit ignores those anyway).
+        // Array holes come back from readV8 as undefined, which visit ignores.
         for k in v.ownKeys { try visit(v[k], depth + 1) }
     }
     func files(_ d: String) -> [String] {

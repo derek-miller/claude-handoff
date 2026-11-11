@@ -35,7 +35,6 @@ fileprivate func lines(_ raw: String) -> [Substring] {
     raw.utf8.split(separator: 10, omittingEmptySubsequences: false).map { Substring($0) }
 }
 
-// Groups values by key, in first-seen key order.
 fileprivate func groupBy(_ xs: [Value], _ key: (Value) throws -> Value) rethrows -> ValueMap {
     let map = ValueMap()
     for x in xs {
@@ -600,7 +599,6 @@ func eventAgrees(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Val
     Value(a["uuid"] === b["uuid"] && a["type"] === b["type"] && a["role"] === b["role"] && a["hash"] === b["hash"])
 }
 func agentName(_ value: Value = .undefined) throws -> Value {
-    // ICU's `$` also matches before a final newline; \z matches only at the very end.
     Value(value.asString.map { re(#"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\z"#).test($0) } ?? false)
 }
 func statIdentity(_ detail: Value = .undefined) throws -> Value {

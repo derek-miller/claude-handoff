@@ -2,14 +2,12 @@ import Foundation
 
 // Transfers, record transfers, finishing pending work, Keep local and the move itself.
 
-// Calls f unless it is null or undefined.
 @discardableResult
 fileprivate func optCall(_ f: Value, _ args: Value...) throws -> Value {
     if f.nullish { return .undefined }
     return try f.callArgs(args)
 }
 
-// Rounds half up.
 fileprivate func roundHalfUp(_ x: Double) -> Double { (x + 0.5).rounded(.down) }
 
 func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {

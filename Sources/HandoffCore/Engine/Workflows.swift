@@ -3,23 +3,20 @@ import Foundation
 
 // The move, finish, sweep and Undo workflows, account selection, the interactive picker and the progress reporter.
 
-// Calls f when it is a function, otherwise returns undefined.
 fileprivate func optCall(_ f: Value, _ args: Value...) throws -> Value {
     f.isFunction ? try f.callArgs(args) : .undefined
 }
 
-// The body's result, or null if it throws.
 fileprivate func orNull(_ body: () throws -> Value) -> Value {
     do { return try body() } catch { return .null }
 }
 
-// Number.isInteger
 fileprivate func isInteger(_ v: Value) -> Bool {
     guard case .number(let d) = v else { return false }
     return d.isFinite && d == d.rounded(.towardZero)
 }
 
-// process.stdout.isTTY (the Host table has no stdout TTY probe).
+// The Host table has no stdout TTY probe, so this asks the terminal directly.
 fileprivate func stdoutIsTTY() -> Bool { isatty(1) != 0 }
 
 // The files of a row's members, or the row's own file when it has none.
@@ -608,7 +605,7 @@ public func step(_ state: Value = .undefined, _ key: Value = .undefined) throws 
     return state
 }
 
-// Key decoding for the picker: the subset of readline's emitKeypressEvents names the picker reacts to.
+// Decodes terminal input bytes into the key names the picker reacts to.
 fileprivate struct PickKey { var name: String?; var ctrl = false }
 
 fileprivate func decodeKeys(_ bytes: [UInt8]) -> [PickKey] {
@@ -646,7 +643,7 @@ fileprivate func decodeKeys(_ bytes: [UInt8]) -> [PickKey] {
                 i = min(j + 1, bytes.count)
                 continue
             }
-            // Meta + key: readline reports the key's own name.
+            // Escape followed by a key reports that key.
             keys.append(next == 0x1B ? PickKey(name: "escape") : single(next))
             i += 2
             continue

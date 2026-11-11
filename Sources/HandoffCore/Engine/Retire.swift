@@ -2,7 +2,6 @@ import Foundation
 
 // Retirement into quarantine, Remote Control archival, cloud attempt bookkeeping and Undo of remote archives.
 
-// Groups items by key, in first-seen key order.
 fileprivate func groupBy(_ items: [Value], _ key: (Value) throws -> Value) rethrows -> [[Value]] {
     let index = ValueMap()
     var groups: [[Value]] = []
@@ -16,7 +15,6 @@ fileprivate func groupBy(_ items: [Value], _ key: (Value) throws -> Value) rethr
     return groups
 }
 
-// The work's result, or null if it throws.
 fileprivate func orNull(_ work: () throws -> Value) -> Value {
     do { return try work() } catch { return .null }
 }

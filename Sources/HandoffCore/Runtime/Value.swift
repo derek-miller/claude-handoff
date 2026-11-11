@@ -282,7 +282,7 @@ extension Value {
         }
     }
 
-    // MARK: Property access (missing keys and non-objects yield undefined, like `?.`).
+    // MARK: Property access (missing keys and non-objects yield undefined).
 
     public subscript(key: String) -> Value {
         get {
@@ -628,7 +628,6 @@ extension Value {
 // MARK: - Collection conveniences (Set, Map, Array)
 
 extension Value {
-    // Set or map membership.
     public func has(_ v: Value) -> Bool {
         switch self {
         case .set(let s): return s.has(v)
@@ -637,14 +636,10 @@ extension Value {
         }
     }
     public func has(_ s: String) -> Bool { has(.string(s)) }
-    // Adds to a set.
     @discardableResult public func add(_ v: Value) -> Value { asSet?.add(v); return self }
-    // Reads a map entry.
     public func get(_ k: Value) -> Value { asMap?.get(k) ?? .undefined }
     public func get(_ k: String) -> Value { get(.string(k)) }
-    // Writes a map entry.
     @discardableResult public func put(_ k: Value, _ v: Value) -> Value { asMap?.set(k, v); return self }
-    // Removes a set member or map entry.
     @discardableResult public func delete(_ k: Value) -> Bool {
         switch self {
         case .set(let s): return s.delete(k)
@@ -652,9 +647,8 @@ extension Value {
         default: return false
         }
     }
-    // Appends to an array.
     public func push(_ vs: Value...) { asArray?.items.append(contentsOf: vs) }
-    // Array membership or substring test.
+    // Array membership (NaN matches NaN) or substring test (the empty string is always contained).
     public func includes(_ v: Value) -> Bool {
         switch self {
         case .array(let a): return a.items.contains { $0 === v || ($0.asNumber?.isNaN == true && v.asNumber?.isNaN == true) }
@@ -662,6 +656,6 @@ extension Value {
         default: return false
         }
     }
-    // Joins array elements' string forms.
+    // Joins elements' string forms; null and undefined join as empty strings.
     public func join(_ sep: String = ",") -> String { elements.map { $0.nullish ? "" : $0.description }.joined(separator: sep) }
 }

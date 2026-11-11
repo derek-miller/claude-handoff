@@ -34,9 +34,7 @@ fileprivate func hashOf(_ v: Value) throws -> RunningHash { try unboxed(v, Runni
 
 fileprivate func str(_ v: Value) -> String { v.description }
 fileprivate func isFileStat(_ st: Value) throws -> Bool { try st["isFile"].call().truthy }
-// UTF-8 byte length of a value's string form.
 fileprivate func byteLength(_ v: Value) -> Double { Double(v.description.utf8.count) }
-// max and min that return NaN when either side is NaN.
 fileprivate func nanMax(_ a: Double, _ b: Double) -> Double { a.isNaN || b.isNaN ? .nan : Swift.max(a, b) }
 fileprivate func nanMin(_ a: Double, _ b: Double) -> Double { a.isNaN || b.isNaN ? .nan : Swift.min(a, b) }
 // A byte range: negative indices count from the end, and both ends are clamped.
@@ -52,7 +50,6 @@ fileprivate func subarray(_ data: Data, _ start: Double, _ end: Double? = nil) -
     let base = data.startIndex
     return Data(data[(base + s)..<(base + e)])
 }
-// These patterns must match only at the end of input; ICU's `$` also matches before a final newline, so they use \z.
 fileprivate let DIGITS = re(#"^[0-9]+\z"#)
 fileprivate let SIGNED = re(#"^-?[0-9]+\z"#)
 fileprivate let HEX64 = re(#"^[a-f0-9]{64}\z"#)
@@ -63,7 +60,6 @@ fileprivate func strictJoin(_ parts: [Value]) throws -> String {
     }
     return path.join(parts.map { $0.description })
 }
-// Groups items by key into a map of arrays.
 fileprivate func groupBy(_ items: [Value], _ key: (Value) throws -> Value) rethrows -> ValueMap {
     let groups = ValueMap()
     for item in items {

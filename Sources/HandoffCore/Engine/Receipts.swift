@@ -7,19 +7,17 @@ import Foundation
 
 fileprivate func arg(_ a: [Value], _ i: Int) -> Value { i < a.count ? a[i] : .undefined }
 
-// Calls f unless it is null or undefined.
 @discardableResult
 fileprivate func optCall(_ f: Value, _ args: Value...) throws -> Value {
     if f.nullish { return .undefined }
     return try f.callArgs(args)
 }
 
-// The body's result, or null if it throws.
 fileprivate func catchNull(_ f: () throws -> Value) -> Value {
     do { return try f() } catch { return .null }
 }
 
-// flatMap that flattens array results one level.
+// Array results are flattened one level; other results are kept as they are.
 fileprivate func flatMapValues(_ xs: [Value], _ f: (Value) throws -> Value) rethrows -> [Value] {
     var out: [Value] = []
     for x in xs {
@@ -29,7 +27,7 @@ fileprivate func flatMapValues(_ xs: [Value], _ f: (Value) throws -> Value) reth
     return out
 }
 
-// ToIntegerOrInfinity for slice/splice arguments.
+// A slice or splice index: undefined and NaN are 0, fractions truncate, and huge values clamp.
 fileprivate func toInteger(_ v: Value) -> Int {
     let d = v.isUndefined ? 0 : toNumber(v)
     if d.isNaN { return 0 }
