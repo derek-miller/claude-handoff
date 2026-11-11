@@ -959,9 +959,7 @@ func carries(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
     guard let x = a["sidecar"]["set"].asSet, let y = b["sidecar"]["set"].asSet else { throw EngineError.type("a.sidecar.set.isSubsetOf is not a function") }
     return Value(x.isSubset(of: y))
 }
-func desktopRecordOf(_ row: Value = .undefined) throws -> Value {
-    row["session"]["record"] ?? row["record"] ?? Value.newObject()
-}
+func desktopRecordOf(_ row: Value = .undefined) throws -> Value { MoveSource(row).desktopRecord.raw }
 func canShareRecord(_ a: Value = .undefined, _ b: Value = .undefined, _ requiredParents: Value = .undefined) throws -> Value {
     let first = try desktopRecordOf(a), second = try desktopRecordOf(b)
     if a["taskFamily"].truthy || b["taskFamily"].truthy {
@@ -982,9 +980,7 @@ func progress(_ report: Value = .undefined, _ stage: Value = .undefined, _ compl
     let extra = extra.isUndefined ? Value.newObject() : extra
     return try report.call(stage, Value("\(completed)/\(total)"), Value.spread(["live": true, "completed": completed, "total": total], extra))
 }
-func desktopFileOf(_ row: Value = .undefined) throws -> Value {
-    row.isString ? row : row["session"]["file"] ?? row["file"]
-}
+func desktopFileOf(_ row: Value = .undefined) throws -> Value { row.isString ? row : MoveSource(row).desktopFile }
 func taskLinks(_ record: Value = .undefined) throws -> Value {
     [record["sessionId"], record["cliSessionId"], record["scheduledTaskId"] ?? .null, record["notifySessionId"] ?? .null,
      record["forkedFromSessionId"] ?? .null, record["cwd"] ?? .null, record["originCwd"] ?? .null]

@@ -396,7 +396,8 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
     try check()
     let requestedAt = options["requestedAt"] ?? .string(isoNow())
     let cloudRequested = options["cloudRequested"] === true || options["cloud"].truthy
-    let workTotal = from.elements.reduce(0) { $0 + $1["sessions"].length } + to["sessions"].length
+    let sources = from.elements.map(Account.init), target = Account(to)
+    let workTotal = sources.reduce(0) { $0 + $1.sessions.count } + target.sessions.count
     var completed = 0
     try progress(report, "scan", Value(completed), Value(workTotal))
     let cache = try openAnalysisCache(paths, Value(options["writeCache"] === true))
@@ -404,8 +405,9 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
     let ctx: Value = ["index": ctxIndex, "scans": .newMap(), "workers": try workers(options["processes"]), "cache": cache]
     try check()
     let soleRecord = { (s: Value) throws -> Bool in
-        guard s["shared"] === false && !s["record"]["forkedFromSessionId"].truthy else { return false }
-        for id in try priorSessions(s["record"]).elements where id !== s["id"] && ctx["index"].has(id) { return false }
+        let record = MoveSource(s).desktopRecord
+        guard s["shared"] === false && !record.raw["forkedFromSessionId"].truthy else { return false }
+        for id in try priorSessions(record.raw).elements where id !== s["id"] && ctx["index"].has(id) { return false }
         return true
     }
     let analyzed = ValueMap()
@@ -414,35 +416,38 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
     let rejected = Value.newArray()
     let found = Value.newArray()
     var total = 0
-    for account in from.elements {
-        total += account["unreadable"].nullish ? 0 : account["unreadable"].length
-        for file in account["unreadable"].elements { unreadable.push(["file": file, "account": account]) }
-        for s in account["sessions"].elements {
+    for source in sources {
+        let account = source.raw
+        total += source.unreadable.count
+        for file in source.unreadable { unreadable.push(["file": file, "account": account]) }
+        for session in source.sessions {
+            let s = session.raw
             try check()
             total += 1
             let scan = { () throws in
-                if !s["id"].truthy { missing.push(s); return }
-                let transcript = try locate(ctx["index"], s["id"], s["cwd"])
+                guard let id = session.id else { missing.push(s); return }
+                let transcript = try locate(ctx["index"], Value(id), session.cwd)
                 if !transcript.truthy { missing.push(s); return }
                 do {
                     var detail = analyzed.get(transcript)
                     if !detail.truthy {
                         var historyDetail: Value
-                        do { historyDetail = try history(s["id"], transcript, ctx, s["cwd"]) } catch {
+                        do { historyDetail = try history(Value(id), transcript, ctx, session.cwd) } catch {
                             if !(try soleRecord(s)) { throw error }
                             historyDetail = .undefined
                         }
                         let base: Value = try historyDetail ?? Value.spread(["roots": .newSet(), "events": .newMap(), "conversation": []], scanLineage(ctx, transcript))
                         let transcriptFingerprint = try fingerprint(transcript, cache)
-                        let sidecar = try sidecars(transcript, s["id"], cache)
+                        let sidecar = try sidecars(transcript, Value(id), cache)
                         detail = Value.spread(base, ["transcriptFingerprint": transcriptFingerprint, "sidecar": sidecar])
                         analyzed.set(transcript, detail)
                     }
                     if detail["contentSha"].truthy && !detail["roots"]["size"].truthy && !detail["invalid"].truthy { missing.push(s); return }
-                    let taskOwned = Value(Account(account).taskRegistry.notifies(s["record"]["sessionId"]))
-                    let worker = try ownsWorker(ctx["workers"], s["id"], s["record"]["sessionId"])
-                    let recordSha = Value(sha(try readFile(s["file"])))
-                    let semantic = try recordSemantic(s["record"])
+                    let recordId = session.record.raw["sessionId"]
+                    let taskOwned = Value(source.taskRegistry.notifies(recordId))
+                    let worker = try ownsWorker(ctx["workers"], Value(id), recordId)
+                    let recordSha = Value(sha(try readFile(Value(session.file))))
+                    let semantic = try recordSemantic(session.record.raw)
                     let source = Value.spread(s, ["account": account, "transcript": transcript], detail,
                                               ["taskOwned": taskOwned, "worker": worker, "recordSha": recordSha, "recordSemantic": semantic])
                     if try validDesktopRecord(source).truthy {
@@ -464,28 +469,30 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
             try check()
         }
     }
-    for file in to["unreadable"].elements { unreadable.push(["file": file, "account": to, "target": true]) }
+    for file in target.unreadable { unreadable.push(["file": file, "account": to, "target": true]) }
     let families = try taskFamilies(from, to, found)
     for family in families.elements {
         let busy = try schedulerBusy(paths, [family["from"], family["to"]], ctx["workers"]["rows"])
-        for row in found.elements where row["taskFamily"] === family { row["schedulerBusy"] = busy }
+        for row in found.elements.map(MoveSource.init) where row.taskFamily === family { row.schedulerBusy = busy }
     }
     let targets = Value.newArray()
-    for s in to["sessions"].elements {
+    for session in target.sessions {
+        let s = session.raw
         try check()
         let scan = { () throws in
-            if !s["id"].truthy { return }
-            let transcript = try locate(ctx["index"], s["id"], s["cwd"])
+            guard let id = session.id else { return }
+            let transcript = try locate(ctx["index"], Value(id), session.cwd)
             do {
-                let detail: Value = transcript.truthy ? try history(s["id"], transcript, ctx, s["cwd"]) : .null
+                let detail: Value = transcript.truthy ? try history(Value(id), transcript, ctx, session.cwd) : .null
                 if detail["roots"]["size"].truthy {
-                    let head: Value = ["record": s["record"]["sessionId"], "id": s["id"]]
-                    let taskOwned = Value(Account(to).taskRegistry.notifies(s["record"]["sessionId"]))
-                    let worker = try ownsWorker(ctx["workers"], s["id"], s["record"]["sessionId"])
+                    let recordId = session.record.raw["sessionId"]
+                    let head: Value = ["record": recordId, "id": Value(id)]
+                    let taskOwned = Value(target.taskRegistry.notifies(recordId))
+                    let worker = try ownsWorker(ctx["workers"], Value(id), recordId)
                     let transcriptFingerprint = try fingerprint(transcript, cache)
-                    let sidecar = try sidecars(transcript, s["id"], cache)
-                    let recordSha = Value(sha(try readFile(s["file"])))
-                    let semantic = try recordSemantic(s["record"])
+                    let sidecar = try sidecars(transcript, Value(id), cache)
+                    let recordSha = Value(sha(try readFile(Value(session.file))))
+                    let semantic = try recordSemantic(session.record.raw)
                     let target = Value.spread(head, detail, [
                         "session": s, "account": to, "taskOwned": taskOwned, "worker": worker, "transcript": transcript,
                         "transcriptFingerprint": transcriptFingerprint, "sidecar": sidecar, "recordSha": recordSha, "recordSemantic": semantic,
@@ -493,10 +500,10 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
                     if try validDesktopRecord(target).truthy {
                         _ = try retainedHistories(target, ctx, options, options["cloud"].truthy ? [options["cloud"]] : from, Value(cloudRequested))
                         targets.push(target)
-                    } else { rejected.push(["id": s["id"], "title": s["title"], "account": to, "target": true, "error": "Desktop record identity is invalid"]) }
+                    } else { rejected.push(["id": Value(id), "title": session.title, "account": to, "target": true, "error": "Desktop record identity is invalid"]) }
                 }
             } catch {
-                rejected.push(["id": s["id"], "title": s["title"], "account": to, "target": true, "error": errorObject(error)["message"]])
+                rejected.push(["id": Value(id), "title": session.title, "account": to, "target": true, "error": errorObject(error)["message"]])
             }
         }
         do { try scan() } catch {

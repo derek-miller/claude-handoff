@@ -114,3 +114,54 @@ struct TaskRegistry {
     func state(_ key: String) -> Value { data[key] ?? Value.newObject() }
     func notifies(_ recordId: Value) -> Bool { raw.has(recordId) }
 }
+
+// A row that belongs to a Desktop record: a session, an inventory source (which carries the session's fields) or an
+// inventory target (which nests the session and keeps only the record's id in `record`).
+protocol RecordHolder {
+    var raw: Value { get }
+}
+
+extension RecordHolder {
+    var desktopRecord: DesktopRecord { DesktopRecord(raw["session"]["record"] ?? raw["record"] ?? Value.newObject()) }
+    var desktopFile: Value { raw["session"]["file"] ?? raw["file"] }
+}
+
+extension DesktopSession: RecordHolder {}
+
+// A source session in an inventory: the DesktopSession's fields merged with its account, transcript and history
+// analysis, plus the fields planning adds. Copies of one history are grouped as one row listing them in `members`.
+struct MoveSource: RecordHolder {
+    let raw: Value
+    init(_ raw: Value) { self.raw = raw }
+    var id: Value { raw["id"] }
+    var file: Value { raw["file"] }
+    var account: Account { Account(raw["account"]) }
+    var transcript: Value { raw["transcript"] }
+    var sidecar: Value { raw["sidecar"] }
+    var roots: Value { raw["roots"] }
+    var isInvalid: Bool { raw["invalid"].truthy }
+    // Every copy in this row's group, or the row alone when it is not grouped.
+    var members: [MoveSource] { (raw["members"].nullish ? [raw] : raw["members"].elements).map(MoveSource.init) }
+    var taskFamily: Value {
+        get { raw["taskFamily"] }
+        nonmutating set { raw["taskFamily"] = newValue }
+    }
+    var schedulerBusy: Value {
+        get { raw["schedulerBusy"] }
+        nonmutating set { raw["schedulerBusy"] = newValue }
+    }
+    var cloudTargetId: Value {
+        get { raw["cloudTargetId"] }
+        nonmutating set { raw["cloudTargetId"] = newValue }
+    }
+}
+
+// A destination session that already holds history: its DesktopSession in `session`, its record id in `record`.
+struct MoveTarget: RecordHolder {
+    let raw: Value
+    init(_ raw: Value) { self.raw = raw }
+    var id: Value { raw["id"] }
+    var recordId: Value { raw["record"] }
+    var session: DesktopSession { DesktopSession(raw["session"]) }
+    var account: Account { Account(raw["account"]) }
+}
