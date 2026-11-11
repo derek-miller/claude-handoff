@@ -197,8 +197,8 @@ func emptyCache() throws -> Value {
     ["version": Value(CACHE_VERSION), "semanticVersion": Value(SEMANTIC_VERSION), "histories": .newObject(), "manifests": .newObject(), "remote": .newObject()]
 }
 
-func openAnalysisCache(_ paths: Value = .undefined, _ writable: Value = .undefined) throws -> Value {
-    let file = Value(path.join(paths["state"].description, "cache.json"))
+func openAnalysisCache(_ paths: DataLayout, _ writable: Value = .undefined) throws -> Value {
+    let file = Value(path.join(paths.state, "cache.json"))
     let stored = (try? readJson(file)) ?? .null
     let valid = stored["version"] === Value(CACHE_VERSION) && stored["semanticVersion"] === Value(SEMANTIC_VERSION) &&
         ["histories", "manifests", "remote"].allSatisfy { stored[$0].truthy && stored[$0].isObjectLike && !stored[$0].isArray }
@@ -289,9 +289,9 @@ func quarantine(_ items: Value = .undefined, _ dest: Value = .undefined, _ befor
 }
 
 // Holds an exclusive flock(2) on state/lock for the duration of `work`, the same lock `/usr/bin/lockf` takes.
-func locked(_ paths: Value = .undefined, _ work: Value = .undefined) throws -> Value {
-    try fs.mkdirp(paths["state"].description)
-    let lockFile = path.join(paths["state"].description, "lock")
+func locked(_ paths: DataLayout, _ work: Value = .undefined) throws -> Value {
+    try fs.mkdirp(paths.state)
+    let lockFile = path.join(paths.state, "lock")
     let handle: FileHandle
     do { handle = try fs.open(lockFile, O_WRONLY | O_CREAT | O_APPEND, 0o666) } catch {
         throw makeError("lock helper failed, exit 73", code: "LOCK_FAILED")
@@ -424,8 +424,8 @@ func taskRegistrationKind(_ family: Value = .undefined, _ registry: Value = .und
     throw EngineError("scheduled task registrations changed")
 }
 
-func schedulerBusy(_ paths: Value = .undefined, _ namespaces: Value = .undefined, _ table: Value = .undefined) throws -> Value {
-    let table = table.isUndefined ? try processTable(paths["claudeApp"]) : table
+func schedulerBusy(_ paths: DataLayout, _ namespaces: Value = .undefined, _ table: Value = .undefined) throws -> Value {
+    let table = table.isUndefined ? try processTable(Value(paths.claudeApp)) : table
     if !table.elements.contains(where: { desktopExecutable($0["executable"]).truthy }) { return false }
     let current = try signedIn(paths, table)
     if current["state"] !== "known" { return true }
@@ -743,7 +743,7 @@ func desktopProfiles(_ dir: Value = .undefined) throws -> Value {
     return ["emails": emails, "orgs": orgs]
 }
 
-func logins(_ paths: Value = .undefined) throws -> Value {
+func logins(_ paths: DataLayout) throws -> Value {
     let emails = Value.newMap()
     let orgs = Value.newMap()
     let pairs = Value.newMap()
@@ -758,17 +758,17 @@ func logins(_ paths: Value = .undefined) throws -> Value {
             pairs.put(Value("\(a["accountUuid"])/\(a["organizationUuid"])"), ["account": a["accountUuid"], "org": a["organizationUuid"]])
         }
     }
-    let home = paths["home"].description
+    let home = paths.home
     for e in (try? fs.readdir(home)) ?? [] where e.name.hasPrefix(".claude") {
         try take(e.isDirectory ? path.join(home, e.name, ".claude.json") : path.join(home, e.name))
     }
-    let switchAccounts = paths["switchAccounts"].description
+    let switchAccounts = paths.switchAccounts
     for e in (try? fs.readdir(switchAccounts)) ?? [] where e.isDirectory { try take(path.join(switchAccounts, e.name, ".claude.json")) }
-    for f in (try? fs.names(paths["backups"].description)) ?? [] where f.hasPrefix(".claude.json.backup") { try take(path.join(paths["backups"].description, f)) }
-    try take(paths["login"].description)
+    for f in (try? fs.names(paths.backups)) ?? [] where f.hasPrefix(".claude.json.backup") { try take(path.join(paths.backups, f)) }
+    try take(paths.login)
     // Desktop only caches the signed-in account, so remember every one seen for later runs.
-    let remembered = (try? readJson(paths["labels"])) ?? Value.newObject()
-    let seen = try desktopProfiles(paths["webCache"])
+    let remembered = (try? readJson(Value(paths.labels))) ?? Value.newObject()
+    let seen = try desktopProfiles(Value(paths.webCache))
     let rememberedEmails = try member(remembered, "emails"), rememberedOrgs = remembered["orgs"]
     // Live login files and Desktop's profile override what earlier runs remembered.
     let entries = { (map: Value) in Value.fromEntries(map.asMap!.entries.map { ($0.0.description, $0.1) }) }
@@ -779,7 +779,7 @@ func logins(_ paths: Value = .undefined) throws -> Value {
     let previous: Value = ["emails": rememberedEmails ?? Value.newObject(), "orgs": rememberedOrgs ?? Value.newObject()]
     for (account, email) in saved["emails"].ownEntries where UUID.test(account) { emails.put(Value(account), email) }
     for (org, name) in saved["orgs"].ownEntries where UUID.test(org) { orgs.put(Value(org), name) }
-    for row in try records(paths["agentSessions"]).elements {
+    for row in try records(Value(paths.agentSessions)).elements {
         let account = row["account"], org = row["org"]
         if UUID.test(account.description) && UUID.test(org.description) { pairs.put(Value("\(account)/\(org)"), ["account": account, "org": org]) }
         for file in row["files"].elements {
@@ -793,7 +793,7 @@ func logins(_ paths: Value = .undefined) throws -> Value {
     guard let receiptList = receiptFiles.asArray else { throw EngineError.type("receipts(...).reverse is not a function") }
     receiptList.items.reverse()
     for file in receiptList.items {
-        guard let handle = try? fs.open(path.join(paths["state"].description, file.description), "r") else { continue }
+        guard let handle = try? fs.open(path.join(paths.state, file.description), "r") else { continue }
         var head = ""
         do {
             let data = try handle.read(length: 16 * 1024, position: 0)
@@ -804,7 +804,7 @@ func logins(_ paths: Value = .undefined) throws -> Value {
             let account = m[1] ?? "", org = m[2] ?? "", raw = m[3] ?? ""
             if !UUID.test(account) || !UUID.test(org) { continue }
             let isDir: Bool
-            do { isDir = try fs.stat(path.join(paths["records"].description, account, org)).isDirectory } catch { isDir = false }
+            do { isDir = try fs.stat(path.join(paths.records, account, org)).isDirectory } catch { isDir = false }
             if !isDir { continue }
             pairs.put(Value("\(account)/\(org)"), ["account": Value(account), "org": Value(org)])
             let parts = try JSON.parse("\"\(raw)\"").description.components(separatedBy: " · ")
@@ -819,7 +819,7 @@ func logins(_ paths: Value = .undefined) throws -> Value {
         for (key, label) in learned.asMap!.entries where UUID.test(key.description) && !kept.has(key.description) { kept[key.description] = label }
     }
     if JSON.text(saved) != JSON.text(previous) {
-        let labels = paths["labels"].description
+        let labels = paths.labels
         let tmp = "\(labels).\(process.pid).tmp"
         do {
             try fs.write(tmp, JSON.text(saved, space: 2) + "\n")
@@ -848,20 +848,21 @@ func mode(_ values: Value = .undefined) throws -> Value {
 
 // MARK: - Desktop identity
 
-func desktopLaunch(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value {
-    let app = path.join(paths["claudeApp"].description, "Contents/MacOS/Claude")
+func desktopLaunch(_ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
+    let app = path.join(paths.claudeApp, "Contents/MacOS/Claude")
     let apps = table.elements.filter { desktopExecutable($0["executable"]).truthy || $0["executable"] === Value(app) }
     let started = apps.count == 1 ? dateParse(apps[0]["started"].description) : .nan
     return started.isFinite && started <= dateNow() ? ["pid": apps[0]["pid"], "started": Value(started)] : .null
 }
 
-public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value {
+public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value { try idleTimeouts(DataLayout(paths), table) }
+func idleTimeouts(_ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
     let launch = try desktopLaunch(paths, table), result = Value.newMap()
     if !launch.truthy { return result }
     var handle: FileHandle?
     defer { try? handle?.close() }
     do {
-        handle = try fs.open(path.join(paths["logs"].description, "main.log"), O_RDONLY | O_NOFOLLOW, 0o666)
+        handle = try fs.open(path.join(paths.logs, "main.log"), O_RDONLY | O_NOFOLLOW, 0o666)
         let before = try handle!.stat()
         if !before.isFile { return result }
         let total = Int(before.size)
@@ -888,7 +889,8 @@ public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefine
     return result
 }
 
-public func signedIn(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value {
+public func signedIn(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value { try signedIn(DataLayout(paths), table) }
+func signedIn(_ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
     func unknown(_ state: String = "unknown", _ time: Double? = nil) -> Value {
         ["account": .null, "org": .null, "state": Value(state), "source": time == nil ? "unknown" : "log", "at": time.map { Value(isoString($0)) } ?? .null]
     }
@@ -899,13 +901,13 @@ public func signedIn(_ paths: Value = .undefined, _ table: Value = .undefined) t
             env["LC_ALL"] = "C"
             let result = childProcess.spawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,comm="], SpawnOptions(timeout: 2000, env: env))
             if result.error != nil || result.status != 0 { return unknown() }
-            table = try parseProcesses(Value(result.stdout), "", paths["claudeApp"])
+            table = try parseProcesses(Value(result.stdout), "", Value(paths.claudeApp))
         }
         let launch = try desktopLaunch(paths, table)
         if !launch.truthy { return unknown() }
         let started = launch["started"].asNumber!
-        let desktop = (try? readJson(paths["desktop"])) ?? Value.newObject()
-        let logs = paths["logs"].description
+        let desktop = (try? readJson(Value(paths.desktop))) ?? Value.newObject()
+        let logs = paths.logs
         let logNames: [Value] = try fs.names(logs).filter { re(#"^main(?:[1-9][0-9]*)?\.log$"#).test($0) }.map { Value($0) }
         let files = stableSorted(logNames) { a, b in
             toNumber(Value(sliceString(a.description, 4, -4))) - toNumber(Value(sliceString(b.description, 4, -4)))
@@ -968,8 +970,8 @@ func binaryMatch(_ file: Value = .undefined, _ pattern: Value = .undefined) thro
     return found.map { Value($0) } ?? .null
 }
 
-func desktopUserAgent(_ paths: Value = .undefined) throws -> Value {
-    let app = paths["claudeApp"].description
+func desktopUserAgent(_ paths: DataLayout) throws -> Value {
+    let app = paths.claudeApp
     let appInfo = path.join(app, "Contents/Info.plist")
     let framework = path.join(app, "Contents/Frameworks/Electron Framework.framework/Versions/A")
     let claude = try plistValue(Value(appInfo), "CFBundleShortVersionString")
@@ -989,9 +991,9 @@ func decryptCookie(_ host: Value = .undefined, _ encrypted: Value = .undefined, 
     return Value(String(decoding: plain.dropFirst(digest.count), as: UTF8.self))
 }
 
-func desktopCookies(_ paths: Value = .undefined) throws -> Value {
+func desktopCookies(_ paths: DataLayout) throws -> Value {
     let options = SpawnOptions(timeout: 10_000)
-    let cookies = paths["cookies"].description
+    let cookies = paths.cookies
     let versionResult = childProcess.spawnSync("/usr/bin/sqlite3", ["-readonly", cookies, "SELECT value FROM meta WHERE key='version';"], options)
     let rowsResult = childProcess.spawnSync("/usr/bin/sqlite3", ["-readonly", "-separator", "\t", cookies,
         "SELECT host_key,name,hex(CAST(value AS BLOB)),hex(encrypted_value) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') ORDER BY length(path) DESC,creation_utc;"], options)
@@ -1078,7 +1080,8 @@ fileprivate func nativeCloudFetch(_ request: Value) throws -> Value {
     return ["status": Value(http.statusCode), "ok": Value((200...299).contains(http.statusCode)), "headers": headers, "body": Value(box.data ?? Data())]
 }
 
-public func cloudClient(_ paths: Value = .undefined, _ expected: Value = .undefined, _ io: Value = .undefined) throws -> Value {
+public func cloudClient(_ paths: Value = .undefined, _ expected: Value = .undefined, _ io: Value = .undefined) throws -> Value { try cloudClient(DataLayout(paths), expected, io) }
+func cloudClient(_ paths: DataLayout, _ expected: Value = .undefined, _ io: Value = .undefined) throws -> Value {
     let expected = expected.isUndefined ? Value.null : expected
     let io = io.isUndefined ? Value.newObject() : io
     let memory = try io["memory"] ?? operationMemory()
@@ -1205,15 +1208,16 @@ func desktopSession(_ file: Value = .undefined, _ record: Value = .undefined) th
     ]
 }
 
-public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefined) throws -> Value {
+public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefined) throws -> Value { try accounts(DataLayout(paths), processes) }
+func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Value {
     let processes = processes.isUndefined ? Value.null : processes
     let found = try logins(paths)
     let emails = found["emails"], orgs = found["orgs"], pairs = found["pairs"]
     let cur = try signedIn(paths, processes)
     var out: [Value] = []
-    let stored = try records(paths["records"])
+    let stored = try records(Value(paths.records))
     let known: [Value] = try pairs.asMap!.values.filter { pair in try !stored.elements.contains { try sameAccount($0, pair).truthy } }.map { pair in
-        ["account": pair["account"], "org": pair["org"], "dir": Value(path.join(paths["records"].description, pair["account"].description, pair["org"].description)), "files": .newArray()]
+        ["account": pair["account"], "org": pair["org"], "dir": Value(path.join(paths.records, pair["account"].description, pair["org"].description)), "files": .newArray()]
     }
     for row in stored.elements + known {
         let account = row["account"], org = row["org"], dir = row["dir"]
@@ -1285,7 +1289,8 @@ func holdsNothing(_ dir: String) -> Bool {
     return true
 }
 
-public func leftovers(_ paths: Value = .undefined, _ all: Value = .undefined) throws -> Value {
+public func leftovers(_ paths: Value = .undefined, _ all: Value = .undefined) throws -> Value { try leftovers(DataLayout(paths), all) }
+func leftovers(_ paths: DataLayout, _ all: Value = .undefined) throws -> Value {
     let rows = all.elements
     let holders = Dictionary(grouping: rows, by: { $0["org"].description })
     var found: [Value] = []
@@ -1293,41 +1298,42 @@ public func leftovers(_ paths: Value = .undefined, _ all: Value = .undefined) th
         let account = row["account"].description, org = row["org"].description
         if row["active"].truthy || row["orgName"] !== "Personal" || row["sessions"].length > 0 || row["unreadable"].length > 0 { continue }
         if (holders[org]?.count ?? 0) < 2 || !rows.contains(where: { $0["account"] === row["account"] && $0["org"] !== row["org"] }) { continue }
-        if holdsNothing(path.join(paths["records"].description, account, org)) && holdsNothing(path.join(paths["agentSessions"].description, account, org)) { found.append(row) }
+        if holdsNothing(path.join(paths.records, account, org)) && holdsNothing(path.join(paths.agentSessions, account, org)) { found.append(row) }
     }
     return Value(found.filter { row in holders[row["org"].description]!.contains { other in !found.contains { $0 === other } } })
 }
 
 // Without a pair, sets aside the leftovers above; with one, sets aside that account/org if it holds nothing.
-public func tidy(_ paths: Value = .undefined, _ pair: Value = .null) throws -> Value {
+public func tidy(_ paths: Value = .undefined, _ pair: Value = .null) throws -> Value { try tidy(DataLayout(paths), pair) }
+func tidy(_ paths: DataLayout, _ pair: Value = .null) throws -> Value {
     let latest = try latestReceipt(paths)
     if latest.truthy {
         let unfinished = try latest.corrupt.truthy || needsRecovery(latest.receipt).truthy || deferredWorkflow(paths, latest).truthy
         if unfinished { throw EngineError("Finish or undo the last move before tidying", code: "MOVE_UNFINISHED") }
     }
     let all = try accounts(paths)
-    let dest = path.join(paths["state"].description, "leftovers", stamp())
+    let dest = path.join(paths.state, "leftovers", stamp())
     var rows = try leftovers(paths, all).elements
     if pair.truthy {
         guard let row = all.elements.first(where: { $0["account"] === pair["account"] && $0["org"] === pair["org"] }) else { throw EngineError("No such account", code: "NO_ACCOUNT") }
         if row["active"].truthy { throw EngineError("Claude is signed in to \(row["label"])", code: "ACCOUNT_ACTIVE") }
         if row["sessions"].length > 0 || row["unreadable"].length > 0 { throw EngineError("\(row["label"]) still holds sessions", code: "ACCOUNT_NOT_EMPTY") }
-        let dirs = [paths["records"], paths["agentSessions"]].map { path.join($0.description, row["account"].description, row["org"].description) }
+        let dirs = [Value(paths.records), Value(paths.agentSessions)].map { path.join($0.description, row["account"].description, row["org"].description) }
         if !dirs.allSatisfy(holdsNothing) { throw EngineError("\(row["label"]) still holds scheduled tasks or other files", code: "ACCOUNT_NOT_EMPTY") }
         rows = [row]
     }
-    let claude = path.dirname(paths["records"].description)
+    let claude = path.dirname(paths.records)
     // A session moved to another account keeps working in the scratch folder it started in.
     let working = all.elements.flatMap { row in row["sessions"].elements.flatMap { [$0["cwd"], $0["record"]["originCwd"]] } }
         .compactMap { $0.asString }.filter { !$0.isEmpty }
     var moved: [Value] = []
     for row in rows {
         let account = row["account"].description, org = row["org"].description
-        let dirs = [("claude-code-sessions", paths["records"]), ("local-agent-mode-sessions", paths["agentSessions"])].map { ($0.0, path.join($0.1.description, account, org)) }
+        let dirs = [("claude-code-sessions", Value(paths.records)), ("local-agent-mode-sessions", Value(paths.agentSessions))].map { ($0.0, path.join($0.1.description, account, org)) }
         if !dirs.allSatisfy({ holdsNothing($0.1) }) { continue }
         let scratch = path.join(claude, "scratch-workspaces", account, org)
         let scratchKept = working.contains { $0 == scratch || $0.hasPrefix(scratch + path.sep) } && fs.exists(scratch)
-        let caches = [("plugin-list", path.join(claude, "plugin-list", account, org)), ("skills-plugin", path.join(paths["agentSessions"].description, "skills-plugin", org, account))]
+        let caches = [("plugin-list", path.join(claude, "plugin-list", account, org)), ("skills-plugin", path.join(paths.agentSessions, "skills-plugin", org, account))]
         for (tree, dir) in dirs + caches + (scratchKept ? [] : [("scratch-workspaces", scratch)]) where fs.exists(dir) {
             let parent = path.basename(path.dirname(dir))
             try fs.mkdirp(path.join(dest, tree, parent))

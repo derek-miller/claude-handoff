@@ -26,17 +26,19 @@ fileprivate func memberFiles(_ row: Value) -> [Value] {
 }
 
 @discardableResult
-public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try executeMove(from, to, DataLayout(paths), options) }
+@discardableResult
+func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = Value.spread(options, ["cloudRequested": Value(options["cloudRequested"] === true || options["cloud"].truthy)])
     let report: Value = options["report"] ?? Value { _ in .undefined }
     let approving = !options["approve"].nullish
     return try locked(paths, Value { _ in
         let inspect: Value = Value { _ in
-            try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(paths["claudeApp"]))
+            try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(Value(paths.claudeApp)))
         }
         let kind: Value = options["recover"].truthy ? "recover" : options["undo"].truthy ? "undo" : from.truthy ? "move" : options["finish"].truthy ? "finish" : "refresh"
         let receiptFile: Value = (options["resume"].truthy ? options["resumeFile"] : options["receiptFile"]) ?? .null
-        let planFile = path.join(paths["state"].description, "restart-plan.json")
+        let planFile = path.join(paths.state, "restart-plan.json")
         let saved: Value = approving ? orNull { try readJson(Value(planFile)) } : .null
         if approving {
             var bad = !saved.truthy || saved["token"] !== options["approve"]
@@ -204,7 +206,7 @@ public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ 
                 ])
                 if regular["move"].length > 0 || regular["there"].length > 0 {
                     let at: Value = existing["receipt"]["at"] ?? Value(stamp())
-                    _ = existing["file"] ?? Value(path.join(paths["state"].description, "\(at).json"))
+                    _ = existing["file"] ?? Value(path.join(paths.state, "\(at).json"))
                     prepared = try transfer(regular, initial["target"], paths, prepareReport, ["existing": existing, "at": at, "sessionProgress": sessionProgress])
                     if prepared["recoveryRequired"].truthy || prepared["deferred"].truthy { return prepared }
                     if prepared["receipt"].truthy, try needsRecovery(prepared["receipt"]).truthy { return prepared }
@@ -279,12 +281,14 @@ public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ 
 }
 
 @discardableResult
-public func finishHeld(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func finishHeld(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try finishHeld(DataLayout(paths), options) }
+@discardableResult
+func finishHeld(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
     let latest = try latestReceipt(paths)
     if !latest.truthy || latest["corrupt"].truthy || !latest["receipt"]["held"]["length"].truthy { return ["nothing": true, "ok": true] }
     if options["background"].truthy {
-        let rows: Value = try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(paths["claudeApp"]))
+        let rows: Value = try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(Value(paths.claudeApp)))
         for held in latest["receipt"]["held"].elements {
             for row in rows.elements where row["worker"].truthy {
                 if try ownsWorker(.newSet(row["ids"].elements), held["id"], held["recordId"]).truthy { return ["pendingLocal": true, "ok": true] }
@@ -327,7 +331,9 @@ public func finishHeld(_ paths: Value = .undefined, _ options: Value = .undefine
 }
 
 @discardableResult
-public func completeActiveCloud(_ result: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func completeActiveCloud(_ result: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try completeActiveCloud(result, DataLayout(paths), options) }
+@discardableResult
+func completeActiveCloud(_ result: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
     if result["plan"].truthy || !result["file"].truthy || !result["receipt"].truthy || result["cloudChecked"].truthy || result["receipt"]["held"]["length"].truthy { return result }
     if try openCloudChecks(result["receipt"]).length == 0 || result["recoveryRequired"].truthy || result["restartOutcome"].truthy && !result["ok"].truthy { return result }
@@ -350,7 +356,9 @@ public func completeActiveCloud(_ result: Value = .undefined, _ paths: Value = .
 }
 
 @discardableResult
-public func finishWorkflow(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func finishWorkflow(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try finishWorkflow(DataLayout(paths), options) }
+@discardableResult
+func finishWorkflow(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
     let approving = !options["approve"].nullish
     if approving && (!options["approve"].isString || !re("^[a-f0-9]{64}$").test(options["approve"].asString!)) {
@@ -393,7 +401,7 @@ public func finishWorkflow(_ paths: Value = .undefined, _ options: Value = .unde
         return try optCall(options["report"], stage, text, extra["live"].truthy ? Value.spread(extra, ["preparatory": true]) : extra)
     }
     let result = try finishPending(paths, Value.spread(options, ["report": report]))
-    let table: Value = try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(paths["claudeApp"]))
+    let table: Value = try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(Value(paths.claudeApp)))
     var checked: Value = .undefined
     if result["receipt"].truthy {
         for check in result["receipt"]["cloudChecks"].elements where try sameAccount(check, result["checkedAccount"]).truthy { checked = check; break }
@@ -409,7 +417,7 @@ func observedRecord(_ record: Value = .undefined) throws -> Value {
     .fromEntries(DURABLE_RECORD_KEYS.map { ($0, record[$0]) })
 }
 
-func inspectPlaced(_ paths: Value = .undefined) throws -> Value {
+func inspectPlaced(_ paths: DataLayout) throws -> Value {
     let latest = try latestReceipt(paths)
     if !latest.truthy { return ["changed": []] }
     if latest["corrupt"].truthy { return ["changed": [], "error": "Latest move receipt is unreadable"] }
@@ -417,7 +425,7 @@ func inspectPlaced(_ paths: Value = .undefined) throws -> Value {
     if receipt["finalizing"].truthy || receipt["undoing"].truthy || receipt["retiring"].truthy || receipt["pending"].truthy { return ["changed": [], "recoveryRequired": true] }
     var changed: [Value] = []
     let destination: Value = receipt["toAccount"].truthy
-        ? Value(path.join(paths["records"].description, receipt["toAccount"]["account"].description, receipt["toAccount"]["org"].description))
+        ? Value(path.join(paths.records, receipt["toAccount"]["account"].description, receipt["toAccount"]["org"].description))
         : receipt["toAccount"]
     for row in (receipt["sessions"] ?? []).elements {
         if !row["recordSnapshot"].truthy || !destination.truthy || Value(path.dirname(row["record"].description)) !== destination || !UUID.test(row["targetId"].description) { continue }
@@ -432,7 +440,7 @@ func inspectPlaced(_ paths: Value = .undefined) throws -> Value {
             ? .strings(unique(before.ownKeys + after.ownKeys).filter { stable(before[$0]) != stable(after[$0]) })
             : .strings(["record unavailable"])
         let found: String = after.truthy ? sha(stable(after)) : raw.truthy ? sha(raw) : "missing"
-        let directory = path.join(paths["state"].description, "drift", path.basename(file.description, ".json"))
+        let directory = path.join(paths.state, "drift", path.basename(file.description, ".json"))
         try fs.mkdirp(directory, mode: 0o700)
         let placedFile = path.join(directory, "\(row["targetId"]).placed.json")
         let foundFile = path.join(directory, "\(row["targetId"]).\(found).found.json")
@@ -455,12 +463,16 @@ func inspectPlaced(_ paths: Value = .undefined) throws -> Value {
 }
 
 @discardableResult
-public func verifyPlaced(_ paths: Value = .undefined) throws -> Value {
+public func verifyPlaced(_ paths: Value = .undefined) throws -> Value { try verifyPlaced(DataLayout(paths)) }
+@discardableResult
+func verifyPlaced(_ paths: DataLayout) throws -> Value {
     try locked(paths, Value { _ in try inspectPlaced(paths) })
 }
 
 @discardableResult
-public func sweep(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func sweep(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try sweep(DataLayout(paths), options) }
+@discardableResult
+func sweep(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
     let recovered = try locked(paths, Value { _ in try reconcile(paths, Value.spread(options, ["background": true])) })
     if recovered["pendingUndo"].truthy { return ["pending": true, "pendingUndo": recovered["pendingUndo"], "ok": true, "complete": false] }
@@ -501,7 +513,9 @@ public func sweep(_ paths: Value = .undefined, _ options: Value = .undefined) th
 }
 
 @discardableResult
-public func undo(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func undo(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try undo(DataLayout(paths), options) }
+@discardableResult
+func undo(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
     if !options["approve"].nullish {
         let recovery = try recoveryPending(paths)
@@ -516,7 +530,7 @@ public func undo(_ paths: Value = .undefined, _ options: Value = .undefined) thr
     ]))
 }
 
-func undoFiles(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+func undoFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
     if options["receiptFile"].truthy, try latestReceipt(paths)["file"] !== options["receiptFile"] { return ["ok": false, "reason": "The operation receipt changed"] }
     let reconciled: Value = options["check"].truthy ? .null : try reconcile(paths, options)
@@ -538,7 +552,7 @@ func undoFiles(_ paths: Value = .undefined, _ options: Value = .undefined) throw
         if changes.length > 0 { kept.append(Value("\(r["title"]) | \(short(r["targetId"])) | \(changes.join(", ")) changed")) }
     }
     if !kept.isEmpty { return ["receipt": receipt, "changed": Value(kept)] }
-    let root = path.join(paths["state"].description, "quarantine")
+    let root = path.join(paths.state, "quarantine")
     let blocked: [Value] = try restoreProblems(receipt["superseded"] ?? [], Value(root)).elements
         + (try bridgeProblems(receipt["sessions"], true)).elements
         + (try taskTransferProblems(receipt["taskTransfers"], paths, inspect)).elements
@@ -753,6 +767,7 @@ public func reporter(_ json: Value = .undefined) throws -> Value {
 }
 
 // The menu bar app ships as Claude Handoff.app, so `menubar` only refuses.
-public func menubar(_ paths: Value = .undefined, _ remove: Value = .undefined, _ snapshot: Value = .undefined) throws -> Value {
+public func menubar(_ paths: Value = .undefined, _ remove: Value = .undefined, _ snapshot: Value = .undefined) throws -> Value { try menubar(DataLayout(paths), remove, snapshot) }
+func menubar(_ paths: DataLayout, _ remove: Value = .undefined, _ snapshot: Value = .undefined) throws -> Value {
     throw EngineError("the menubar app ships as Claude Handoff.app; install it from the release DMG")
 }

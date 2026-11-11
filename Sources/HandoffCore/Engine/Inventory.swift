@@ -385,7 +385,8 @@ func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, 
     return .undefined
 }
 
-public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ options: Value = .undefined) throws -> Value { try inventory(from, to, DataLayout(paths), report, options) }
+func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let options: Value = options.isUndefined ? .newObject() : options
     let check = { () throws in
@@ -399,7 +400,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
     var completed = 0
     try progress(report, "scan", Value(completed), Value(workTotal))
     let cache = try openAnalysisCache(paths, Value(options["writeCache"] === true))
-    let ctxIndex = try index(paths["pool"])
+    let ctxIndex = try index(Value(paths.pool))
     let ctx: Value = ["index": ctxIndex, "scans": .newMap(), "workers": try workers(options["processes"]), "cache": cache]
     try check()
     let soleRecord = { (s: Value) throws -> Bool in
@@ -631,7 +632,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
     out["cacheStats"] = cache["stats"]
     out["cloud"] = cloudPlan
     if options["inspect"].nullish {
-        out["inspect"] = Value { _ in try options["processes"] ?? processTable(paths["claudeApp"]) }
+        out["inspect"] = Value { _ in try options["processes"] ?? processTable(Value(paths.claudeApp)) }
     } else {
         out["inspect"] = options["inspect"]
     }
