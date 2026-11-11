@@ -78,13 +78,11 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
         return found.isUndefined ? .infinity : toNumber(found)
     }
     var firstPass: [Value] = []
-    for session in listed.elements {
-        if excludedIds.has(try remoteId(session["id"])) { continue }
-        if try sessionIds.truthy && !sessionIds.has(remoteId(session["id"])) { continue }
-        if !(session["environment_kind"] === "bridge") { continue }
-        if !(session["tags"].isArray && session["tags"].elements.contains { $0.asString.map { REMOTE_TAGS.contains($0) } ?? false }) { continue }
-        if !remoteOpenStatus(session["status"]) { continue }
-        firstPass.append(session)
+    for session in listed.elements.map(RemoteSession.init) {
+        if excludedIds.has(try remoteId(session.id)) { continue }
+        if try sessionIds.truthy && !sessionIds.has(remoteId(session.id)) { continue }
+        if !session.isBridge || !session.hasRemoteTag || !remoteOpenStatus(session.status) { continue }
+        firstPass.append(session.raw)
     }
     var filtered: [Value] = []
     for session in firstPass {
@@ -114,10 +112,10 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     }
     // Sessions are analyzed one at a time, so each artifact check runs after the previous one finished.
     if !sessions.isEmpty { try progress(report, "cloud scan", Value(completed), Value(sessions.count)) }
-    let analyze = { (session: Value) throws -> Value in
-        let result: Value
+    let analyze = { (session: Value) throws -> CloudOutcome in
+        let result: CloudOutcome
         do {
-            result = try {
+            result = try { () throws -> CloudOutcome in
                 let sessionId = try wireRemoteId(session["id"])
                 let named = candidates.filter { $0["title"] === session["title"] }
                 let linked = candidates.filter { $0["remoteIds"].has(sessionId) }
@@ -127,9 +125,9 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                     let same: Value = ValueSet(local.map { $0["id"] }).size == 1 ? local[0] : .null
                     let recordId: Value = same.truthy ? try desktopRecordOf(same["row"])["sessionId"] : .null
                     let row: Value = ["id": session["id"], "title": or(session["title"], "Untitled session"), "localId": same["id"] ?? .null, "recordId": recordId]
-                    return ["waiting": row]
+                    return .waiting(row)
                 }
-                if linked.count > 1 { return ["blocked": ["id": session["id"], "title": session["title"], "account": account, "error": "multiple local targets carry the Remote Control id"]] }
+                if linked.count > 1 { return .blocked(["id": session["id"], "title": session["title"], "account": account, "error": "multiple local targets carry the Remote Control id"]) }
                 try assertRemoteIdle(detail)
                 let signature = Value(sha(stable(["id": session["id"], "updatedAt": session["updated_at"], "lastEventAt": detail["last_event_at"], "status": detail["status"]])))
                 var remote = try cacheLookup(cache, "remote", session["id"], signature)
@@ -166,8 +164,8 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                 let covered = try findCovered(eligible)
                 let linkedCovered = covered.filter { $0["remoteIds"].has(sessionId) }
                 let verified = linkedCovered.count == 1 ? linkedCovered : covered
-                if verified.count > 1 { return ["blocked": ["id": session["id"], "title": session["title"], "account": account, "error": "multiple verified local target histories"]] }
-                if verified.count == 1 { return ["match": ["session": session, "target": verified[0], "conversationSha": Value(sha(stable(remoteConversation))), "account": account]] }
+                if verified.count > 1 { return .blocked(["id": session["id"], "title": session["title"], "account": account, "error": "multiple verified local target histories"]) }
+                if verified.count == 1 { return .match(["session": session, "target": verified[0], "conversationSha": Value(sha(stable(remoteConversation))), "account": account]) }
                 let anchors = !linked.isEmpty ? linked : named
                 let base: Value = anchors.count == 1 ? anchors[0] : .null
                 let record: Value = base.truthy ? try desktopRecordOf(base["row"]) : base
@@ -181,7 +179,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                     let selected = base
                     var retrySignature: Value = .undefined, fullBudget = false, checked = false
                     var deferredAt: Double? = nil
-                    var settled: Value? = nil
+                    var settled: CloudOutcome? = nil
                     do {
                         if !linked.isEmpty && !artifactLinked { throw EngineError(try artifactError("the retained parent history cannot be verified")) }
                         if !remote["events"].isArray { try refresh() }
@@ -195,7 +193,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                         remote.removeKey("artifactDeferred")
                         checked = true
                         let proof = try supplementalCoverage(remote["events"], selected["row"], artifacts, inputs)
-                        if proof.truthy { settled = ["match": ["session": session, "target": Value.spread(selected, proof), "conversationSha": Value(sha(stable(remoteConversation))), "account": account]] }
+                        if proof.truthy { settled = .match(["session": session, "target": Value.spread(selected, proof), "conversationSha": Value(sha(stable(remoteConversation))), "account": account]) }
                     } catch {
                         let error = errorObject(error)
                         if checked && retrySignature.truthy {
@@ -206,19 +204,19 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                             }
                         }
                         let typed = error["code"].asString?.hasPrefix("CLOUD_ARTIFACT_") ?? false
-                        settled = ["blocked": ["id": session["id"], "title": session["title"], "account": account, "code": typed ? error["code"] : "CLOUD_ARTIFACT_UNCERTAIN",
-                                               "error": typed ? error["message"] : "Supplemental cloud coverage is uncertain: local artifacts could not be verified"]]
+                        settled = .blocked(["id": session["id"], "title": session["title"], "account": account, "code": typed ? error["code"] : "CLOUD_ARTIFACT_UNCERTAIN",
+                                            "error": typed ? error["message"] : "Supplemental cloud coverage is uncertain: local artifacts could not be verified"])
                     }
                     // finally
                     if checked { try cacheStore(cache, "remote", session["id"], signature, remote) }
                     if let settled { return settled }
                 }
-                return ["blocked": ["id": session["id"], "title": session["title"], "account": account, "code": "CLOUD_UNPROVEN", "error": .string("not proven to be on this Mac, kept in \(account["label"])")]]
+                return .blocked(["id": session["id"], "title": session["title"], "account": account, "code": "CLOUD_UNPROVEN", "error": .string("not proven to be on this Mac, kept in \(account["label"])")])
             }()
         } catch {
             let error = errorObject(error)
             do {
-                result = ["blocked": ["id": session["id"], "title": session["title"], "account": account, "code": try memoryErrorCode(error), "error": .string("Remote Control history unreadable: \(error["message"])")]]
+                result = .blocked(["id": session["id"], "title": session["title"], "account": account, "code": try memoryErrorCode(error), "error": .string("Remote Control history unreadable: \(error["message"])")])
             } catch {
                 completed += 1
                 try progress(report, "cloud scan", Value(completed), Value(sessions.count))
@@ -233,13 +231,15 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     var at = 0
     while at < sessions.count {
         let size = options["serial"].truthy ? 1 : (try selectedMemory(Value.spread(options, ["cloud": cloud]))["parallel"].call()).asInt ?? 0
-        var batch: [Value] = []
+        var batch: [CloudOutcome] = []
         for session in sliceArray(sessions, at, at + size) { batch.append(try analyze(session)) }
         at += batch.count
         for result in batch {
-            if result["match"].truthy { matches.push(result["match"]) }
-            else if result["waiting"].truthy { waiting.push(result["waiting"]) }
-            else { blocked.push(result["blocked"]) }
+            switch result {
+            case .match(let match): matches.push(match)
+            case .waiting(let row): waiting.push(row)
+            case .blocked(let row): blocked.push(row)
+            }
         }
     }
     let out: Value = [

@@ -175,3 +175,26 @@ struct MoveTarget: RecordHolder {
     var session: DesktopSession { DesktopSession(raw["session"]) }
     var account: Account { Account(raw["account"]) }
 }
+
+// A Remote Control session as claude.ai lists it.
+struct RemoteSession {
+    let raw: Value
+    init(_ raw: Value) { self.raw = raw }
+    var id: Value { raw["id"] }
+    var title: Value { raw["title"] }
+    var status: Value { raw["status"] }
+    var createdAt: Value { raw["created_at"] }
+    var updatedAt: Value { raw["updated_at"] }
+    var isBridge: Bool { raw["environment_kind"] === "bridge" }
+    var hasRemoteTag: Bool { raw["tags"].isArray && raw["tags"].elements.contains { $0.asString.map { REMOTE_TAGS.contains($0) } ?? false } }
+}
+
+// What checking one Remote Control session against local history found.
+enum CloudOutcome {
+    // A local history covers it, so it can be archived after the move.
+    case match(Value)
+    // It is still open and owned by a local session; check again later.
+    case waiting(Value)
+    // It cannot be archived, with the reason.
+    case blocked(Value)
+}
