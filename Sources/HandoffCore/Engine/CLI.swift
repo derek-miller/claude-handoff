@@ -391,7 +391,7 @@ public func main(_ argv: [String]) throws {
                     }
                 }
                 let current = all.elements.first { $0.active.truthy } ?? .undefined
-                var scheduler = table.elements.contains { desktopExecutable($0.executable).truthy }
+                var scheduler = processRows(table).contains(where: \.isDesktop)
                 if scheduler {
                     if current.truthy {
                         var hit = false

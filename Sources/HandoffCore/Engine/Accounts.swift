@@ -426,7 +426,7 @@ func taskRegistrationKind(_ family: Value = .undefined, _ registry: Value = .und
 
 func schedulerBusy(_ paths: DataLayout, _ namespaces: Value = .undefined, _ table: Value = .undefined) throws -> Value {
     let table = table.isUndefined ? try processTable(Value(paths.claudeApp)) : table
-    if !table.elements.contains(where: { desktopExecutable($0["executable"]).truthy }) { return false }
+    if !processRows(table).contains(where: \.isDesktop) { return false }
     let current = try signedIn(paths, table)
     if current["state"] !== "known" { return true }
     return Value(try namespaces.elements.contains { try sameAccount($0, current).truthy })
@@ -850,7 +850,7 @@ func mode(_ values: Value = .undefined) throws -> Value {
 
 func desktopLaunch(_ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
     let app = path.join(paths.claudeApp, "Contents/MacOS/Claude")
-    let apps = table.elements.filter { desktopExecutable($0["executable"]).truthy || $0["executable"] === Value(app) }
+    let apps = processRows(table).filter { $0.isDesktop || $0.executable == app }.map(\.raw)
     let started = apps.count == 1 ? dateParse(apps[0]["started"].description) : .nan
     return started.isFinite && started <= dateNow() ? ["pid": apps[0]["pid"], "started": Value(started)] : .null
 }
