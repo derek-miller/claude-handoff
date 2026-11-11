@@ -162,7 +162,8 @@ extension Engine {
                                                    "receiptSummary": ["moved": 499, "notMoved": [], "groups": [], "attention": [], "kept": []]]) }
             let starting = try pending(0, "cloud", 1, "CLOUD_AUTH_PENDING", nil, 2).map { .spread($0, ["active": false, "signedIn": false, "identityState": "unknown"]) }
             let unfinished = try pending(2, "cloud", 3).map { $0.pending.truthy ? .spread($0, ["receiptSummary": partialSummary]) : $0 }
-            let retrying = { (rows: Value) in rows.map { $0.pending.truthy ? .spread($0, ["pendingRetryAt": Value(dateNow() + 60000)]) : $0 } }
+            // An hour ahead: compiling the menu bar app before it renders can take most of a minute on CI.
+            let retrying = { (rows: Value) in rows.map { $0.pending.truthy ? .spread($0, ["pendingRetryAt": Value(dateNow() + 3_600_000)]) : $0 } }
             let label0 = base[0].label, label1 = base[1].label
             let rows: [Value] = [
                 ["name": "01-done", "screen": "moved", "event": ["done": true, "ok": true, "complete": true, "moved": 361, "destinationLabel": label0], "contains": ["Done. 361 sessions are now in", label0], "primary": nil],
