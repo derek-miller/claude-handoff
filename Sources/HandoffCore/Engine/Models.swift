@@ -82,7 +82,6 @@ struct Account: AccountKey {
     var isEmpty: Bool { raw["sessions"].length == 0 && raw["unreadable"].length == 0 }
     var taskError: Value { raw["taskError"] }
     var taskRegistry: TaskRegistry { TaskRegistry(raw["taskSessions"]) }
-    var taskFile: Value { raw["taskFile"] }
     // Every session in the folder, when accounts() narrowed `sessions`.
     var allSessions: Value { raw["allSessions"] ?? raw["sessions"] }
 }
