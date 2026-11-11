@@ -84,7 +84,10 @@ struct Account: AccountKey {
     var unreadable: [Value] { raw["unreadable"].elements }
     var isEmpty: Bool { raw["sessions"].length == 0 && raw["unreadable"].length == 0 }
     var taskError: Value { raw["taskError"] }
-    var taskSessions: Value { raw["taskSessions"] }
+    var taskRegistry: TaskRegistry { TaskRegistry(raw["taskSessions"]) }
+    var taskFile: Value { raw["taskFile"] }
+    // Every session in the folder, when accounts() narrowed `sessions`.
+    var allSessions: Value { raw["allSessions"] ?? raw["sessions"] }
 }
 
 // An account and org pair that is not a full account row: a folder found on disk, a login, a receipt's namespace.
@@ -102,4 +105,16 @@ struct Identity: AccountKey {
     var isKnown: Bool { state === "known" }
     // The same signed-in account, when the identity is known or carries no state.
     func isLogin(of account: some AccountKey) -> Bool { account.accountId.truthy && account.accountId === accountId && (state.nullish || isKnown) }
+}
+
+// A scheduled-task registry (scheduled-tasks.json). taskSessions() returns it as the set of record ids its tasks
+// notify, with the parsed file, or null when there is none, attached as `registry`.
+struct TaskRegistry {
+    let raw: Value
+    init(_ raw: Value) { self.raw = raw }
+    var data: Value { raw["registry"] }
+    var tasks: Value { data["scheduledTasks"] ?? Value.newArray() }
+    // One of the per-task state maps (TASK_STATE_KEYS), keyed by task id.
+    func state(_ key: String) -> Value { data[key] ?? Value.newObject() }
+    func notifies(_ recordId: Value) -> Bool { raw.has(recordId) }
 }

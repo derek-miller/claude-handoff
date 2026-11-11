@@ -347,7 +347,7 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: DataLayout, 
                     || file !== Value(path.join(paths.records, namespace.account.description, namespace.org.description, "scheduled-tasks.json")) {
                     throw EngineError("scheduled task namespace mismatch")
                 }
-                let registry = try taskSessions(file).registry
+                let registry = try taskRegistry(file).data
                 let tasks = registry.scheduledTasks ?? Value.newArray()
                 let target = file === family.targetFile
                 let kind = try taskRegistrationKind(family, registry, Value(target), selected.isEmpty ? .undefined : Value(selected[0]))
@@ -412,9 +412,9 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
         let problems = try taskTransferProblems([family], paths, inspect, true, check, snapshots)
         if problems.length != 0 { throw EngineError(problems.join(", ")) }
         let file = side === "source" ? family.sourceFile : family.targetFile
-        let registry = try taskSessions(file).registry
+        let registry = try taskRegistry(file).data
         let tasks = registry.scheduledTasks ?? Value.newArray()
-        let source = try taskSessions(family.sourceFile).registry
+        let source = try taskRegistry(family.sourceFile).data
         let kind = try taskRegistrationKind(family, registry, Value(side === "target"),
                                             Value((source.scheduledTasks ?? Value.newArray()).elements.contains { family.ids.includes($0.id) }))
         if Value(kind === "published") === present || family.tasks.length == 0 { continue }
@@ -430,7 +430,7 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
                 next.insert(replaced.task, at: spliceStart(min(toNumber(replaced.index), Double(next.count)), next.count))
             }
         }
-        if try stable(taskSessions(file).registry) != stable(registry) { throw EngineError("scheduled task registry changed before write") }
+        if try stable(taskRegistry(file).data) != stable(registry) { throw EngineError("scheduled task registry changed before write") }
         try check.call(true)
         if try schedulerBusy(paths, [family.from, family.to], optCall(inspect)).truthy { throw EngineError(SCHEDULER_OWNS) }
         let after = Value.spread(registry, ["scheduledTasks": Value(next)])
@@ -452,12 +452,12 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
                 let problems = try taskTransferProblems([family], paths, inspect, true, check, snapshots)
                 if problems.length != 0 { throw EngineError(problems.join(", ")) }
                 try check.call(true)
-                if try stable(taskSessions(file).registry) != stable(registry) { throw EngineError("scheduled task registry changed before publication") }
+                if try stable(taskRegistry(file).data) != stable(registry) { throw EngineError("scheduled task registry changed before publication") }
                 if try schedulerBusy(paths, [family.from, family.to], optCall(inspect)).truthy { throw EngineError(SCHEDULER_OWNS) }
                 return .undefined
             })
         }
-        if try stable(taskSessions(file).registry) != stable(remove ? .null : after) { throw EngineError("scheduled task registry changed during write") }
+        if try stable(taskRegistry(file).data) != stable(remove ? .null : after) { throw EngineError("scheduled task registry changed during write") }
     }
     return .undefined
 }
@@ -478,7 +478,7 @@ func finishUndo(_ receipt: Value = .undefined, _ file: Value = .undefined, _ pat
     for row in receipt.sessions.elements {
         if try ownsWorker(liveWorkers, row.targetId, row.targetRecordId).truthy { problems.append(Value("\(row.title) | running worker kept in destination")) }
         if try !row.taskFamily.truthy && row.taskFile.truthy
-            && Value(taskSessions(row.taskFile).has(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned {
+            && Value(taskRegistry(row.taskFile).notifies(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned {
             problems.append(Value("\(row.title) | scheduled tasks changed"))
         }
     }
@@ -552,7 +552,7 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
         if !record.error.truthy {
             if !sameRecordAs(record.file) { changes.append("desktop record changed") }
         }
-        if try row.taskFile.truthy && Value(taskSessions(row.taskFile).has(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned {
+        if try row.taskFile.truthy && Value(taskRegistry(row.taskFile).notifies(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned {
             changes.append("scheduled tasks changed")
         }
         if try ownsWorker(liveWorkers, row.targetId, row.targetRecordId).truthy { changes.append("running worker") }
@@ -573,7 +573,7 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
     if !record.error.truthy {
         if !sameRecordAs(record.file) { changes.append("desktop record changed") }
     }
-    if try row.taskFile.truthy && Value(taskSessions(row.taskFile).has(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned {
+    if try row.taskFile.truthy && Value(taskRegistry(row.taskFile).notifies(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned {
         changes.append("scheduled tasks changed")
     }
     if try ownsWorker(liveWorkers, row.targetId, row.targetRecordId).truthy { changes.append("running worker") }
@@ -827,7 +827,7 @@ func witnessed(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ c
         let currentTranscript = catchNull { try fingerprint(row.transcript) }
         let currentSidecars = catchNull { try treeFingerprint(sidecarRoot) }
         let sameTask = try !row.account.taskFile.truthy
-            || Value(taskSessions(row.account.taskFile).has(desktopRecordOf(row).sessionId)) === row.taskOwned
+            || Value(taskRegistry(row.account.taskFile).notifies(desktopRecordOf(row).sessionId)) === row.taskOwned
         let shared = try and(and(and(Value(currentTranscript.truthy),
                                      Value(!expectedSidecars.count.truthy || exists(sidecarRoot))),
                                  Value(!expectedSidecars.canonicalRoot.truthy || currentSidecars.canonicalRoot === expectedSidecars.canonicalRoot)),
@@ -836,7 +836,7 @@ func witnessed(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ c
     }
     let now = catchNull { try sidecars(row.transcript, row.id) }
     let sameTask = try !row.account.taskFile.truthy
-        || Value(taskSessions(row.account.taskFile).has(desktopRecordOf(row).sessionId)) === row.taskOwned
+        || Value(taskRegistry(row.account.taskFile).notifies(desktopRecordOf(row).sessionId)) === row.taskOwned
     if try !now.truthy || now.sha !== row.sidecar.sha || row.sidecar.canonicalRoot.truthy && now.canonicalRoot !== row.sidecar.canonicalRoot
         || !sameTask || ownsWorker(liveWorkers, row.id, desktopRecordOf(row).sessionId).truthy {
         return false

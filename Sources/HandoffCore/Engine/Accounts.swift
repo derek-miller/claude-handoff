@@ -372,6 +372,7 @@ func taskSessions(_ file: Value = .undefined) throws -> Value {
     s["registry"] = data
     return s
 }
+func taskRegistry(_ file: Value) throws -> TaskRegistry { TaskRegistry(try taskSessions(file)) }
 
 func taskState(_ registry: Value = .undefined, _ ids: Value = .undefined) throws -> Value {
     .fromEntries(TASK_STATE_KEYS.map { key in
@@ -434,17 +435,17 @@ func schedulerBusy(_ paths: DataLayout, _ namespaces: Value = .undefined, _ tabl
 
 func coldBlocked(_ record: Value = .undefined, _ owners: Value = .undefined) throws -> Value {
     Value(owners.elements.contains { owner in
-        let ts = owner["taskSessions"]
-        return ts.has(record["sessionId"]) || ts["registry"]["scheduledTasks"].elements.contains { $0["id"] === record["scheduledTaskId"] } ||
-            TASK_STATE_KEYS.contains { (ts["registry"][$0] ?? Value.newObject()).hasOwn(record["scheduledTaskId"].description) }
+        let tasks = Account(owner).taskRegistry
+        return tasks.notifies(record["sessionId"]) || tasks.tasks.elements.contains { $0["id"] === record["scheduledTaskId"] } ||
+            TASK_STATE_KEYS.contains { tasks.state($0).hasOwn(record["scheduledTaskId"].description) }
     })
 }
 
 func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found: Value = .undefined) throws -> Value {
     var families: [Value] = []
     for account in from.elements {
-        let tasks = account["taskSessions"]["registry"]["scheduledTasks"] ?? Value.newArray()
-        let recordRows = account["allSessions"] ?? account["sessions"]
+        let tasks = Account(account).taskRegistry.tasks
+        let recordRows = Account(account).allSessions
         var graph: [String: OrderedStrings] = [:]
         let seeds = OrderedStrings()
         func connect(_ a: String, _ b: String) {
@@ -499,15 +500,15 @@ func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found:
                 members.allSatisfy { $0["record"]["isArchived"] === true && $0["record"]["scheduledTaskId"].truthy && !$0["record"]["notifySessionId"].truthy } &&
                 TASK_STATE_KEYS.allSatisfy { key in
                     ids.allSatisfy { id in
-                        !(account["taskSessions"]["registry"][key] ?? Value.newObject()).hasOwn(id) && !(to["taskSessions"]["registry"][key] ?? Value.newObject()).hasOwn(id)
+                        !Account(account).taskRegistry.state(key).hasOwn(id) && !Account(to).taskRegistry.state(key).hasOwn(id)
                     }
                 }
-            let targetTasks = to["taskSessions"]["registry"]["scheduledTasks"] ?? Value.newArray()
+            let targetTasks = Account(to).taskRegistry.tasks
             let twins = targetTasks.elements.filter { idsValue.includes($0["id"]) }
             let twinProblems: [Value] = try twins.map { twin in
                 guard let source = tasks.elements.first(where: { $0["id"] === twin["id"] }) else { return "target scheduled task collision" }
-                let registry: Value = ["source": account["taskSessions"]["registry"], "target": to["taskSessions"]["registry"]]
-                return try staleTaskProblem(source, twin, registry, (to["allSessions"] ?? to["sessions"]).elements.map { $0["record"] }.value, to["unreadable"]["length"])
+                let registry: Value = ["source": Account(account).taskRegistry.data, "target": Account(to).taskRegistry.data]
+                return try staleTaskProblem(source, twin, registry, Account(to).allSessions.elements.map { $0["record"] }.value, to["unreadable"]["length"])
             }
             let twinProblem = twinProblems.first(where: \.truthy) ?? .undefined
             family["error"] = try account["taskError"] ?? to["taskError"] ?? (
@@ -515,7 +516,7 @@ func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found:
                     (!historical && ids.contains { id in !tasks.elements.contains { $0["id"] === Value(id) } }) || recordIds.count != members.count ? "scheduled task family member missing" :
                     twinProblem ?? (
                         targetTasks.elements.contains { !idsValue.includes($0["id"]) && recordIdsValue.includes($0["notifySessionId"]) } ? "target scheduled task collision" :
-                            taskStateConflict(taskState(account["taskSessions"]["registry"], idsValue), taskState(to["taskSessions"]["registry"], idsValue)).truthy
+                            taskStateConflict(taskState(Account(account).taskRegistry.data, idsValue), taskState(Account(to).taskRegistry.data, idsValue)).truthy
                             ? "target scheduled task state collision" : .null))
             for row in members { Value.assign(row, ["taskFamily": family, "coldRun": false]) }
             families.append(family)
@@ -1246,7 +1247,7 @@ func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Va
     for session in sessions { for id in unique([session.raw["id"]] + (try priorSessions(session.record.raw)).elements) { claims[HashKey(id), default: 0] += 1 } }
     let parents = ValueSet(sessions.map { $0.record.raw["forkedFromSessionId"] })
     let tasks: ValueSet? = out.contains { $0.taskError.truthy } ? nil
-        : ValueSet(out.flatMap { ($0.taskSessions["registry"]["scheduledTasks"] ?? Value.newArray()).elements.map { $0["id"] } })
+        : ValueSet(out.flatMap { $0.taskRegistry.tasks.elements.map { $0["id"] } })
     for session in sessions {
         let record = session.record.raw
         Value.assign(session.raw, [
