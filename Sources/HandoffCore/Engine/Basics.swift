@@ -218,12 +218,8 @@ func accountRef(_ arg0: Value = .undefined) throws -> Value {
     if arg0.nullish { throw EngineError.type("Cannot destructure '\(arg0)' as it is \(arg0).") }
     return ["account": arg0.account, "org": arg0.org, "label": arg0.label]
 }
-public func sameAccount(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
-    Value(a.truthy && b.truthy && a.account === b.account && a.org === b.org)
-}
-func sameLogin(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
-    Value(a.account.truthy && a.account === b.account && (b.state.nullish || b.state === "known"))
-}
+public func sameAccount(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value { Value(AccountPair(a).same(AccountPair(b))) }
+func sameLogin(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value { Value(Identity(b).isLogin(of: AccountPair(a))) }
 func localCloudPending(_ account: Value = .undefined, _ retiring: Value = .undefined) throws -> Value {
     let retiring = retiring.isUndefined ? Value.newSet() : retiring
     return Value(account.truthy && (account.unreadable["length"].truthy ||

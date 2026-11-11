@@ -427,9 +427,9 @@ func taskRegistrationKind(_ family: Value = .undefined, _ registry: Value = .und
 func schedulerBusy(_ paths: DataLayout, _ namespaces: Value = .undefined, _ table: Value = .undefined) throws -> Value {
     let table = table.isUndefined ? try processTable(Value(paths.claudeApp)) : table
     if !processRows(table).contains(where: \.isDesktop) { return false }
-    let current = try signedIn(paths, table)
-    if current["state"] !== "known" { return true }
-    return Value(try namespaces.elements.contains { try sameAccount($0, current).truthy })
+    let current = Identity(try signedIn(paths, table))
+    if !current.isKnown { return true }
+    return Value(namespaces.elements.contains { AccountPair($0).same(current) })
 }
 
 func coldBlocked(_ record: Value = .undefined, _ owners: Value = .undefined) throws -> Value {
@@ -1194,19 +1194,7 @@ func priorSessions(_ record: Value = .undefined) throws -> Value {
     record["priorCliSessionIds"].isArray ? record["priorCliSessionIds"] : .newArray()
 }
 
-func desktopSession(_ file: Value = .undefined, _ record: Value = .undefined) throws -> Value {
-    [
-        "file": file,
-        "id": UUID.test((record["cliSessionId"] ?? "").description) ? record["cliSessionId"] : .null,
-        "cwd": record["cwd"] ?? "",
-        "title": record["title"] ?? "",
-        "archived": Value(record["isArchived"] === true),
-        "createdAt": record["createdAt"] ?? 0,
-        "activeAt": record["lastActivityAt"] ?? 0,
-        "focusedAt": record["lastFocusedAt"] ?? 0,
-        "record": record,
-    ]
-}
+func desktopSession(_ file: Value = .undefined, _ record: Value = .undefined) throws -> Value { DesktopSession(file: file, record: record).raw }
 
 public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefined) throws -> Value { try accounts(DataLayout(paths), processes) }
 func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Value {
@@ -1214,21 +1202,21 @@ func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Va
     let found = try logins(paths)
     let emails = found["emails"], orgs = found["orgs"], pairs = found["pairs"]
     let cur = try signedIn(paths, processes)
-    var out: [Value] = []
+    var out: [Account] = []
     let stored = try records(Value(paths.records))
-    let known: [Value] = try pairs.asMap!.values.filter { pair in try !stored.elements.contains { try sameAccount($0, pair).truthy } }.map { pair in
+    let known: [Value] = pairs.asMap!.values.filter { pair in !stored.elements.contains { AccountPair($0).same(AccountPair(pair)) } }.map { pair in
         ["account": pair["account"], "org": pair["org"], "dir": Value(path.join(paths.records, pair["account"].description, pair["org"].description)), "files": .newArray()]
     }
     for row in stored.elements + known {
         let account = row["account"], org = row["org"], dir = row["dir"]
-        var sessions: [Value] = []
+        var sessions: [DesktopSession] = []
         var unreadable: [Value] = []
         for file in row["files"].elements {
             let r = (try? readJson(file)) ?? .null
             if !r.truthy { unreadable.append(file); continue }
-            sessions.append(try desktopSession(file, r))
+            sessions.append(DesktopSession(file: file, record: r))
         }
-        let activeAt = nanMax([0] + sessions.map { toNumber($0["activeAt"]) })
+        let activeAt = nanMax([0] + sessions.map(\.activeAt))
         let email = emails.get(account) ?? .null
         let orgName = orgs.get(org) ?? .null
         let taskFile = Value(path.join(dir.description, "scheduled-tasks.json"))
@@ -1239,39 +1227,41 @@ func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Va
         var base = "0 | -"
         if !sessions.isEmpty {
             let names = try sessions.map { s -> Value in
-                guard let cwd = s["cwd"].asString else { throw EngineError.type("The \"path\" argument must be of type string. Received \(s["cwd"].typeOf)") }
+                guard let cwd = s.cwd.asString else { throw EngineError.type("The \"path\" argument must be of type string. Received \(s.cwd.typeOf)") }
                 return Value(path.basename(cwd))
             }
             base = "\(sessions.count) | \(try ago(Value(activeAt))) | \(try mode(names.value))"
         }
         let stats = "\(base)\(unreadable.isEmpty ? "" : " | \(unreadable.count) unreadable")\(taskError.truthy ? " | task registry unreadable" : "")"
-        let sessionsValue = sessions.value
-        out.append([
+        let sessionsValue = sessions.map(\.raw).value
+        out.append(Account([
             "account": account, "org": org, "dir": dir, "email": email, "orgName": orgName, "sessions": sessionsValue, "allSessions": sessionsValue,
             "unreadable": unreadable.value, "taskFile": taskFile, "taskSessions": scheduled, "taskError": taskError, "activeAt": Value(activeAt),
-            "focusedAt": Value(nanMax([0] + sessions.map { toNumber($0["focusedAt"]) })), "label": Value(label), "stats": Value(stats), "active": false,
+            "focusedAt": Value(nanMax([0] + sessions.map(\.focusedAt))), "label": Value(label), "stats": Value(stats), "active": false,
             "signedIn": try sameLogin(["account": account], cur), "identityState": cur["state"],
-        ])
+        ]))
     }
-    let sessions = out.flatMap { $0["sessions"].elements }
+    let sessions = out.flatMap(\.sessions)
     var claims: [HashKey: Int] = [:]
-    for session in sessions { for id in unique([session["id"]] + (try priorSessions(session["record"])).elements) { claims[HashKey(id), default: 0] += 1 } }
-    let parents = ValueSet(sessions.map { $0["record"]["forkedFromSessionId"] })
-    let tasks: ValueSet? = out.contains { $0["taskError"].truthy } ? nil
-        : ValueSet(out.flatMap { ($0["taskSessions"]["registry"]["scheduledTasks"] ?? Value.newArray()).elements.map { $0["id"] } })
+    for session in sessions { for id in unique([session.raw["id"]] + (try priorSessions(session.record.raw)).elements) { claims[HashKey(id), default: 0] += 1 } }
+    let parents = ValueSet(sessions.map { $0.record.raw["forkedFromSessionId"] })
+    let tasks: ValueSet? = out.contains { $0.taskError.truthy } ? nil
+        : ValueSet(out.flatMap { ($0.taskSessions["registry"]["scheduledTasks"] ?? Value.newArray()).elements.map { $0["id"] } })
     for session in sessions {
-        let record = session["record"]
-        Value.assign(session, [
-            "shared": Value((claims[HashKey(session["id"])] ?? 0) > 1 || parents.has(record["sessionId"])),
+        let record = session.record.raw
+        Value.assign(session.raw, [
+            "shared": Value((claims[HashKey(session.raw["id"])] ?? 0) > 1 || parents.has(record["sessionId"])),
             "deletedTask": Value(tasks != nil && record["scheduledTaskId"].isString && !tasks!.has(record["scheduledTaskId"])),
         ])
     }
     // Desktop keeps a folder for every account/org pair it has signed in with, and personal orgs share one name.
-    let labels = Dictionary(grouping: out, by: { $0["label"].description })
-    for rows in labels.values where rows.count > 1 { for row in rows { Value.assign(row, ["label": Value("\(row["label"]) · \(short(row["org"]))")]) } }
-    let mine = out.filter { $0["account"] === cur["account"] }
-    if let chosen = mine.first(where: { $0["org"] === cur["org"] }) { Value.assign(chosen, ["active": true, "stats": Value("\(chosen["stats"]) | active")]) }
-    return stableSorted(out) { a, b in
+    let labels = Dictionary(grouping: out, by: \.label)
+    for rows in labels.values where rows.count > 1 { for row in rows { row.label = "\(row.label) · \(short(row.orgId))" } }
+    if let chosen = out.first(where: { $0.accountId === cur["account"] && $0.orgId === cur["org"] }) {
+        chosen.active = true
+        chosen.stats = "\(chosen.stats) | active"
+    }
+    return stableSorted(out.map(\.raw)) { a, b in
         let d = toNumber(b["activeAt"]) - toNumber(a["activeAt"])
         return d.isNaN ? 0 : d
     }.value
@@ -1291,16 +1281,16 @@ func holdsNothing(_ dir: String) -> Bool {
 
 public func leftovers(_ paths: Value = .undefined, _ all: Value = .undefined) throws -> Value { try leftovers(DataLayout(paths), all) }
 func leftovers(_ paths: DataLayout, _ all: Value = .undefined) throws -> Value {
-    let rows = all.elements
-    let holders = Dictionary(grouping: rows, by: { $0["org"].description })
-    var found: [Value] = []
+    let rows = all.elements.map(Account.init)
+    let holders = Dictionary(grouping: rows, by: { $0.orgId.description })
+    var found: [Account] = []
     for row in rows {
-        let account = row["account"].description, org = row["org"].description
-        if row["active"].truthy || row["orgName"] !== "Personal" || row["sessions"].length > 0 || row["unreadable"].length > 0 { continue }
-        if (holders[org]?.count ?? 0) < 2 || !rows.contains(where: { $0["account"] === row["account"] && $0["org"] !== row["org"] }) { continue }
+        let account = row.accountId.description, org = row.orgId.description
+        if row.active || row.orgName !== "Personal" || !row.isEmpty { continue }
+        if (holders[org]?.count ?? 0) < 2 || !rows.contains(where: { $0.accountId === row.accountId && $0.orgId !== row.orgId }) { continue }
         if holdsNothing(path.join(paths.records, account, org)) && holdsNothing(path.join(paths.agentSessions, account, org)) { found.append(row) }
     }
-    return Value(found.filter { row in holders[row["org"].description]!.contains { other in !found.contains { $0 === other } } })
+    return Value(found.filter { row in holders[row.orgId.description]!.contains { other in !found.contains { $0.raw === other.raw } } }.map(\.raw))
 }
 
 // Without a pair, sets aside the leftovers above; with one, sets aside that account/org if it holds nothing.
@@ -1311,25 +1301,24 @@ func tidy(_ paths: DataLayout, _ pair: Value = .null) throws -> Value {
         let unfinished = try latest.corrupt.truthy || needsRecovery(latest.receipt).truthy || deferredWorkflow(paths, latest).truthy
         if unfinished { throw EngineError("Finish or undo the last move before tidying", code: "MOVE_UNFINISHED") }
     }
-    let all = try accounts(paths)
+    let all = try accounts(paths).elements.map(Account.init)
     let dest = path.join(paths.state, "leftovers", stamp())
-    var rows = try leftovers(paths, all).elements
+    var rows = try leftovers(paths, all.map(\.raw).value).elements.map(Account.init)
     if pair.truthy {
-        guard let row = all.elements.first(where: { $0["account"] === pair["account"] && $0["org"] === pair["org"] }) else { throw EngineError("No such account", code: "NO_ACCOUNT") }
-        if row["active"].truthy { throw EngineError("Claude is signed in to \(row["label"])", code: "ACCOUNT_ACTIVE") }
-        if row["sessions"].length > 0 || row["unreadable"].length > 0 { throw EngineError("\(row["label"]) still holds sessions", code: "ACCOUNT_NOT_EMPTY") }
-        let dirs = [Value(paths.records), Value(paths.agentSessions)].map { path.join($0.description, row["account"].description, row["org"].description) }
-        if !dirs.allSatisfy(holdsNothing) { throw EngineError("\(row["label"]) still holds scheduled tasks or other files", code: "ACCOUNT_NOT_EMPTY") }
+        guard let row = all.first(where: { $0.accountId === pair["account"] && $0.orgId === pair["org"] }) else { throw EngineError("No such account", code: "NO_ACCOUNT") }
+        if row.active { throw EngineError("Claude is signed in to \(row.label)", code: "ACCOUNT_ACTIVE") }
+        if !row.isEmpty { throw EngineError("\(row.label) still holds sessions", code: "ACCOUNT_NOT_EMPTY") }
+        let dirs = [paths.records, paths.agentSessions].map { path.join($0, row.accountId.description, row.orgId.description) }
+        if !dirs.allSatisfy(holdsNothing) { throw EngineError("\(row.label) still holds scheduled tasks or other files", code: "ACCOUNT_NOT_EMPTY") }
         rows = [row]
     }
     let claude = path.dirname(paths.records)
     // A session moved to another account keeps working in the scratch folder it started in.
-    let working = all.elements.flatMap { row in row["sessions"].elements.flatMap { [$0["cwd"], $0["record"]["originCwd"]] } }
-        .compactMap { $0.asString }.filter { !$0.isEmpty }
+    let working = all.flatMap { $0.sessions.flatMap(\.workingDirectories) }
     var moved: [Value] = []
     for row in rows {
-        let account = row["account"].description, org = row["org"].description
-        let dirs = [("claude-code-sessions", Value(paths.records)), ("local-agent-mode-sessions", Value(paths.agentSessions))].map { ($0.0, path.join($0.1.description, account, org)) }
+        let account = row.accountId.description, org = row.orgId.description
+        let dirs = [("claude-code-sessions", paths.records), ("local-agent-mode-sessions", paths.agentSessions)].map { ($0.0, path.join($0.1, account, org)) }
         if !dirs.allSatisfy({ holdsNothing($0.1) }) { continue }
         let scratch = path.join(claude, "scratch-workspaces", account, org)
         let scratchKept = working.contains { $0 == scratch || $0.hasPrefix(scratch + path.sep) } && fs.exists(scratch)
@@ -1339,7 +1328,7 @@ func tidy(_ paths: DataLayout, _ pair: Value = .null) throws -> Value {
             try fs.mkdirp(path.join(dest, tree, parent))
             try fs.rename(dir, path.join(dest, tree, parent, path.basename(dir)))
         }
-        var entry: Value = ["account": row["account"], "org": row["org"], "label": row["label"]]
+        var entry: Value = ["account": row.accountId, "org": row.orgId, "label": row.raw["label"]]
         if scratchKept { entry = Value.spread(entry, ["scratchKept": .string(scratch)]) }
         moved.append(entry)
     }
