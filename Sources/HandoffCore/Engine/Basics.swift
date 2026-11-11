@@ -487,7 +487,7 @@ struct ProcessRow {
     var pid: Double? { raw["pid"].asNumber }
     var ppid: Double? { raw["ppid"].asNumber }
     var executable: String? { raw["executable"].asString }
-    var isDesktop: Bool { executable?.hasSuffix("/Claude.app/Contents/MacOS/Claude") ?? false }
+    var isDesktop: Bool { desktopExecutable(raw["executable"]).truthy }
     var isWorker: Bool { raw["worker"].truthy }
     var ids: [Value] { raw["ids"].elements }
     var desktopPid: Double? { raw["desktopPid"].asNumber }
@@ -516,7 +516,7 @@ func ownsWorker(_ live: Value = .undefined, _ id: Value = .undefined, _ recordId
     let record: Value = recordId.nullish ? .undefined : .string(re("^local_").replace(recordId.description, "").lowercased())
     return Value(live.has(lowerOpt(id)) || live.has(record))
 }
-func processIdentity(_ row: Value = .undefined) throws -> Value { Value("\(row.pid)/\(row.started)") }
+func processIdentity(_ row: Value = .undefined) throws -> Value { ProcessRow(row).identity }
 func restartFingerprint(_ desktop: Value = .undefined, _ rows: Value = .undefined) throws -> Value {
     let desktopPid = ProcessRow(desktop).pid
     let workers: [Value] = processRows(rows).filter { $0.isWorker && $0.desktopPid == desktopPid && $0.pid != desktopPid }
