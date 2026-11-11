@@ -488,9 +488,11 @@ func artifacts(_ row: Value = .undefined) throws -> Value {
     row.strategy === "rehome" ? [row.record] : [row.targetTranscript, row.targetDir, row.record].filter { $0.truthy }.value
 }
 public func retiredCount(_ receipt: Value = .undefined) throws -> Value {
+    let receipt = Receipt(receipt)
     Value((receipt.superseded ?? .newArray()).elements.filter { $0.source.truthy }.count)
 }
 func retiredFiles(_ receipt: Value = .undefined) throws -> Value {
+    let receipt = Receipt(receipt)
     .newSet((receipt.superseded ?? .newArray()).elements.filter { $0.source.truthy }.flatMap { row in row.moved.elements.map { $0[0] } })
 }
 func ownership(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ bridges: Value = .undefined) throws -> Value {
@@ -558,6 +560,7 @@ func failureCause(_ error: Value = .undefined) throws -> Value {
     return "other"
 }
 public func receiptSummary(_ receipt: Value = .undefined) throws -> Value {
+    let receipt = Receipt(receipt)
     let failed = (receipt.failed ?? .newArray()).elements
     let local = failed.filter { !$0.cloudAccount.truthy }
     let byKey = ValueMap()
@@ -585,6 +588,7 @@ public func receiptSummary(_ receipt: Value = .undefined) throws -> Value {
 }
 
 func projectLocalFailures(_ receipt: Value = .undefined, _ paths: DataLayout, _ project: Value = .undefined) throws -> Value {
+    let receipt = Receipt(receipt)
     let project = project.isUndefined ? Value(true) : project
     let local = (receipt.failed ?? .newArray()).elements.filter { !$0.cloudAccount.truthy }
     if local.isEmpty && !(receipt.failed ?? .newArray()).elements.contains(where: { $0.blockedByLocal["length"].truthy }) { return .undefined }

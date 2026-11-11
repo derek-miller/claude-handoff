@@ -105,7 +105,7 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
         var chosen: Value = saved["selection"] ?? selection
         let sessionFiles: Value = .newSet(try receiptSummary(existing["receipt"] ?? .newObject())["notMoved"].elements.map { $0["file"] }.filter { $0.truthy })
         let sessionProgress: Value = Value { args in
-            let receipt = args.first ?? .undefined
+            let receipt = Receipt(args.first ?? .undefined)
             let retired = try retiredFiles(receipt ?? .newObject())
             let remaining = sessionFiles.elements.filter { !retired.has($0) }.count
             _ = try report.call("sessions", "Remaining sessions", ["live": true, "sessionTotal": Value(sessionFiles.length), "remainingCount": Value(remaining)])
@@ -421,13 +421,13 @@ func inspectPlaced(_ paths: DataLayout) throws -> Value {
     let latest = try latestReceipt(paths)
     if !latest.truthy { return ["changed": []] }
     if latest["corrupt"].truthy { return ["changed": [], "error": "Latest move receipt is unreadable"] }
-    let receipt = latest["receipt"], file = latest["file"]
-    if receipt["finalizing"].truthy || receipt["undoing"].truthy || receipt["retiring"].truthy || receipt["pending"].truthy { return ["changed": [], "recoveryRequired": true] }
+    let receipt = Receipt(latest["receipt"]), file = latest["file"]
+    if receipt.finalizing.truthy || receipt.undoing.truthy || receipt.retiring.truthy || receipt.pending.truthy { return ["changed": [], "recoveryRequired": true] }
     var changed: [Value] = []
-    let destination: Value = receipt["toAccount"].truthy
-        ? Value(path.join(paths.records, receipt["toAccount"]["account"].description, receipt["toAccount"]["org"].description))
-        : receipt["toAccount"]
-    for row in (receipt["sessions"] ?? []).elements {
+    let destination: Value = receipt.toAccount.truthy
+        ? Value(path.join(paths.records, receipt.toAccount["account"].description, receipt.toAccount["org"].description))
+        : receipt.toAccount
+    for row in (receipt.sessions ?? []).elements {
         if !row["recordSnapshot"].truthy || !destination.truthy || Value(path.dirname(row["record"].description)) !== destination || !UUID.test(row["targetId"].description) { continue }
         let raw: Value = orNull { try readFile(row["record"]) }
         if raw.truthy && Value(sha(raw)) === row["recordSha"] { continue }
@@ -449,16 +449,16 @@ func inspectPlaced(_ paths: DataLayout) throws -> Value {
         changed.append(["id": row["targetId"], "title": record["title"] ?? row["title"], "fields": fields, "placed": Value(placedFile), "found": raw.truthy ? Value(foundFile) : .null])
     }
     let changedValue = Value(changed)
-    if latest["projected"].truthy || stable(receipt["metadataDrift"] ?? []) != stable(changedValue) {
-        receipt["metadataDrift"] = changedValue
+    if latest["projected"].truthy || stable(receipt.metadataDrift ?? []) != stable(changedValue) {
+        receipt.metadataDrift = changedValue
         _ = try projectLocalFailures(receipt, paths, false)
         _ = try saveJson(file, receipt)
     }
     var failed: [Value] = []
-    for row in (receipt["failed"] ?? []).elements where try actionableCloudFailure(receipt, row).truthy { failed.append(row) }
+    for row in (receipt.failed ?? []).elements where try actionableCloudFailure(receipt, row).truthy { failed.append(row) }
     return [
         "changed": changedValue, "receipt": file, "summary": try receiptSummary(receipt), "ok": try finishOkay(receipt), "failed": Value(failed),
-        "notMoved": Value((receipt["failed"] ?? []).elements.filter { !$0["cloudAccount"].truthy }), "problems": receipt["verification"]["problems"] ?? [],
+        "notMoved": Value((receipt.failed ?? []).elements.filter { !$0["cloudAccount"].truthy }), "problems": receipt.verification["problems"] ?? [],
     ]
 }
 
@@ -542,38 +542,38 @@ func undoFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -> Val
     let latest = try latestReceipt(paths)
     if options["receiptFile"].truthy && latest["file"] !== options["receiptFile"] { return ["ok": false, "reason": "The operation receipt changed"] }
     if !latest.truthy { return ["nothing": true] }
-    let file = latest["file"], receipt = latest["receipt"]
-    if receipt["retained"]["length"].truthy { return ["receipt": receipt, "retained": receipt["retained"]] }
+    let file = latest["file"], receipt = Receipt(latest["receipt"])
+    if receipt.retained["length"].truthy { return ["receipt": receipt, "retained": receipt.retained] }
     var kept: [Value] = []
     let inspect = try inspector(paths, options)
     let liveWorkers = try workers(try inspect.call())
-    for r in receipt["sessions"].elements {
+    for r in receipt.sessions.elements {
         let changes = try targetChanges(r, liveWorkers, Value(r["strategy"] !== "rehome"))
         if changes.length > 0 { kept.append(Value("\(r["title"]) | \(short(r["targetId"])) | \(changes.join(", ")) changed")) }
     }
     if !kept.isEmpty { return ["receipt": receipt, "changed": Value(kept)] }
     let root = path.join(paths.state, "quarantine")
-    let blocked: [Value] = try restoreProblems(receipt["superseded"] ?? [], Value(root)).elements
-        + (try bridgeProblems(receipt["sessions"], true)).elements
-        + (try taskTransferProblems(receipt["taskTransfers"], paths, inspect)).elements
+    let blocked: [Value] = try restoreProblems(receipt.superseded ?? [], Value(root)).elements
+        + (try bridgeProblems(receipt.sessions, true)).elements
+        + (try taskTransferProblems(receipt.taskTransfers, paths, inspect)).elements
     let schedulerHeld = !blocked.isEmpty && blocked.allSatisfy { $0 === Value(SCHEDULER_OWNS) } && !options["check"].truthy
-    if schedulerHeld && !receipt["remote"]["length"].truthy { return ["restartNeeded": true, "file": file, "receipt": receipt] }
+    if schedulerHeld && !receipt.remote["length"].truthy { return ["restartNeeded": true, "file": file, "receipt": receipt] }
     if !blocked.isEmpty && !schedulerHeld { return ["receipt": receipt, "restoreProblems": Value(blocked)] }
     let plan = try prepareUndo(receipt, paths)
     var changedAfterSnapshot: [Value] = []
     let finalWorkers = try workers(try inspect.call())
-    for r in receipt["sessions"].elements {
+    for r in receipt.sessions.elements {
         let changes = try targetChanges(r, finalWorkers, Value(r["strategy"] !== "rehome"))
         if changes.length > 0 { changedAfterSnapshot.append(Value("\(r["title"]) | \(short(r["targetId"])) | \(changes.join(", ")) changed")) }
     }
     if !changedAfterSnapshot.isEmpty { return ["receipt": receipt, "changed": Value(changedAfterSnapshot)] }
     let activationBlocked = try activationProblems(receipt)
     let parentProblems = try undoParentProblems(receipt).elements
-    let familyProblems = try taskTransferProblems(receipt["taskTransfers"], paths, inspect).elements.filter { !schedulerHeld || $0 !== Value(SCHEDULER_OWNS) }
+    let familyProblems = try taskTransferProblems(receipt.taskTransfers, paths, inspect).elements.filter { !schedulerHeld || $0 !== Value(SCHEDULER_OWNS) }
     activationBlocked.asArray?.items.append(contentsOf: parentProblems + familyProblems)
     if activationBlocked.length > 0 { return ["receipt": receipt, "restoreProblems": activationBlocked] }
-    receipt["undoing"] = plan
-    if receipt["remote"]["length"].truthy { receipt["remoteUndoing"] = receipt["remote"].deepClone() }
+    receipt.undoing = plan
+    if receipt.remote["length"].truthy { receipt.remoteUndoing = receipt.remote.deepClone() }
     _ = try cancelCloudChecks(receipt)
     _ = try saveJson(file, receipt)
     let remote = try restoreRemote(receipt, file, paths, options)

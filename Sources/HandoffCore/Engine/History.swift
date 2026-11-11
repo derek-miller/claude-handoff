@@ -1012,13 +1012,14 @@ func linkedCloudIds(_ links: Value = .undefined, _ account: Value = .undefined) 
     return unique(try rows.flatMap { flatArray($0["bridgeIds"]) }.map { try remoteId($0) }.filter { $0.truthy }).value
 }
 func retainedCloudChecks(_ receipt: Value = .undefined, _ inv: Value = .undefined, _ current: Value = .undefined) throws -> Value {
-    try receipt["cloudChecks"].elements.flatMap { check -> [Value] in
+    let receipt = Receipt(receipt)
+    return try receipt.cloudChecks.elements.flatMap { check -> [Value] in
         if try (inv["cloud"]["checked"].truthy && (try sameAccount(check, inv["cloud"])).truthy) ||
             (try inv["deferredCloudSources"].elements.contains { try sameAccount(check, $0).truthy }) ||
             (try localCloudPending(try current.elements.first { try sameAccount($0, check).truthy } ?? .undefined)).truthy {
             return [check]
         }
-        let sessionIds = try linkedCloudIds(receipt["cloudLinks"], check)
+        let sessionIds = try linkedCloudIds(receipt.cloudLinks, check)
         return sessionIds.length > 0 ? [Value.spread(check, ["sessionIds": sessionIds])] : []
     }.value
 }

@@ -122,7 +122,7 @@ public func main(_ argv: [String]) throws {
         if !result.truthy || result.nothing.truthy || !result.receipt.truthy {
             return args.json.truthy ? emit(["done": true, "ok": result.ok ?? true, "moved": 0, "restarted": result.restarted]) : write("  nothing to move\n")
         }
-        let file = result.file, receipt = result.receipt, ok = result.ok
+        let file = result.file, receipt = Receipt(result.receipt), ok = result.ok
         let checks: Value = result.checks.isUndefined ? [] : result.checks
         let problems: Value = result.problems.isUndefined ? [] : result.problems
         if !ok.truthy { process.exitCode = 1 }
@@ -225,7 +225,7 @@ public func main(_ argv: [String]) throws {
                 let r = result.receipt
                 return emit(["undone": r.at, "sessions": r.sessions["length"], "restored": try retiredCount(r), "cloudRestored": r.remote["length"] ?? 0, "restart": Value(r.sessions["length"].truthy || r.superseded["length"].truthy || r.remote["length"].truthy)])
             }
-            let receipt = result.receipt
+            let receipt = Receipt(result.receipt)
             let heldAutomatic = receipt.held["length"].truthy && receipt.held.elements.allSatisfy { $0.release === "worker" }
             let remoteRestored = result.remoteRestored ?? 0
             let first: Value = [
@@ -306,8 +306,8 @@ public func main(_ argv: [String]) throws {
         }
         if result.nothing.truthy { return write("nothing to undo\n") }
         if result.reconciled.truthy { return write("reconciled  \(result.reconciled.title) | \(result.reconciled.error)\n  undo        not run, run it again if still wanted\n") }
-        let receipt = result.receipt
-        write("Undo  \(receipt.at) | \(receipt["from"].join(" + ")) → \(receipt.to)\n")
+        let receipt = Receipt(result.receipt)
+        write("Undo  \(receipt.at) | \(receipt.from.join(" + ")) → \(receipt.to)\n")
         if result.pendingUndo.truthy { return write("  pending     sign Claude Desktop into \(result.pendingUndo.join(" or ")) and run finish\n") }
         if result.retained.truthy {
             let rows = result.retained.elements.map { r in "    \(or(r.title, r.id)) | \(short(r.targetId))" }.joined(separator: "\n")

@@ -63,7 +63,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Data
         }
     }
     let blocked: (Value) throws -> Value = { reason in
-        let receipt = try readReceipt(file)
+        let receipt = Receipt(try readReceipt(file))
         receipt.localRecovery = Value.spread(receipt.localRecovery, ["blocked": reason] as Value)
         let retired = try retiredFiles(receipt)
         receipt.failed.push(Value.spread(["id": .null, "title": "Unfinished move", "error": reason] as Value,
@@ -88,11 +88,11 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Data
             let error = errorObject(error)
             if error.code === "RESTART_REOPENED" || !context.restart.truthy && !family.truthy { throw EngineError(error) }
             try optCall(context.progress)
-            var receipt: Value
-            do { receipt = try readReceipt(file) } catch {
+            var receipt: Receipt
+            do { receipt = Receipt(try readReceipt(file)) } catch {
                 let e = errorObject(error)
                 if e.code !== "ENOENT" { throw EngineError(e) }
-                receipt = .null
+                receipt = Receipt(.null)
             }
             if !last { failed.append(contentsOf: files) }
             let failure = Value.spread(["id": .null, "title": family.truthy ? "Scheduled task family" : "Unfinished move", "error": error["message"]] as Value,
@@ -183,7 +183,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Data
         if try receiptSummary(result.receipt).notMoved.elements.contains(where: { retrying.has($0.file) }) { result.receipt.localStopped = true }
         _ = try saveJson(result.file, result.receipt)
     }
-    let receipt = result["receipt"]
+    let receipt = Receipt(result["receipt"])
     if receipt.truthy && !context.existing.truthy && receipt.sessions.length == 0 && receipt.superseded.length == 0 && receipt.remote.length == 0 && !receipt.held["length"].truthy,
        try openCloudChecks(receipt).length == 0,
        !exists(.string(path.join(paths.state, "quarantine", context.at.description, "failed"))) {
@@ -238,9 +238,9 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
         return sources.isEmpty ? [] : [Value.spread(row, ["sources": Value(sources)] as Value)]
     }
     let initialFailures: [Value] = try inventoryFailures(inv).elements.flatMap(unheldFailures)
-    let receipt: Value
+    let receipt: Receipt
     if !context.existing["receipt"].nullish {
-        receipt = context.existing.receipt
+        receipt = Receipt(context.existing.receipt)
     } else {
         var cloudChecks: Value = []
         if inv.cloudRequested.truthy {
@@ -266,7 +266,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
             "finalizing": true,
         ]
         if context.restart.truthy { r.restart = context.restart }
-        receipt = r
+        receipt = Receipt(r)
     }
     let file: Value = .string(path.join(paths.state, "\(at).json"))
     if context.existing.truthy {
@@ -452,7 +452,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
             unwound.append(contentsOf: files.values)
             try save.call()
         }
-        if !units.isEmpty { receipt.removeKey("localRecovery") }
+        if !units.isEmpty { receipt.clear(.localRecovery) }
         if !unwound.isEmpty { receipt.verification.ok = Value(receipt.verification.problems.length == 0 && receipt.appendCheckpoint["verification"]["ok"] !== false) }
     }
     let done = receipt.sessions.length
@@ -473,8 +473,8 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     }
     try optCall(context.check, true)
     receipt.finalizing = false
-    receipt.removeKey("appendCheckpoint")
-    receipt.removeKey("cloudAttempts")
+    receipt.clear(.appendCheckpoint)
+    receipt.clear(.cloudAttempts)
     receipt.failed = Value(receipt.failed.elements.flatMap(unheldFailures))
     try save.call()
     try optCall(context.sessionProgress, receipt)
@@ -543,7 +543,7 @@ func finishPending(_ paths: DataLayout, _ options: Value = .undefined) throws ->
         if !latest.truthy { return ["nothing": true, "ok": true, "complete": true, "pendingCloud": 0] }
         if options.receiptFile.truthy && latest.file !== options.receiptFile { return ["nothing": true, "ok": true] }
         if try latest.corrupt.truthy || needsRecovery(latest.receipt).truthy {
-            if (options.automatic.truthy || options.background.truthy) && (latest.receipt["undoing"].truthy || latest.receipt["remoteUndoing"]["length"].truthy) {
+            if (options.automatic.truthy || options.background.truthy) && (latest.receipt.undoing.truthy || latest.receipt.remoteUndoing["length"].truthy) {
                 _ = try reconcile(paths, options)
                 return ["pending": true, "ok": true, "complete": false]
             }
@@ -554,7 +554,7 @@ func finishPending(_ paths: DataLayout, _ options: Value = .undefined) throws ->
             }
             return ["reconciled": reconciled, "recoveryRequired": true, "ok": false, "complete": false]
         }
-        let file = latest.file, receipt = latest.receipt
+        let file = latest.file, receipt = Receipt(latest.receipt)
         let outstanding = try openCloudChecks(receipt)
         if outstanding.length == 0 {
             if latest.projected.truthy { _ = try saveJson(file, receipt) }
@@ -680,7 +680,7 @@ func keepLocal(_ paths: DataLayout, _ options: Value = .undefined) throws -> Val
         if recovery.truthy { return ["recoveryRequired": true, "recovery": recovery] }
         let latest = try latestReceipt(paths)
         if !latest.truthy { return ["nothing": true] }
-        let file = latest.file, receipt = latest.receipt
+        let file = latest.file, receipt = Receipt(latest.receipt)
         let available = try openCloudChecks(receipt)
         let optionChecks = options["checks"]
         let checks: [Value] = optionChecks["length"].truthy
