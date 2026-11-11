@@ -782,8 +782,8 @@ func updateRestartReceipt(_ paths: DataLayout, _ file: Value = .undefined, _ upd
     return receipt
 }
 
-public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .undefined, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value { try withDesktopRestart(plan, DataLayout(paths), work, report, io) }
-func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value {
+public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .undefined, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value { try withDesktopRestart(RestartPlan(plan), DataLayout(paths), work, report, io) }
+func withDesktopRestart(_ plan: RestartPlan, _ paths: DataLayout, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     var paths = paths
     paths.claudeApp = (plan.app ?? Value(paths.claudeApp)).description
@@ -799,8 +799,8 @@ func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work:
     let activity: Value = ["progress": Value { _ in lastProgress = try now(); return .undefined }]
     let shutdownWait = toNumber(io.shutdownWait ?? Value(SHUTDOWN_WAIT))
     let file = path.join(paths.state, "restart.json")
-    let state: Value = ["at": Value(stamp()), "attemptId": Value(randomUUID()), "requestedAt": Value(isoNow()), "app": Value(paths.claudeApp),
-                        "desktop": plan.desktop, "held": plan.held, "outcome": "closing"]
+    let state = RestartAttempt(["at": Value(stamp()), "attemptId": Value(randomUUID()), "requestedAt": Value(isoNow()), "app": Value(paths.claudeApp),
+                                "desktop": plan.desktop, "held": plan.held, "outcome": "closing"])
     let origin: Value = plan.receiptFile ?? (plan.selection.truthy ? Value(path.join(paths.state, "\(state.at).json")) : .null)
     let kind: Value = plan.kind === "undo" ? "undo" : plan.resume.truthy || plan.kind === "finish" || plan.kind === "recover" ? "finish" : plan.kind === "move" ? "move" : "restart"
     func diagnostic(_ event: String, _ extra: Value = Value.newObject()) throws {
@@ -814,7 +814,7 @@ func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work:
         ]
         _ = try appendRestartEvent(paths, Value.spread(Value(base), extra))
     }
-    func save() throws { _ = try saveJson(Value(file), state) }
+    func save() throws { _ = try saveJson(Value(file), state.raw) }
     var nextInspection = -Double.infinity
     func check(_ force: Bool) throws {
         let stallWait = toNumber(io.stallWait ?? Value(STALL_WAIT))
@@ -862,7 +862,7 @@ func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work:
             try diagnostic("exited")
             try check(true)
             result = try localActivity.run(activity) {
-                try work.call(["at": state.at, "restart": state, "check": checkValue, "progress": activity.progress])
+                try work.call(["at": state.at, "restart": state.raw, "check": checkValue, "progress": activity.progress])
             }
         }
     } catch {
@@ -890,7 +890,7 @@ func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work:
     do {
         try save()
         if !failure.truthy && result.file.truthy && result.receipt.truthy {
-            let receipt = try updateRestartReceipt(paths, result.file, Value { args in arg(args, 0).restart = Value.spread(state); return .undefined })
+            let receipt = try updateRestartReceipt(paths, result.file, Value { args in arg(args, 0).restart = Value.spread(state.raw); return .undefined })
             if receipt.truthy { Value.assign(result.receipt, receipt) }
         }
     } catch {
@@ -919,7 +919,7 @@ func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work:
             if receipt.truthy && result.receipt.truthy { Value.assign(result.receipt, receipt) }
         } catch {}
     }
-    return ["result": result, "restart": state, "code": stopCode, "error": failure.message ?? state.error,
+    return ["result": result, "restart": state.raw, "code": stopCode, "error": failure.message ?? state.error,
             "ok": Value(state.outcome === "reopened" && !state.error.truthy && result.ok !== false)]
 }
 
