@@ -303,8 +303,8 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     }
     let family = context.taskFamily
     if family.truthy {
-        let source = try taskSessions(family.sourceFile).registry
-        let target = try taskSessions(family.targetFile).registry
+        let source = try taskRegistry(family.sourceFile).data
+        let target = try taskRegistry(family.targetFile).data
         let tasks = Value((source["scheduledTasks"] ?? []).elements.filter { task in family.ids.includes(task.id) })
         let routes = defaultSorted(tasks.elements.map { task in Value([task.id, task.notifySessionId ?? .null]) })
         if stable(Value(routes)) != stable(Value(defaultSorted(family.routes.elements))) { throw EngineError("scheduled task family changed since inventory") }

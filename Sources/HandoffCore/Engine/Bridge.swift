@@ -402,8 +402,8 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
     }
     let sourceTasks = taskSessionsMap.get(s.account.taskFile)
     if sourceTasks.nullish { throw EngineError.type("Cannot read properties of \(sourceTasks) (reading 'has')") }
-    if sourceTasks.has(current.sessionId) { throw EngineError("source scheduled task ownership changed since inventory") }
-    let targetTasks = taskSessionsMap.get(to.taskFile).registry.scheduledTasks ?? .newArray()
+    if TaskRegistry(sourceTasks).notifies(current.sessionId) { throw EngineError("source scheduled task ownership changed since inventory") }
+    let targetTasks = TaskRegistry(taskSessionsMap.get(to.taskFile)).tasks
     if targetTasks.elements.contains(where: { task in
         task.notifySessionId === current.sessionId &&
             !s.taskFamily.replaced.elements.contains(where: { row in stable(row.task) == stable(task) })
@@ -727,7 +727,7 @@ func targetChanges(_ row: Value = .undefined, _ liveWorkers: Value = .undefined,
     }
     if recordChanged { changes.push("desktop record") }
     if try !allowRecordDrift.truthy && !row.taskFamily.truthy && row.taskFile.truthy &&
-        Value(try taskSessions(row.taskFile).has(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned { changes.push("scheduled tasks") }
+        Value(try taskRegistry(row.taskFile).notifies(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned { changes.push("scheduled tasks") }
     if try !allowRecordDrift.truthy && ownsWorker(liveWorkers, row.targetId, row.targetRecordId).truthy { changes.push("running worker") }
     return changes
 }

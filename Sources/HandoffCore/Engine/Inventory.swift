@@ -439,7 +439,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
                         analyzed.set(transcript, detail)
                     }
                     if detail["contentSha"].truthy && !detail["roots"]["size"].truthy && !detail["invalid"].truthy { missing.push(s); return }
-                    let taskOwned = Value(account["taskSessions"].has(s["record"]["sessionId"]))
+                    let taskOwned = Value(Account(account).taskRegistry.notifies(s["record"]["sessionId"]))
                     let worker = try ownsWorker(ctx["workers"], s["id"], s["record"]["sessionId"])
                     let recordSha = Value(sha(try readFile(s["file"])))
                     let semantic = try recordSemantic(s["record"])
@@ -480,7 +480,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
                 let detail: Value = transcript.truthy ? try history(s["id"], transcript, ctx, s["cwd"]) : .null
                 if detail["roots"]["size"].truthy {
                     let head: Value = ["record": s["record"]["sessionId"], "id": s["id"]]
-                    let taskOwned = Value(to["taskSessions"].has(s["record"]["sessionId"]))
+                    let taskOwned = Value(Account(to).taskRegistry.notifies(s["record"]["sessionId"]))
                     let worker = try ownsWorker(ctx["workers"], s["id"], s["record"]["sessionId"])
                     let transcriptFingerprint = try fingerprint(transcript, cache)
                     let sidecar = try sidecars(transcript, s["id"], cache)
