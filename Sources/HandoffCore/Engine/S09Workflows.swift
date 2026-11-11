@@ -39,8 +39,6 @@ public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ 
         let inspect: Value = Value { _ in
             try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(paths["claudeApp"]))
         }
-        // Lets the parity harness rebuild this closure on the Node side (e.g. when inv reaches options.summary).
-        if options["io"]["inspect"].nullish { inspect["$recipe"] = ["inspect", options["processes"], paths["claudeApp"]] }
         let kind: Value = options["recover"].truthy ? "recover" : options["undo"].truthy ? "undo" : from.truthy ? "move" : options["finish"].truthy ? "finish" : "refresh"
         let receiptFile: Value = (options["resume"].truthy ? options["resumeFile"] : options["receiptFile"]) ?? .null
         let planFile = path.join(paths["state"].description, "restart-plan.json")

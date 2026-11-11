@@ -101,15 +101,11 @@ func memoryErrorCode(_ error: Value = .undefined) throws -> Value {
 }
 
 // L72
-// Overridden only by the parity server, which reproduces the Node runtime's budget.
-var nativeHeapLimit: Value? = nil
-var budgetRuntime = "native"
-
 public func memoryBudget(_ io: Value = .undefined) throws -> Value {
     let limitValue = try memoryTarget(io.total ?? Value(process.totalmem()))
     let limit = jsNumber(limitValue)
     // No V8 heap in the native engine: the heap limit equals the memory target.
-    let heapValue = io.heap ?? nativeHeapLimit ?? limitValue
+    let heapValue = io.heap ?? limitValue
     let heap = jsNumber(heapValue)
     let usage: () throws -> Value = io.usage.isUndefined
         ? { let rss = residentBytes(); return ["rss": Value(rss), "heapUsed": Value(rss)] }
@@ -195,7 +191,7 @@ public func memoryBudget(_ io: Value = .undefined) throws -> Value {
             throw JSError(error)
         }
     }
-    return ["limit": limitValue, "heap": heapValue, "signature": Value("\(limitValue):\(heapValue):\(budgetRuntime)"), "check": checkValue,
+    return ["limit": limitValue, "heap": heapValue, "signature": Value("\(limitValue):\(heapValue):native"), "check": checkValue,
             "parallel": parallel, "read": read]
 }
 
@@ -205,8 +201,6 @@ var sharedMemory: Value = .undefined
 func operationMemory() throws -> Value {
     if sharedMemory.nullish {
         sharedMemory = try memoryBudget()
-        // Lets the parity harness hand this budget back to the engine; hidden from JSON and from the engine.
-        if let o = sharedMemory.asObject { o["$recipe"] = ["memory"]; o.hidden.insert("$recipe") }
     }
     return sharedMemory
 }

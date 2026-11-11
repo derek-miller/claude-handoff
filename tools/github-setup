@@ -89,7 +89,7 @@ RULESET=$(cat << EOF
     }},
     {"type": "required_status_checks", "parameters": {
       "do_not_enforce_on_create": false,
-      "required_status_checks": [{"context": "swift", "integration_id": 15368}, {"context": "app", "integration_id": 15368}, {"context": "reference", "integration_id": 15368}, {"context": "parity (1)", "integration_id": 15368}, {"context": "parity (2)", "integration_id": 15368}, {"context": "parity (3)", "integration_id": 15368}, {"context": "parity (4)", "integration_id": 15368}, {"context": "parity (5)", "integration_id": 15368}, {"context": "parity (6)", "integration_id": 15368}],
+      "required_status_checks": [{"context": "swift", "integration_id": 15368}, {"context": "engine", "integration_id": 15368}, {"context": "app", "integration_id": 15368}],
       "strict_required_status_checks_policy": false
     }}
   ]
