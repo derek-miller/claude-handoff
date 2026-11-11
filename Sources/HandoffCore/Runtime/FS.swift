@@ -68,15 +68,13 @@ public struct FileStat {
     public var inoValue: Value { number(ino) }
     public var devValue: Value { number(dev) }
     public var mtimeMs: Value { ms(mtime) }
+    public var mtimeNs: Int64 { FileStat.ns(mtime) }
 
-    // dev:ino:size:mtimeNs:ctimeNs. Without BigInt fields the two times are empty.
     public var identity: String {
         let times = bigint ? "\(FileStat.ns(mtime)):\(FileStat.ns(ctime))" : ":"
         return "\(devValue.description):\(inoValue.description):\(sizeValue.description):\(times)"
     }
 
-    // The stat as an object, for results that carry it: the numeric fields plus isFile/isDirectory/isSymbolicLink/
-    // isFIFO/isSocket as hidden methods.
     public var value: Value {
         let o = ValueObject()
         o["dev"] = number(dev); o["mode"] = number(mode); o["nlink"] = number(nlink); o["uid"] = number(uid); o["gid"] = number(gid)

@@ -657,8 +657,7 @@ func artifactInputs(_ row: Value = .undefined) throws -> Value {
                 if try !entry.isFile || !(try agentName(Value(agent))).truthy { throw artifactFail("subagent entry is not a regular owned file") }
                 let current = try artifactStat(Value(name))
                 fingerprints.append([Value(name), current.signature])
-                let mtimeNs = Int64(current.detail.mtime.tv_sec) * 1_000_000_000 + Int64(current.detail.mtime.tv_nsec)
-                files.append(["file": Value(name), "agent": Value(agent), "modified": Value(Double(mtimeNs / 1_000_000))])
+                files.append(["file": Value(name), "agent": Value(agent), "modified": Value(Double(current.detail.mtimeNs / 1_000_000))])
             }
         }
     }
