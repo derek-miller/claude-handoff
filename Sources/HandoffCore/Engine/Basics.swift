@@ -672,16 +672,16 @@ func restartReceiptId(_ paths: Value = .undefined, _ file: Value = .undefined) t
 func appendRestartEvent(_ paths: Value = .undefined, _ event: Value = .undefined) throws -> Value {
     do {
         let file = path.join(paths.state.description, "restart-events.jsonl")
-        var detail: Value = .null
+        var detail: FileStat?
         do { detail = try fs.lstat(file) } catch {
             let error = errorObject(error)
             if error.code !== "ENOENT" { throw EngineError(error) }
         }
-        if try detail.truthy && !detail["isFile"].call().truthy { return .undefined }
+        if let detail, !detail.isFile { return .undefined }
         let text = jsonText(event, 0)
         let length = Double(text.utf8.count)
         if length > 4096 { return .undefined }
-        if detail.truthy && toNumber(detail["size"]) + length > RESTART_LOG_BYTES {
+        if let detail, Double(detail.size) + length > RESTART_LOG_BYTES {
             try fs.rm("\(file).1", force: true)
             try fs.rename(file, "\(file).1")
         }
@@ -706,7 +706,7 @@ func foldRestartHistory(_ paths: Value = .undefined, _ file: Value = .undefined,
         do {
             handle = try fs.open(path.join(paths.state.description, name), O_RDONLY | O_NOFOLLOW, 0o666)
             let detail = try handle!.stat()
-            if !(try detail["isFile"].call().truthy) || toNumber(detail["size"]) > RESTART_LOG_BYTES { continue }
+            if !detail.isFile || Double(detail.size) > RESTART_LOG_BYTES { continue }
             let text = String(decoding: try handle!.readFile(), as: UTF8.self)
             for line in text.components(separatedBy: "\n").dropLast() {
                 guard let row = try? JSON.parse(line) else { continue }
@@ -724,13 +724,13 @@ func updateRestartReceipt(_ paths: Value = .undefined, _ file: Value = .undefine
     if !(try restartReceiptId(paths, file)).truthy { return .null }
     func snapshot() throws -> Value {
         try [file.description, "\(file).journal"].map { name -> Value in
-            var detail: Value = .null
+            var detail: FileStat?
             do { detail = try fs.lstat(name, bigint: true) } catch {
                 let error = errorObject(error)
                 if error.code !== "ENOENT" { throw EngineError(error) }
             }
-            if try detail.truthy && !detail["isFile"].call().truthy { throw EngineError("Restart receipt is not a regular file") }
-            return detail.truthy ? try statIdentity(detail) : .null
+            if let detail, !detail.isFile { throw EngineError("Restart receipt is not a regular file") }
+            return detail.map { statIdentity($0) } ?? .null
         }.value
     }
     var before: Value = .undefined, receipt: Value = .undefined

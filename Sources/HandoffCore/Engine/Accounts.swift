@@ -12,9 +12,6 @@ fileprivate func member(_ v: Value, _ k: String) throws -> Value {
     return v[k]
 }
 
-fileprivate func isDirectoryStat(_ st: Value) throws -> Bool { try st["isDirectory"].call().truthy }
-fileprivate func isFileStat(_ st: Value) throws -> Bool { try st["isFile"].call().truthy }
-fileprivate func isSymlinkStat(_ st: Value) throws -> Bool { try st["isSymbolicLink"].call().truthy }
 
 fileprivate func nanMax(_ xs: [Double]) -> Double {
     var out = -Double.infinity
@@ -109,7 +106,7 @@ func tree(_ root: Value = .undefined, _ canonicalRoot: Value = .undefined) throw
     let rootPath = root.description, canonical = canonicalRoot.description
     func walk(_ dir: String) throws {
         let before = try fs.lstat(dir, bigint: true)
-        if try !isDirectoryStat(before) || fs.realpath(dir) != path.resolve(dir) {
+        if try !before.isDirectory || fs.realpath(dir) != path.resolve(dir) {
             throw EngineError("unsupported entry \(path.join(rootPath, path.relative(canonical, dir)))")
         }
         let entries = try fs.readdir(dir).enumerated().sorted { a, b in
@@ -120,16 +117,16 @@ func tree(_ root: Value = .undefined, _ canonicalRoot: Value = .undefined) throw
             let p = path.join(dir, e.name)
             if e.isDirectory { try walk(p) } else if e.isFile || e.isSymbolicLink { out.append(Value(p)) } else { throw EngineError("unsupported entry \(p)") }
         }
-        if try statIdentity(fs.lstat(dir, bigint: true)) !== statIdentity(before) || fs.realpath(dir) != path.resolve(dir) {
+        if try fs.lstat(dir, bigint: true).identity != before.identity || fs.realpath(dir) != path.resolve(dir) {
             throw EngineError("sidecars changed while reading")
         }
     }
-    var detail: Value = .null
-    do { detail = try fs.lstat(canonical, bigint: false) } catch {
+    var present = false
+    do { _ = try fs.lstat(canonical, bigint: false); present = true } catch {
         let error = errorObject(error)
         if error["code"] !== "ENOENT" { throw EngineError(error) }
     }
-    if detail.truthy { try walk(canonical) }
+    if present { try walk(canonical) }
     if try mappedPath(root) !== canonicalRoot { throw EngineError("sidecar root mapping changed while reading") }
     return out.value
 }
@@ -142,10 +139,10 @@ func treeFingerprint(_ root: Value = .undefined) throws -> Value {
     for file in files.elements {
         let f = file.description
         let detail = try fs.lstat(f, bigint: true)
-        if try !isFileStat(detail) && !isSymlinkStat(detail) { throw EngineError("unsupported entry \(f)") }
-        let identity = try statIdentity(detail)
+        if !detail.isFile && !detail.isSymbolicLink { throw EngineError("unsupported entry \(f)") }
+        let identity = statIdentity(detail)
         signatures.put(file, identity)
-        let print: Value = try isSymlinkStat(detail) ? Value("link:\(identity):\(sha(try fs.readlink(f)))") : identity
+        let print: Value = detail.isSymbolicLink ? Value("link:\(identity):\(sha(try fs.readlink(f)))") : identity
         if try statIdentity(fs.lstat(f, bigint: true)) !== identity { throw EngineError("sidecars changed while reading") }
         dependencies.append(["rel": Value(path.relative(canonicalRoot.description, f)), "fingerprint": print])
     }
@@ -164,9 +161,9 @@ func manifest(_ root: Value = .undefined, _ cache: Value = .undefined) throws ->
         for file in files.elements {
             let f = file.description
             let detail = try fs.lstat(f, bigint: true)
-            if try statIdentity(detail) !== before["signatures"].get(file) { throw EngineError("sidecars changed while reading") }
+            if statIdentity(detail) !== before["signatures"].get(file) { throw EngineError("sidecars changed while reading") }
             let rel = Value(path.relative(before["canonicalRoot"].description, f))
-            if try isSymlinkStat(detail) {
+            if detail.isSymbolicLink {
                 let data = try fs.readlink(f)
                 rows.push(["rel": rel, "bytes": Value(data.count), "sha": Value(sha(data)), "type": "symlink",
                            "resolved": Value(path.resolve(path.dirname(f), String(decoding: data, as: UTF8.self)))])
@@ -213,7 +210,7 @@ func openAnalysisCache(_ paths: Value = .undefined, _ writable: Value = .undefin
 func fingerprint(_ file: Value = .undefined, _ cache: Value = .undefined) throws -> Value {
     if cache["fingerprints"].has(file) { return cache["fingerprints"].get(file) }
     let detail = try fs.stat(file.description, bigint: true)
-    let value = try statIdentity(detail)
+    let value = statIdentity(detail)
     cache["fingerprints"].put(file, value)
     return value
 }
@@ -269,7 +266,7 @@ public func writeNew(_ file: Value = .undefined, _ text: Value = .undefined, _ c
     var failure: Error?
     do {
         if case .bytes(let b) = text { try handle.writeFile(b.data) } else { try handle.writeFile(text.description) }
-        try created.call(try handle.stat())
+        try created.call(try handle.stat().value)
         try fs.link(temp, f)
         productive()
     } catch { failure = error }
@@ -807,7 +804,7 @@ func logins(_ paths: Value = .undefined) throws -> Value {
             let account = m[1] ?? "", org = m[2] ?? "", raw = m[3] ?? ""
             if !UUID.test(account) || !UUID.test(org) { continue }
             let isDir: Bool
-            do { isDir = try isDirectoryStat(fs.stat(path.join(paths["records"].description, account, org))) } catch { isDir = false }
+            do { isDir = try fs.stat(path.join(paths["records"].description, account, org)).isDirectory } catch { isDir = false }
             if !isDir { continue }
             pairs.put(Value("\(account)/\(org)"), ["account": Value(account), "org": Value(org)])
             let parts = try JSON.parse("\"\(raw)\"").description.components(separatedBy: " · ")
@@ -866,8 +863,8 @@ public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefine
     do {
         handle = try fs.open(path.join(paths["logs"].description, "main.log"), O_RDONLY | O_NOFOLLOW, 0o666)
         let before = try handle!.stat()
-        if try !isFileStat(before) { return result }
-        let total = before["size"].asInt ?? 0
+        if !before.isFile { return result }
+        let total = Int(before.size)
         let size = min(total, 4 * 1024 * 1024)
         let data = try handle!.read(length: size, position: Int64(total - size))
         if data.count != size { return result }
@@ -886,7 +883,7 @@ public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefine
             result.put(key, !result.has(key) || result.get(key) === seconds ? seconds : .null)
         }
         let after = try handle!.stat()
-        if after["size"] !== before["size"] || after["mtimeMs"] !== before["mtimeMs"] { return Value.newMap() }
+        if after.sizeValue !== before.sizeValue || after.mtimeMs !== before.mtimeMs { return Value.newMap() }
     } catch { return Value.newMap() }
     return result
 }

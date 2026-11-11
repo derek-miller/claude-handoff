@@ -558,7 +558,7 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
         let retainedUnchanged = { () throws -> Bool in
             if !retained.truthy { return true }
             return orNull({ try mappedPath(retained["transcript"]) }) === retained["canonicalTranscript"] &&
-                orNull({ try artifactStat(retained["canonicalTranscript"])["signature"] }) === retained["fingerprint"] &&
+                orNull({ try artifactStat(retained["canonicalTranscript"]).signature }) === retained["fingerprint"] &&
                 orNull({ Value(sha(try readRegular(retained["canonicalTranscript"], retained["fingerprint"]))) }) === retained["contentSha"] &&
                 orNull({ try mappedPath(retained["transcript"]) }) === retained["canonicalTranscript"]
         }

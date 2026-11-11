@@ -33,7 +33,6 @@ fileprivate func handleOf(_ v: Value) throws -> FileHandle { try unboxed(v, File
 fileprivate func hashOf(_ v: Value) throws -> RunningHash { try unboxed(v, RunningHash.self) }
 
 fileprivate func str(_ v: Value) -> String { v.description }
-fileprivate func isFileStat(_ st: Value) throws -> Bool { try st["isFile"].call().truthy }
 fileprivate func byteLength(_ v: Value) -> Double { Double(v.description.utf8.count) }
 fileprivate func nanMax(_ a: Double, _ b: Double) -> Double { a.isNaN || b.isNaN ? .nan : Swift.max(a, b) }
 fileprivate func nanMin(_ a: Double, _ b: Double) -> Double { a.isNaN || b.isNaN ? .nan : Swift.min(a, b) }
@@ -133,12 +132,12 @@ func bridgePlans(_ row: Value = .undefined, _ aliases: Value = .undefined) throw
 func bridgeFile(_ plan: Value = .undefined, _ writable: Value = .undefined, _ work: Value = .undefined) throws -> Value {
     if try mappedPath(plan.transcript) !== plan.canonical || Value(try fs.realpath(str(plan.canonical))) !== plan.canonical { throw try bridgeFailure("transcript path changed") }
     let before = try fs.lstat(str(plan.canonical), bigint: true)
-    if !(try isFileStat(before)) || plan.dev !== Value(before.dev.description) || plan.ino !== Value(before.ino.description) { throw try bridgeFailure("transcript identity changed") }
+    if !before.isFile || plan.dev !== Value(before.dev.description) || plan.ino !== Value(before.ino.description) { throw try bridgeFailure("transcript identity changed") }
     let flags: Int32 = (writable.truthy ? O_RDWR | O_APPEND : O_RDONLY) | O_NOFOLLOW | O_NONBLOCK
     let handle = try fs.open(str(plan.canonical), flags, 0o666)
     let boxedHandle = boxed(handle)
     return try withFinally({
-        _ = try bridgeStable(plan, boxedHandle, try statIdentity(before))
+        _ = try bridgeStable(plan, boxedHandle, statIdentity(before))
         return try work.call(boxedHandle)
     }, { try handle.close() })
 }
@@ -150,7 +149,7 @@ func bridgeStable(_ plan: Value = .undefined, _ handle: Value = .undefined, _ si
     }
     let current = try handleOf(handle).stat(bigint: true)
     let named = try fs.lstat(str(plan.canonical), bigint: true)
-    if try !isFileStat(current) || !isFileStat(named) || statIdentity(current) !== signature || statIdentity(named) !== signature ||
+    if try !current.isFile || !named.isFile || statIdentity(current) !== signature || statIdentity(named) !== signature ||
         Value(current.dev.description) !== plan.dev || Value(current.ino.description) !== plan.ino ||
         mappedPath(plan.transcript) !== plan.canonical || Value(fs.realpath(str(plan.canonical))) !== plan.canonical { throw try bridgeFailure("transcript changed") }
     return .undefined
@@ -159,7 +158,7 @@ func bridgeStable(_ plan: Value = .undefined, _ handle: Value = .undefined, _ si
 func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ parse: Value = .undefined) throws -> Value {
     let parse = parse.isUndefined ? Value(true) : parse
     let file = try handleOf(handle)
-    let detail = try file.stat(bigint: true), size = toNumber(detail["size"]), signature = try statIdentity(detail)
+    let detail = try file.stat(bigint: true), size = Double(detail.size), signature = statIdentity(detail)
     if !isSafeInteger(Value(size)) { throw try bridgeFailure("transcript size is unsupported") }
     let memory = try operationMemory()
     let hash = RunningHash(), prefix = RunningHash()
@@ -715,8 +714,8 @@ func targetChanges(_ row: Value = .undefined, _ liveWorkers: Value = .undefined,
                 var rewound = row.strategy === "rehome" && record.cliSessionId !== row.targetId && UUID.test((record.cliSessionId ?? "").description)
                 if rewound { rewound = try priorSessions(record).includes(row.targetId) }
                 if rewound {
-                    let detail = (try? fs.stat(path.join(path.dirname(str(row.targetTranscript)), "\(record.cliSessionId).jsonl"))) ?? .null
-                    rewound = detail.nullish ? false : try isFileStat(detail)
+                    let detail = try? fs.stat(path.join(path.dirname(str(row.targetTranscript)), "\(record.cliSessionId).jsonl"))
+                    rewound = detail?.isFile ?? false
                 }
                 recordChanged = try !validDesktopRecord(["file": row.record, "record": record]).truthy ||
                     ["sessionId", "cwd", "originCwd"].contains(where: { record[$0] !== row.recordSnapshot[$0] }) ||
@@ -778,10 +777,10 @@ func snapshotPlan(_ item: Value = .undefined) throws -> Value {
         let file = pair[0], parked = pair[1]
         if !LOCAL_RECORD.test(path.basename(str(file), ".json")) { continue }
         let temp = "\(file).tmp"
-        let detail: Value
+        let detail: FileStat
         do { detail = try fs.lstat(temp) }
         catch { if errorObject(error).code === "ENOENT" { continue }; throw error }
-        if !(try isFileStat(detail)) { throw EngineError("Desktop record temp is not a regular file: \(path.basename(temp))") }
+        if !detail.isFile { throw EngineError("Desktop record temp is not a regular file: \(path.basename(temp))") }
         let raw = try readFile(Value(temp))
         if stable(try JSON.parse(raw.asData ?? Data())) != stable(try readJson(file)) { throw EngineError("Desktop record has a different pending update: \(path.basename(str(file)))") }
         plan.hashes.push([Value(temp), Value(sha(raw))])

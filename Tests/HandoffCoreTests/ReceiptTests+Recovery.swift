@@ -792,7 +792,7 @@ extension Engine.Receipts {
         try h.record("P", SOURCE, rehomeRecord())
         try mkdirp(dir)
         try writeData(file, data)
-        let detail = try FileSystem.nativeStat(file, true, follow: true)
+        let detail = try FileSystem.nativeStat(file, true, follow: true).value
         let signature = [detail.dev, detail.ino, detail.size, detail.mtimeNs, detail.ctimeNs].map { $0.description }.joined(separator: ":")
         let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
         let inv = try inventory([from], to, h.paths, NOOP, ["processes": []])

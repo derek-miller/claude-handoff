@@ -38,40 +38,61 @@ func errnoName(_ err: Int32) -> (String, String) {
     }
 }
 
-// The stat fields the engine reads. With `bigint`, numeric fields are BigInt and the *Ns nanosecond fields exist.
-public func statValue(_ s: stat, bigint: Bool) -> Value {
-    let o = ValueObject()
-    func n(_ x: Int64) -> Value { bigint ? .bigint(x) : .number(Double(x)) }
-    o["dev"] = n(Int64(s.st_dev))
-    o["mode"] = n(Int64(s.st_mode))
-    o["nlink"] = n(Int64(s.st_nlink))
-    o["uid"] = n(Int64(s.st_uid))
-    o["gid"] = n(Int64(s.st_gid))
-    o["rdev"] = n(Int64(s.st_rdev))
-    o["blksize"] = n(Int64(s.st_blksize))
-    o["ino"] = n(Int64(bitPattern: UInt64(s.st_ino)))
-    o["size"] = n(Int64(s.st_size))
-    o["blocks"] = n(Int64(s.st_blocks))
-    func ns(_ t: timespec) -> Int64 { Int64(t.tv_sec) * 1_000_000_000 + Int64(t.tv_nsec) }
-    func ms(_ t: timespec) -> Value { bigint ? .bigint(ns(t) / 1_000_000) : .number(Double(t.tv_sec) * 1000 + Double(t.tv_nsec) / 1_000_000) }
-    o["atimeMs"] = ms(s.st_atimespec)
-    o["mtimeMs"] = ms(s.st_mtimespec)
-    o["ctimeMs"] = ms(s.st_ctimespec)
-    o["birthtimeMs"] = ms(s.st_birthtimespec)
-    if bigint {
-        o["atimeNs"] = .bigint(ns(s.st_atimespec))
-        o["mtimeNs"] = .bigint(ns(s.st_mtimespec))
-        o["ctimeNs"] = .bigint(ns(s.st_ctimespec))
-        o["birthtimeNs"] = .bigint(ns(s.st_birthtimespec))
+// A stat result. `bigint` records whether it was read with BigInt fields: only those carry nanosecond times, so
+// it changes `value` and `identity`, both of which are stored on disk.
+public struct FileStat {
+    public let dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks: Int64
+    public let atime, mtime, ctime, birthtime: timespec
+    public let bigint: Bool
+
+    public init(_ s: Darwin.stat, bigint: Bool) {
+        dev = Int64(s.st_dev); mode = Int64(s.st_mode); nlink = Int64(s.st_nlink); uid = Int64(s.st_uid); gid = Int64(s.st_gid)
+        rdev = Int64(s.st_rdev); blksize = Int64(s.st_blksize); ino = Int64(bitPattern: UInt64(s.st_ino)); size = Int64(s.st_size)
+        blocks = Int64(s.st_blocks); atime = s.st_atimespec; mtime = s.st_mtimespec; ctime = s.st_ctimespec
+        birthtime = s.st_birthtimespec; self.bigint = bigint
     }
-    let kind = s.st_mode & S_IFMT
-    o["isFile"] = Value { _ in .bool(kind == S_IFREG) }
-    o["isDirectory"] = Value { _ in .bool(kind == S_IFDIR) }
-    o["isSymbolicLink"] = Value { _ in .bool(kind == S_IFLNK) }
-    o["isFIFO"] = Value { _ in .bool(kind == S_IFIFO) }
-    o["isSocket"] = Value { _ in .bool(kind == S_IFSOCK) }
-    o.hidden = ["isFile", "isDirectory", "isSymbolicLink", "isFIFO", "isSocket"]
-    return .object(o)
+
+    private var kind: mode_t { mode_t(truncatingIfNeeded: mode) & S_IFMT }
+    public var isFile: Bool { kind == S_IFREG }
+    public var isDirectory: Bool { kind == S_IFDIR }
+    public var isSymbolicLink: Bool { kind == S_IFLNK }
+    public var isFIFO: Bool { kind == S_IFIFO }
+    public var isSocket: Bool { kind == S_IFSOCK }
+
+    private static func ns(_ t: timespec) -> Int64 { Int64(t.tv_sec) * 1_000_000_000 + Int64(t.tv_nsec) }
+    private func number(_ x: Int64) -> Value { bigint ? .bigint(x) : .number(Double(x)) }
+    private func ms(_ t: timespec) -> Value {
+        bigint ? .bigint(FileStat.ns(t) / 1_000_000) : .number(Double(t.tv_sec) * 1000 + Double(t.tv_nsec) / 1_000_000)
+    }
+    public var sizeValue: Value { number(size) }
+    public var inoValue: Value { number(ino) }
+    public var devValue: Value { number(dev) }
+    public var mtimeMs: Value { ms(mtime) }
+    public var mtimeNs: Int64 { FileStat.ns(mtime) }
+
+    public var identity: String {
+        let times = bigint ? "\(FileStat.ns(mtime)):\(FileStat.ns(ctime))" : ":"
+        return "\(devValue.description):\(inoValue.description):\(sizeValue.description):\(times)"
+    }
+
+    public var value: Value {
+        let o = ValueObject()
+        o["dev"] = number(dev); o["mode"] = number(mode); o["nlink"] = number(nlink); o["uid"] = number(uid); o["gid"] = number(gid)
+        o["rdev"] = number(rdev); o["blksize"] = number(blksize); o["ino"] = number(ino); o["size"] = number(size); o["blocks"] = number(blocks)
+        o["atimeMs"] = ms(atime); o["mtimeMs"] = ms(mtime); o["ctimeMs"] = ms(ctime); o["birthtimeMs"] = ms(birthtime)
+        if bigint {
+            o["atimeNs"] = .bigint(FileStat.ns(atime)); o["mtimeNs"] = .bigint(FileStat.ns(mtime))
+            o["ctimeNs"] = .bigint(FileStat.ns(ctime)); o["birthtimeNs"] = .bigint(FileStat.ns(birthtime))
+        }
+        let (file, directory, link, fifo, socket) = (isFile, isDirectory, isSymbolicLink, isFIFO, isSocket)
+        o["isFile"] = Value { _ in .bool(file) }
+        o["isDirectory"] = Value { _ in .bool(directory) }
+        o["isSymbolicLink"] = Value { _ in .bool(link) }
+        o["isFIFO"] = Value { _ in .bool(fifo) }
+        o["isSocket"] = Value { _ in .bool(socket) }
+        o.hidden = ["isFile", "isDirectory", "isSymbolicLink", "isFIFO", "isSocket"]
+        return .object(o)
+    }
 }
 
 public struct Dirent {
@@ -90,7 +111,7 @@ public final class FileHandle {
     init(fd: Int32, path: String) { self.fd = fd; self.path = path }
     deinit { if !closed { Darwin.close(fd) } }
 
-    public func stat(bigint: Bool = false) throws -> Value {
+    public func stat(bigint: Bool = false) throws -> FileStat {
         try fs.handleStat(self, bigint)
     }
     public func readFile() throws -> Data { try fs.handleReadFile(self) }
@@ -129,8 +150,8 @@ public final class FileHandle {
 public final class FileSystem {
     public var readFile: (String) throws -> Data = FileSystem.nativeReadFile
     public var writeFile: (String, Data, String, Int) throws -> Void = FileSystem.nativeWriteFile
-    public var stat: (String, Bool) throws -> Value = { p, big in try FileSystem.nativeStat(p, big, follow: true) }
-    public var lstat: (String, Bool) throws -> Value = { p, big in try FileSystem.nativeStat(p, big, follow: false) }
+    public var stat: (String, Bool) throws -> FileStat = { p, big in try FileSystem.nativeStat(p, big, follow: true) }
+    public var lstat: (String, Bool) throws -> FileStat = { p, big in try FileSystem.nativeStat(p, big, follow: false) }
     public var readdir: (String) throws -> [Dirent] = FileSystem.nativeReaddir
     public var mkdir: (String, Bool, Int) throws -> Void = FileSystem.nativeMkdir
     public var rename: (String, String) throws -> Void = { a, b in if Darwin.rename(a, b) != 0 { throw fsError(errno, "rename", a, b) } }
@@ -143,10 +164,10 @@ public final class FileSystem {
     public var readlink: (String) throws -> Data = FileSystem.nativeReadlink
     public var copyFile: (String, String) throws -> Void = { a, b in if copyfile(a, b, nil, copyfile_flags_t(COPYFILE_ALL)) != 0 { throw fsError(errno, "copyfile", a, b) } }
     public var open: (String, Int32, Int) throws -> FileHandle = FileSystem.nativeOpen
-    public var handleStat: (FileHandle, Bool) throws -> Value = { h, big in
+    public var handleStat: (FileHandle, Bool) throws -> FileStat = { h, big in
         var s = Darwin.stat()
         if fstat(h.fd, &s) != 0 { throw fsError(errno, "fstat") }
-        return statValue(s, bigint: big)
+        return FileStat(s, bigint: big)
     }
     public var handleReadFile: (FileHandle) throws -> Data = { h in
         var out = Data()
@@ -188,11 +209,11 @@ public final class FileSystem {
         try h.writeFile(data)
     }
 
-    public static func nativeStat(_ p: String, _ bigint: Bool, follow: Bool) throws -> Value {
+    public static func nativeStat(_ p: String, _ bigint: Bool, follow: Bool) throws -> FileStat {
         var s = Darwin.stat()
         let r: Int32 = follow ? statPath(p, &s) : Darwin.lstat(p, &s)
         if r != 0 { throw fsError(errno, follow ? "stat" : "lstat", p) }
-        return statValue(s, bigint: bigint)
+        return FileStat(s, bigint: bigint)
     }
 
     public static func nativeReaddir(_ p: String) throws -> [Dirent] {
@@ -280,8 +301,8 @@ extension FileSystem {
     public func readText(_ p: String) throws -> String { String(decoding: try readFile(p), as: UTF8.self) }
     public func readJSON(_ p: String) throws -> Value { try JSON.parse(try readFile(p)) }
     public func write(_ p: String, _ text: String, flag: String = "w", mode: Int = 0o666) throws { try writeFile(p, Data(text.utf8), flag, mode) }
-    public func stat(_ p: String, bigint: Bool = false) throws -> Value { try stat(p, bigint) }
-    public func lstat(_ p: String, bigint: Bool = false) throws -> Value { try lstat(p, bigint) }
+    public func stat(_ p: String, bigint: Bool = false) throws -> FileStat { try stat(p, bigint) }
+    public func lstat(_ p: String, bigint: Bool = false) throws -> FileStat { try lstat(p, bigint) }
     public func names(_ p: String) throws -> [String] { try readdir(p).map(\.name) }
     public func mkdirp(_ p: String, mode: Int = 0o777) throws { try mkdir(p, true, mode) }
     public func rm(_ p: String, recursive: Bool = false, force: Bool = false) throws { try rm(p, recursive, force) }
