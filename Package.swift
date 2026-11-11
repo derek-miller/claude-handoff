@@ -22,6 +22,6 @@ let package = Package(
         ),
         // Runs engine exports for the Node test suite (Tests/Parity); debug builds only, via @testable import.
         .executableTarget(name: "handoff-parity", dependencies: ["HandoffCore"]),
-        .testTarget(name: "HandoffCoreTests", dependencies: ["HandoffCore"]),
+        .testTarget(name: "HandoffCoreTests", dependencies: ["HandoffCore"], exclude: ["Fixtures"]),
     ]
 )
