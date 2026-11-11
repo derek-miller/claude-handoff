@@ -37,7 +37,8 @@ extension Engine {
 
         static func splicedApp() throws -> String {
             let app = try readText(path.join(here, "../../Sources/ClaudeHandoff/App.swift"))
-            guard var source = app.components(separatedBy: "@main\nstruct HandoffApp: App {").first, source.count < app.count else {
+            guard var source = app.components(separatedBy: "@main
+enum Main {").first, source.count < app.count else {
                 throw EngineError("App.swift has no HandoffApp entry point")
             }
             source = try replaceOnce(source, "import Sparkle\n", "")
