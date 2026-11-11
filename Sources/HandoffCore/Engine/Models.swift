@@ -326,10 +326,6 @@ struct Receipt {
         get { raw["writer"] }
         nonmutating set { raw["writer"] = newValue }
     }
-    var restart: Value {
-        get { raw["restart"] }
-        nonmutating set { raw["restart"] = newValue }
-    }
     func clear(_ field: Field) { raw.removeKey(field.rawValue) }
 
     enum Field: String { case appendCheckpoint, cloudAttempts, localRecovery, remotePending, remoteUndoing }
