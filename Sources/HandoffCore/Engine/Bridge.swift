@@ -428,7 +428,7 @@ func rehomeOne(_ sourceValue: Value = .undefined, _ to: Value = .undefined, _ jo
             !s.taskFamily["replaced"].elements.contains(where: { row in stable(row["task"]) == stable(task) })
     }) { throw EngineError("target scheduled task collision") }
     if try ownsWorker(check.workers, s.id, current.sessionId).truthy { throw EngineError("running worker") }
-    let title = or(or(Value((current.title ?? "").description.trimmingWhitespace), s.raw["title"]), "Untitled")
+    let title = or(or(Value((current.title ?? "").description.trimmingWhitespace), s.title), "Untitled")
     let record = path.join(destination.dir, path.basename(str(s.file)))
     let sourceRecordSha = sha(sourceRecord)
     let placed = Value.spread(try without(currentValue, .strings(ACCOUNT_ERROR_KEYS)), ["bridgeSessionIds": .newArray()])
@@ -543,7 +543,7 @@ func retirementOwnership(_ inv: MovePlan, _ row: Value = .undefined, _ owner: Va
 func sourceIdentity(_ row: Value = .undefined) throws -> Value {
     let source = MoveSource(row)
     let rest: Value = ["label": try accountLabel(source.account.raw), "id": source.id, "sessionId": DesktopRecord(source.record).sessionId, "file": source.file,
-                       "title": row["title"], "remoteIds": try remoteIdsOf(row)]
+                       "title": source.title, "remoteIds": try remoteIdsOf(row)]
     return Value.spread(try accountRef(source.account.raw), rest, source.recordSha.truthy ? ["recordSha": source.recordSha] : [:])
 }
 func failureIdentity(_ item: Value = .undefined) throws -> Value {
@@ -552,7 +552,7 @@ func failureIdentity(_ item: Value = .undefined) throws -> Value {
 }
 func inventoryFailure(_ item: Value = .undefined) throws -> Value {
     let source = MoveSource(item)
-    func name(_ row: MoveSource) -> String { "\(row.account.raw["label"]) | \(or(row.raw["title"], Value(path.basename(str(row.file)))))" }
+    func name(_ row: MoveSource) -> String { "\(row.account.label) | \(or(row.title, Value(path.basename(str(row.file)))))" }
     let title: String
     if toNumber(item["members"]["length"]) > 1 {
         title = item["members"].elements.map { name(MoveSource($0)) }.joined(separator: " + ")

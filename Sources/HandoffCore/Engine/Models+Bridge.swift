@@ -595,6 +595,7 @@ extension MoveSource {
         get { raw["roots"] }
         nonmutating set { raw["roots"] = newValue }
     }
+    var title: Value { raw["title"] }
     var worker: Value { raw["worker"] }
 }
 
