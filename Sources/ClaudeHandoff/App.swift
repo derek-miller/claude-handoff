@@ -1266,8 +1266,7 @@ final class Model: ObservableObject {
     }
 }
 
-// The panel is our own window rather than MenuBarExtra's: MenuBarExtra keeps a resized window's bottom edge, so the
-// panel slid away from the menu bar whenever its content changed height, and pinning its top fought its own sizing.
+// MenuBarExtra keeps a resized window's bottom edge, not its top.
 @MainActor
 final class StatusPanel: NSObject {
     static let shared = StatusPanel()
