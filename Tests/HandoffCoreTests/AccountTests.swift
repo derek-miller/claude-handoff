@@ -213,8 +213,17 @@ extension Engine {
             throwsError(where: ["code": "ACCOUNT_NOT_EMPTY"]) { try tidy(h.paths, ["account": Value(owner), "org": Value(ownerOrg)]) }
             throwsError(where: ["code": "ACCOUNT_NOT_EMPTY"]) { try tidy(h.paths, ["account": Value(other), "org": Value(ownerOrg)]) }
             throwsError(where: ["code": "NO_ACCOUNT"]) { try tidy(h.paths, ["account": Value(other), "org": Value(team)]) }
+            let guestFolder = path.join(h.paths.records.str, guest, guestOrg)
+            try writeText(path.join(guestFolder, "notes.txt"), "mine")
+            throwsError(where: ["code": "ACCOUNT_NOT_EMPTY"]) { try tidy(h.paths, ["account": Value(guest), "org": Value(guestOrg)]) }
+            try FileManager.default.removeItem(atPath: path.join(guestFolder, "notes.txt"))
+            for dir in ["backlog", "waiting-input", "rpm"] { try mkdirp(path.join(guestFolder, dir)) }
+            try writeJSON(path.join(guestFolder, "backlog", "tasks.json"), ["version": 1, "items": [["id": "todo_1", "source": "dismissed"]]])
+            try writeJSON(path.join(guestFolder, "archived-sessions.idx"), ["v": 1, "archived": []])
+            try writeText(path.join(guestFolder, "deleted_\(id(951))"), "deleted")
             let single = try tidy(h.paths, ["account": Value(guest), "org": Value(guestOrg)])
             deq(single.moved.map { Value($0.account.str + $0.org.str) }, [Value(guest + guestOrg)])
+            #expect(exists(path.join(single.dest.str, "claude-code-sessions", guest, guestOrg, "backlog", "tasks.json")))
             for root in [h.paths.records.str, h.paths.agentSessions.str] { #expect(!exists(path.join(root, guest, guestOrg))) }
             #expect(exists(path.join(h.paths.records.str, guest, team)))
         }

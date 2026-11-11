@@ -1268,12 +1268,16 @@ func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Va
     }.value
 }
 
+// Besides these, Desktop writes a deleted_<id> marker for each session it deletes.
+let desktopBookkeeping: Set<String> = ["archived-sessions.idx", "backlog", "waiting-input", "rpm"]
+
 // While Desktop switches logins it briefly pairs the incoming account with the previous login's org and leaves an
 // empty folder for that pair in both session trees. Only folders with no sessions and no scheduled tasks qualify.
 func holdsNothing(_ dir: String) -> Bool {
     let names: [String]
     do { names = try fs.names(dir) } catch { return errorObject(error).code === "ENOENT" }
     for name in names {
+        if desktopBookkeeping.contains(name) || name.hasPrefix("deleted_") { continue }
         guard name == "scheduled-tasks.json", let registry = try? fs.readJSON(path.join(dir, name)),
               case .array(let tasks) = registry["scheduledTasks"], tasks.items.isEmpty else { return false }
     }
