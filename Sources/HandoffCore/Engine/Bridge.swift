@@ -86,50 +86,55 @@ func bridgeError(_ text: Value = .undefined) throws -> Value {
 }
 fileprivate func bridgeFailure(_ text: String) throws -> EngineError { EngineError(try bridgeError(Value(text))) }
 func bridgeEntry(_ entry: Value = .undefined, _ sessionId: Value = .undefined) throws -> Value {
-    Value(entry.truthy && entry.typeOf == "object" && !entry.isArray &&
-        entry["type"] === "bridge-session" && entry.sessionId === sessionId && (entry.bridgeSessionId ?? entry.bridge_session_id).isString)
+    let line = BridgeEntry(entry)
+    return Value(entry.truthy && entry.typeOf == "object" && !entry.isArray &&
+        line.type === "bridge-session" && line.sessionId === sessionId && line.bridgeSessionId.isString)
 }
 
 func bridgePlans(_ row: Value = .undefined, _ aliases: Value = .undefined) throws -> Value {
     let aliases = aliases.isUndefined ? Value.newArray() : aliases
-    if row.bridgeAppend.nullish && row.bridgeUndo.nullish { return .newArray() }
-    let id = row.targetId ?? row.id
-    let plans = Value([row.bridgeAppend] + (row.bridgeUndo.nullish ? [] : [row.bridgeUndo]))
-    for (index, plan) in plans.elements.enumerated() {
+    let session = PlacedSession(row)
+    if session.bridgeAppend.nullish && session.bridgeUndo.nullish { return .newArray() }
+    let id = session.targetId ?? session.id
+    let plans = Value([session.bridgeAppend] + (session.bridgeUndo.nullish ? [] : [session.bridgeUndo]))
+    for (index, value) in plans.elements.enumerated() {
+        let plan = BridgePlan(value), first = BridgePlan(plans[0])
         let invalid = { () throws -> Never in throw try bridgeFailure("invalid bridge recovery receipt") }
-        if try !UUID.test((id ?? "").description) || !plan.truthy || plan.typeOf != "object" || plan.isArray || plan.sessionId !== id ||
-            !(try bridgeEntry(plan.original, id)).truthy || !(plan.original.bridgeSessionId ?? plan.original.bridge_session_id).truthy { try invalid() }
-        let made0 = row.made[0]
-        let recordId = row.targetRecordId ?? row.recordSnapshot.sessionId ?? row.recordId ??
+        if try !UUID.test((id ?? "").description) || !value.truthy || value.typeOf != "object" || value.isArray || plan.sessionId !== id ||
+            !(try bridgeEntry(plan.original, id)).truthy || !BridgeEntry(plan.original).bridgeSessionId.truthy { try invalid() }
+        let made0 = session.made[0]
+        let recordId = session.targetRecordId ?? DesktopRecord(session.recordSnapshot).sessionId ?? session.recordId ??
             (made0.truthy ? Value(path.basename(made0.description, ".json")) : .null)
         let recordIds = plan.recordIds
         if !recordIds.isArray || recordIds.length == 0 || recordIds.elements.contains(where: { !$0.isString || !LOCAL_RECORD.test($0.description) }) ||
             ValueSet(recordIds.elements).size != recordIds.length || ([recordId] + aliases.elements).contains(where: { $0.truthy && !recordIds.includes($0) }) { try invalid() }
-        if ["transcript", "canonical"].contains(where: { key in !plan[key].isString || !path.isAbsolute(plan[key].description) || path.basename(plan[key].description) != "\(id).jsonl" }) ||
-            ["dev", "ino"].contains(where: { key in !plan[key].isString || !DIGITS.test(plan[key].description) }) ||
-            !isSafeInteger(plan["length"]) || toNumber(plan["length"]) < 0 ||
-            ["sha", "afterSha"].contains(where: { key in !plan[key].isString || !HEX64.test(plan[key].description) }) { try invalid() }
+        if [plan.transcript, plan.canonical].contains(where: { !$0.isString || !path.isAbsolute($0.description) || path.basename($0.description) != "\(id).jsonl" }) ||
+            [plan.dev, plan.ino].contains(where: { !$0.isString || !DIGITS.test($0.description) }) ||
+            !isSafeInteger(plan.length) || toNumber(plan.length) < 0 ||
+            [plan.sha, plan.afterSha].contains(where: { !$0.isString || !HEX64.test($0.description) }) { try invalid() }
         let signature: [String] = plan.fingerprint.isString ? plan.fingerprint.description.splitting(":") : []
-        if signature.count != 5 || signature[0..<3].joined(separator: ":") != "\(plan.dev):\(plan.ino):\(plan["length"])" ||
+        if signature.count != 5 || signature[0..<3].joined(separator: ":") != "\(plan.dev):\(plan.ino):\(plan.length)" ||
             signature[3...].contains(where: { !SIGNED.test($0) }) { try invalid() }
-        let bytes = jsonText(index != 0 ? plans[0].original : try bridgeClear(id), 0)
-        if plan["bytes"] !== Value(bytes) && plan["bytes"] !== Value("\n\(bytes)") || !isSafeInteger(Value(toNumber(plan["length"]) + byteLength(plan["bytes"]))) { try invalid() }
-        if (row.targetTranscript ?? row.transcript ?? plan.transcript) !== plan.transcript || index != 0 &&
-            (["transcript", "canonical", "dev", "ino"].contains(where: { plan[$0] !== plans[0][$0] }) || stable(plan.recordIds) != stable(plans[0].recordIds) ||
-             stable(plan.original) != stable(plans[0].original) || toNumber(plan["length"]) < toNumber(plans[0]["length"]) + byteLength(plans[0]["bytes"])) { try invalid() }
+        let bytes = jsonText(index != 0 ? first.original : try bridgeClear(id), 0)
+        if plan.bytes !== Value(bytes) && plan.bytes !== Value("\n\(bytes)") || !isSafeInteger(Value(toNumber(plan.length) + byteLength(plan.bytes))) { try invalid() }
+        if (session.targetTranscript ?? session.transcript ?? plan.transcript) !== plan.transcript || index != 0 &&
+            (plan.transcript !== first.transcript || plan.canonical !== first.canonical || plan.dev !== first.dev || plan.ino !== first.ino ||
+             stable(plan.recordIds) != stable(first.recordIds) ||
+             stable(plan.original) != stable(first.original) || toNumber(plan.length) < toNumber(first.length) + byteLength(first.bytes)) { try invalid() }
         if !plan.continuation.nullish {
-            let continuation = plan.continuation, offset = toNumber(continuation["length"]) - toNumber(plan["length"])
-            if !isSafeInteger(Value(offset)) || offset < 0 || offset >= byteLength(plan["bytes"]) ||
+            let continuation = BridgeContinuation(plan.continuation), offset = toNumber(continuation.length) - toNumber(plan.length)
+            if !isSafeInteger(Value(offset)) || offset < 0 || offset >= byteLength(plan.bytes) ||
                 !continuation.sha.isString || !HEX64.test(continuation.sha.description) ||
-                continuation["bytes"] !== Value(subarray(Data(plan["bytes"].description.utf8), offset).base64EncodedString()) ||
+                continuation.bytes !== Value(subarray(Data(plan.bytes.description.utf8), offset).base64EncodedString()) ||
                 !continuation.fingerprint.isString ||
-                !re("^\(plan.dev):\(plan.ino):\(continuation["length"]):-?[0-9]+:-?[0-9]+\\z").test(continuation.fingerprint.description) { try invalid() }
+                !re("^\(plan.dev):\(plan.ino):\(continuation.length):-?[0-9]+:-?[0-9]+\\z").test(continuation.fingerprint.description) { try invalid() }
         }
     }
     return plans
 }
 
-func bridgeFile(_ plan: Value = .undefined, _ writable: Value = .undefined, _ work: Value = .undefined) throws -> Value {
+func bridgeFile(_ planValue: Value = .undefined, _ writable: Value = .undefined, _ work: Value = .undefined) throws -> Value {
+    let plan = BridgePlan(planValue)
     if try mappedPath(plan.transcript) !== plan.canonical || Value(try fs.realpath(str(plan.canonical))) !== plan.canonical { throw try bridgeFailure("transcript path changed") }
     let before = try fs.lstat(str(plan.canonical), bigint: true)
     if !before.isFile || plan.dev !== Value(before.dev.description) || plan.ino !== Value(before.ino.description) { throw try bridgeFailure("transcript identity changed") }
@@ -137,12 +142,13 @@ func bridgeFile(_ plan: Value = .undefined, _ writable: Value = .undefined, _ wo
     let handle = try fs.open(str(plan.canonical), flags, 0o666)
     let boxedHandle = boxed(handle)
     return try withFinally({
-        _ = try bridgeStable(plan, boxedHandle, statIdentity(before))
+        _ = try bridgeStable(planValue, boxedHandle, statIdentity(before))
         return try work.call(boxedHandle)
     }, { try handle.close() })
 }
 
-func bridgeStable(_ plan: Value = .undefined, _ handle: Value = .undefined, _ signature: Value = .undefined, _ inspect: Value = .undefined) throws -> Value {
+func bridgeStable(_ planValue: Value = .undefined, _ handle: Value = .undefined, _ signature: Value = .undefined, _ inspect: Value = .undefined) throws -> Value {
+    let plan = BridgePlan(planValue)
     if inspect.truthy {
         let live = try workers(try inspect.call())
         for recordId in (plan.recordIds ?? [.null]).elements where try ownsWorker(live, plan.sessionId, recordId).truthy { throw try bridgeFailure("running worker") }
@@ -155,7 +161,8 @@ func bridgeStable(_ plan: Value = .undefined, _ handle: Value = .undefined, _ si
     return .undefined
 }
 
-func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ parse: Value = .undefined) throws -> Value {
+func bridgeRead(_ planValue: Value = .undefined, _ handle: Value = .undefined, _ parse: Value = .undefined) throws -> Value {
+    let plan = BridgePlan(planValue)
     let parse = parse.isUndefined ? Value(true) : parse
     let file = try handleOf(handle)
     let detail = try file.stat(bigint: true), size = Double(detail.size), signature = statIdentity(detail)
@@ -163,19 +170,19 @@ func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ pars
     let memory = try operationMemory()
     let hash = RunningHash(), prefix = RunningHash()
     var tail = Data()
-    let bufferLength = 64.0 * 1024, limit = byteLength(plan["bytes"] ?? "")
-    let planLength = toNumber(plan["length"])
+    let bufferLength = 64.0 * 1024, limit = byteLength(plan.bytes ?? "")
+    let planLength = toNumber(plan.length)
     var parts: [Data] = [], length = 0, last: Value = .null, prefixLast: Value = .null, invalid = false, newline = false
     func consume(_ end: Double) throws {
-        _ = try memory.check.call(Value(Double(length * 4)))
+        _ = try memory["check"].call(Value(Double(length * 4)))
         var joined = Data(capacity: length)
         for part in parts { joined.append(part) }
         let text = String(decoding: joined, as: UTF8.self).trimmingWhitespace
         parts = []; length = 0
         if text.isEmpty { return }
         do {
-            let entry = try JSON.parse(text)
-            if entry["type"] === "bridge-session" && entry.sessionId === plan.sessionId {
+            let entry = try JSON.parse(text), line = BridgeEntry(entry)
+            if line.type === "bridge-session" && line.sessionId === plan.sessionId {
                 last = entry
                 if end <= planLength { prefixLast = entry }
             }
@@ -187,7 +194,7 @@ func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ pars
         let bytesRead = chunk.count
         if bytesRead == 0 { throw try bridgeFailure("transcript changed while reading") }
         productive()
-        _ = try memory.check.call(Value(Double(bytesRead)))
+        _ = try memory["check"].call(Value(Double(bytesRead)))
         hash.update(chunk)
         if at < planLength { prefix.update(subarray(chunk, 0, nanMin(Double(bytesRead), planLength - at))) }
         let startTail = nanMax(0, planLength - at), endTail = nanMin(Double(bytesRead), planLength + limit - at)
@@ -208,14 +215,14 @@ func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ pars
         at += Double(bytesRead)
     }
     if length != 0 { try consume(size) }
-    _ = try bridgeStable(plan, handle, signature)
+    _ = try bridgeStable(planValue, handle, signature)
     let o = ValueObject()
     o["length"] = Value(size)
     o["fingerprint"] = signature
     o["sha"] = Value(hash.copy().digest())
     o["hash"] = boxed(hash)
     o["prefixHash"] = boxed(prefix.copy())
-    o["intendedSha"] = Value(prefix.copy().update((plan["bytes"] ?? "").description).digest())
+    o["intendedSha"] = Value(prefix.copy().update((plan.bytes ?? "").description).digest())
     o["prefixSha"] = Value(prefix.digest())
     o["prefixLast"] = prefixLast
     o["tail"] = Value(tail)
@@ -225,80 +232,86 @@ func bridgeRead(_ plan: Value = .undefined, _ handle: Value = .undefined, _ pars
     return .object(o)
 }
 
-func bridgePlan(_ base: Value = .undefined, _ state: Value = .undefined, _ entry: Value = .undefined) throws -> Value {
-    if !(try bridgeEntry(entry, base.sessionId)).truthy { throw try bridgeFailure("invalid bridge metadata entry") }
-    let bytes = "\(state["length"].truthy && !state.newline.truthy ? "\n" : "")\(JSON.text(entry))\n"
+func bridgePlan(_ base: Value = .undefined, _ stateValue: Value = .undefined, _ entry: Value = .undefined) throws -> Value {
+    let state = BridgeState(stateValue)
+    if !(try bridgeEntry(entry, BridgePlan(base).sessionId)).truthy { throw try bridgeFailure("invalid bridge metadata entry") }
+    let bytes = "\(state.length.truthy && !state.newline.truthy ? "\n" : "")\(JSON.text(entry))\n"
     return Value.spread(try without(base, .strings(["continuation"])), [
-        "length": state["length"], "sha": state.sha, "fingerprint": state.fingerprint, "bytes": Value(bytes),
-        "afterSha": Value(try hashOf(state["hash"]).copy().update(bytes).digest())
+        "length": state.length, "sha": state.sha, "fingerprint": state.fingerprint, "bytes": Value(bytes),
+        "afterSha": Value(try hashOf(state.hash).copy().update(bytes).digest())
     ])
 }
 
-func bridgeSource(_ s: Value = .undefined, _ to: Value = .undefined, _ `guard`: Value = .undefined) throws -> Value {
+func bridgeSource(_ source: Value = .undefined, _ to: Value = .undefined, _ guardValue: Value = .undefined) throws -> Value {
+    let s = MoveSource(source), destination = Account(to), check = RehomeGuard(guardValue)
     let canonical = try mappedPath(s.transcript), detail = try fs.lstat(str(canonical), bigint: true)
-    let records = try ([s] + `guard`.sources.elements + `guard`.targets.elements).filter { $0.id === s.id }.map { try desktopRecordOf($0) }
-    let recordIds = Value(defaultSorted(unique(records.map { $0.sessionId })))
+    let records = ([source] + check.sources.elements + check.targets.elements).filter { $0["id"] === s.id }.map { MoveSource($0).desktopRecord }
+    let recordIds = Value(defaultSorted(unique(records.map(\.sessionId))))
     let base: Value = ["transcript": s.transcript, "canonical": canonical, "sessionId": s.id, "recordIds": recordIds,
                        "dev": Value(detail.dev.description), "ino": Value(detail.ino.description)]
     return try bridgeFile(base, false, Value { args in
         let handle = args.first ?? .undefined
-        let state = try bridgeRead(base, handle, Value(s.bridge !== false && s.contentSha !== s.bridgeAppend.afterSha))
+        let stateValue = try bridgeRead(base, handle, Value(s.bridge !== false && s.contentSha !== BridgePlan(s.bridgeAppend).afterSha))
+        let state = BridgeState(stateValue)
         if state.fingerprint !== s.transcriptFingerprint || s.contentSha.truthy && state.sha !== s.contentSha { throw EngineError("source changed since inventory") }
-        let last = state["last"]
-        let pointer = last.bridgeSessionId ?? last.bridge_session_id
-        let destinationOwned = last.ownerAccountUuid === to.account && last.ownerOrganizationUuid === to.org
+        let last = BridgeEntry(state.last)
+        let pointer = last.bridgeSessionId
+        let destinationOwned = last.ownerAccountUuid === destination.accountId && last.ownerOrganizationUuid === destination.orgId
         let mirror = records.contains(where: { record in record.sshConfig.truthy || record.sshRemoteTranscriptPath.isString && record.sshRemoteTranscriptPath !== "" }) ||
             [s.transcript, canonical].contains(where: { file in path.basename(path.dirname(file.description)) == "ssh-\(s.id)" })
         let append: Value = pointer.isString && pointer.truthy && !state.invalid.truthy && !destinationOwned && !mirror
-            ? Value.spread(try bridgePlan(base, state, try bridgeClear(s.id)), ["original": last]) : .null
-        if append.truthy { _ = try bridgePlans(["id": s.id, "recordId": s.record.sessionId, "transcript": s.transcript, "bridgeAppend": append]) }
+            ? Value.spread(try bridgePlan(base, stateValue, try bridgeClear(s.id)), ["original": last.raw]) : .null
+        if append.truthy { _ = try bridgePlans(["id": s.id, "recordId": DesktopRecord(s.record).sessionId, "transcript": s.transcript, "bridgeAppend": append]) }
         return ["fingerprint": state.fingerprint, "append": append]
     })
 }
 
-func appendBridge(_ plan: Value = .undefined, _ inspect: Value = .undefined, _ recovering: Value = .undefined, _ save: Value = .undefined) throws -> Value {
+func appendBridge(_ planValue: Value = .undefined, _ inspect: Value = .undefined, _ recovering: Value = .undefined, _ save: Value = .undefined) throws -> Value {
+    let plan = BridgePlan(planValue)
     let recovering = recovering.isUndefined ? Value(false) : recovering
     let save = save.isUndefined ? Value.null : save
     var attempted = false
     do {
-        return try bridgeFile(plan, true, Value { args in
+        return try bridgeFile(planValue, true, Value { args in
             let handle = args.first ?? .undefined
-            let state = try bridgeRead(plan, handle, false), bytes = Data(plan["bytes"].description.utf8)
-            let extra = toNumber(state["length"]) - toNumber(plan["length"])
+            let stateValue = try bridgeRead(planValue, handle, false), state = BridgeState(stateValue), bytes = Data(plan.bytes.description.utf8)
+            let extra = toNumber(state.length) - toNumber(plan.length)
             if recovering.truthy {
-                if !(try bridgeWitness(plan, state)).truthy { throw try bridgeFailure("append recovery witness changed") }
-                if extra >= Double(bytes.count) { return state }
-                plan.continuation = ["length": state["length"], "sha": state.sha, "fingerprint": state.fingerprint,
+                if !(try bridgeWitness(planValue, stateValue)).truthy { throw try bridgeFailure("append recovery witness changed") }
+                if extra >= Double(bytes.count) { return stateValue }
+                plan.continuation = ["length": state.length, "sha": state.sha, "fingerprint": state.fingerprint,
                                      "bytes": Value(subarray(bytes, extra).base64EncodedString())]
                 _ = try save.call()
             }
-            if !recovering.truthy && (state["length"] !== plan["length"] || state.sha !== plan.sha || state.fingerprint !== plan.fingerprint) { throw try bridgeFailure("source changed before append") }
-            _ = try bridgeStable(plan, handle, state.fingerprint, inspect)
+            if !recovering.truthy && (state.length !== plan.length || state.sha !== plan.sha || state.fingerprint !== plan.fingerprint) { throw try bridgeFailure("source changed before append") }
+            _ = try bridgeStable(planValue, handle, state.fingerprint, inspect)
             attempted = true
             let file = try handleOf(handle)
             try file.writeFile(recovering.truthy ? subarray(bytes, extra) : bytes)
             try file.sync()
-            let after = try bridgeRead(plan, handle, false)
-            if after["length"] !== Value(toNumber(plan["length"]) + byteLength(plan["bytes"])) || after.sha !== plan.afterSha ||
-                after.prefixSha !== plan.sha || after.tail.asData != Data(plan["bytes"].description.utf8) { throw try bridgeFailure("unexpected content after append") }
-            _ = try bridgeStable(plan, handle, after.fingerprint, inspect)
-            return after
+            let afterValue = try bridgeRead(planValue, handle, false), after = BridgeState(afterValue)
+            if after.length !== Value(toNumber(plan.length) + byteLength(plan.bytes)) || after.sha !== plan.afterSha ||
+                after.prefixSha !== plan.sha || after.tail.asData != Data(plan.bytes.description.utf8) { throw try bridgeFailure("unexpected content after append") }
+            _ = try bridgeStable(planValue, handle, after.fingerprint, inspect)
+            return afterValue
         })
     } catch {
         let value = errorObject(error)
-        value.bridgeUntouched = Value(!attempted)
+        value["bridgeUntouched"] = Value(!attempted)
         throw EngineError(value)
     }
 }
 
-func bridgeWitness(_ plan: Value = .undefined, _ state: Value = .undefined) throws -> Value {
-    let bytes = Data(plan["bytes"].description.utf8), extra = toNumber(state["length"]) - toNumber(plan["length"])
+func bridgeWitness(_ planValue: Value = .undefined, _ stateValue: Value = .undefined) throws -> Value {
+    let plan = BridgePlan(planValue), state = BridgeState(stateValue)
+    let bytes = Data(plan.bytes.description.utf8), extra = toNumber(state.length) - toNumber(plan.length)
     if state.prefixSha === plan.sha {
         var broken = state.intendedSha !== plan.afterSha
         if !broken && plan.continuation.truthy {
+            let continuation = BridgeContinuation(plan.continuation)
             let witness = try hashOf(state.prefixHash).copy()
-                .update(subarray(bytes, 0, toNumber(plan.continuation["length"]) - toNumber(plan["length"]))).digest()
-            broken = Value(witness) !== plan.continuation.sha
+                .update(subarray(bytes, 0, toNumber(continuation.length) - toNumber(plan.length))).digest()
+            broken = Value(witness) !== continuation.sha
         }
         if broken { throw try bridgeFailure("invalid bridge recovery receipt witness") }
     }
@@ -308,94 +321,100 @@ func bridgeWitness(_ plan: Value = .undefined, _ state: Value = .undefined) thro
 func bridgeRecovery(_ row: Value = .undefined, _ optional: Value = .undefined, _ aliases: Value = .undefined) throws -> Value {
     let optional = optional.isUndefined ? Value(false) : optional
     let aliases = aliases.isUndefined ? Value.newArray() : aliases
-    let plans = try bridgePlans(row, aliases), plan = plans[0]
-    if !plan.truthy { return .null }
-    let state: Value
-    do { state = try bridgeFile(plan, false, Value { args in try bridgeRead(plan, args.first ?? .undefined) }) }
-    catch { if optional.truthy && !row.bridgeUndo.truthy { return .null }; throw error }
+    let session = PlacedSession(row)
+    let plans = try bridgePlans(row, aliases), planValue = plans[0], plan = BridgePlan(planValue)
+    if !planValue.truthy { return .null }
+    let stateValue: Value
+    do { stateValue = try bridgeFile(planValue, false, Value { args in try bridgeRead(planValue, args.first ?? .undefined) }) }
+    catch { if optional.truthy && !session.bridgeUndo.truthy { return .null }; throw error }
+    let state = BridgeState(stateValue)
     if state.prefixSha === plan.sha && stable(state.prefixLast) != stable(plan.original) { throw try bridgeFailure("invalid original bridge witness") }
-    let witnessed = try bridgeWitness(plan, state), extra = toNumber(state["length"]) - toNumber(plan["length"])
+    let witnessed = try bridgeWitness(planValue, stateValue), extra = toNumber(state.length) - toNumber(plan.length)
     if !witnessed.truthy {
-        if optional.truthy && !row.bridgeUndo.truthy { return .null }
+        if optional.truthy && !session.bridgeUndo.truthy { return .null }
         throw try bridgeFailure("transcript restoration witness changed")
     }
-    if row.bridgeUndo.truthy {
-        if extra < byteLength(plan["bytes"]) { throw try bridgeFailure("transcript restoration witness changed") }
-        let undo = row.bridgeUndo
+    if session.bridgeUndo.truthy {
+        if extra < byteLength(plan.bytes) { throw try bridgeFailure("transcript restoration witness changed") }
+        let undo = session.bridgeUndo
         let restored = try bridgeFile(undo, false, Value { args in try bridgeRead(undo, args.first ?? .undefined, false) })
-        if !(try bridgeWitness(row.bridgeUndo, restored)).truthy { throw try bridgeFailure("transcript restoration witness changed") }
-        return ["plan": plan, "state": state, "restoring": true]
+        if !(try bridgeWitness(session.bridgeUndo, restored)).truthy { throw try bridgeFailure("transcript restoration witness changed") }
+        return ["plan": planValue, "state": stateValue, "restoring": true]
     }
     if extra == 0 { return .null }
-    if try extra >= byteLength(plan["bytes"]) && (state.invalid.truthy || stable(state["last"]) != stable(try bridgeClear(plan.sessionId))) {
+    if try extra >= byteLength(plan.bytes) && (state.invalid.truthy || stable(state.last) != stable(try bridgeClear(plan.sessionId))) {
         if optional.truthy { return .null }
         throw try bridgeFailure("transcript restoration witness changed")
     }
-    return ["plan": plan, "state": state, "partial": Value(extra < byteLength(plan["bytes"]))]
+    return ["plan": planValue, "state": stateValue, "partial": Value(extra < byteLength(plan.bytes))]
 }
 
 func restoreBridge(_ row: Value = .undefined, _ save: Value = .undefined, _ inspect: Value = .undefined, _ optional: Value = .undefined, _ allowLater: Value = .undefined) throws -> Value {
     let optional = optional.isUndefined ? Value(false) : optional
     let allowLater = allowLater.isUndefined ? Value(true) : allowLater
-    let recovery = try bridgeRecovery(row, optional)
-    if !recovery.truthy { return .undefined }
-    let plan = recovery.plan, partial = recovery.partial, restoring = recovery.restoring
-    if restoring.truthy { return try appendBridge(row.bridgeUndo, inspect, true, save) }
-    if !allowLater.truthy && toNumber(recovery.state["length"]) > toNumber(plan["length"]) + byteLength(plan["bytes"]) { throw try bridgeFailure("newer transcript content prevents bridge restoration") }
-    if partial.truthy { _ = try appendBridge(plan, inspect, true, save) }
-    let ready = try bridgeRecovery(row, optional)
-    if !ready.truthy { return .undefined }
-    row.bridgeUndo = try bridgePlan(plan, ready.state, plan.original)
+    let session = PlacedSession(row)
+    let recovery = BridgeRecovery(try bridgeRecovery(row, optional))
+    if !recovery.isPresent { return .undefined }
+    let plan = BridgePlan(recovery.plan)
+    if recovery.restoring.truthy { return try appendBridge(session.bridgeUndo, inspect, true, save) }
+    if !allowLater.truthy && toNumber(BridgeState(recovery.state).length) > toNumber(plan.length) + byteLength(plan.bytes) { throw try bridgeFailure("newer transcript content prevents bridge restoration") }
+    if recovery.partial.truthy { _ = try appendBridge(plan.raw, inspect, true, save) }
+    let ready = BridgeRecovery(try bridgeRecovery(row, optional))
+    if !ready.isPresent { return .undefined }
+    session.bridgeUndo = try bridgePlan(plan.raw, ready.state, plan.original)
     _ = try save.call()
-    _ = try appendBridge(row.bridgeUndo, inspect)
+    _ = try appendBridge(session.bridgeUndo, inspect)
     return .undefined
 }
 
 func bridgeProblems(_ rows: Value = .undefined, _ optional: Value = .undefined) throws -> Value {
     let optional = optional.isUndefined ? Value(false) : optional
     let problems = Value.newArray()
-    let related = groupBy(rows.elements) { $0.targetId ?? $0.id }
-    for row in rows.elements {
+    func key(_ row: PlacedSession) -> Value { row.targetId ?? row.id }
+    let related = groupBy(rows.elements) { key(PlacedSession($0)) }
+    for row in rows.elements.map(PlacedSession.init) {
         do {
-            let aliases = related.get(row.targetId ?? row.id).elements.map { $0.targetRecordId ?? $0.recordSnapshot.sessionId }
-            _ = try bridgeRecovery(row, optional, Value(aliases))
+            let aliases = related.get(key(row)).elements.map(PlacedSession.init).map { $0.targetRecordId ?? DesktopRecord($0.recordSnapshot).sessionId }
+            _ = try bridgeRecovery(row.raw, optional, Value(aliases))
         } catch { problems.push(Value("\(row.title) | \(errorObject(error)["message"])")) }
     }
     return problems
 }
 
 func bridgeIntact(_ row: Value = .undefined) throws -> Value {
-    if !row.bridgeAppend.truthy { return true }
-    let plan = row.bridgeAppend
+    let planValue = PlacedSession(row).bridgeAppend
+    if !planValue.truthy { return true }
+    let plan = BridgePlan(planValue)
     do {
-        return try bridgeFile(plan, false, Value { args in
-            let state = try bridgeRead(plan, args.first ?? .undefined, false)
-            return Value(state.prefixSha === plan.sha && state.tail.asData == Data(plan["bytes"].description.utf8))
+        return try bridgeFile(planValue, false, Value { args in
+            let state = BridgeState(try bridgeRead(planValue, args.first ?? .undefined, false))
+            return Value(state.prefixSha === plan.sha && state.tail.asData == Data(plan.bytes.description.utf8))
         })
     } catch { return false }
 }
 
 // MARK: - Rehome
 
-func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Value = .undefined, _ `guard`: Value = .undefined) throws -> Value {
-    let source = try bridgeSource(s, to, `guard`)
-    let transcriptFingerprint = source.fingerprint, append = source.append
+func rehomeOne(_ sourceValue: Value = .undefined, _ to: Value = .undefined, _ journal: Value = .undefined, _ guardValue: Value = .undefined) throws -> Value {
+    let s = MoveSource(sourceValue), destination = Account(to), check = RehomeGuard(guardValue)
+    let source = try bridgeSource(sourceValue, to, guardValue)
+    let transcriptFingerprint = source["fingerprint"], append = BridgePlan(source["append"])
     let sidecarRoot = path.join(path.dirname(str(s.transcript)), str(s.id))
-    let sidecarTree = try treeFingerprint(Value(sidecarRoot))
-    if try !s.sidecar.fingerprint.truthy || !(try sameTree(s.sidecar, sidecarTree)).truthy { throw EngineError("source sidecars changed since inventory") }
-    let sourceSidecars = Value.spread(s.sidecar, ["fingerprint": sidecarTree.fingerprint, "canonicalRoot": sidecarTree.canonicalRoot])
+    let sidecarTree = try treeFingerprint(Value(sidecarRoot)), tree = SidecarTree(sidecarTree)
+    if try !SidecarTree(s.sidecar).fingerprint.truthy || !(try sameTree(s.sidecar, sidecarTree)).truthy { throw EngineError("source sidecars changed since inventory") }
+    let sourceSidecars = SidecarTree(Value.spread(s.sidecar, ["fingerprint": tree.fingerprint, "canonicalRoot": tree.canonicalRoot]))
     let sourceRecord = try readFile(s.file, "utf8")
-    let current = try JSON.parse(sourceRecord.description)
-    if try current.cliSessionId !== s.id || !(try validDesktopRecord(["file": s.file, "record": current])).truthy { throw EngineError("source Desktop record changed identity") }
-    if try recordSemantic(current) !== s.recordSemantic { throw EngineError("source Desktop record changed since inventory") }
-    if current.forkedFromSessionId !== s.record.forkedFromSessionId { throw EngineError("source Desktop lineage changed since inventory") }
-    let taskSessionsMap = `guard`.taskSessions
+    let currentValue = try JSON.parse(sourceRecord.description), current = DesktopRecord(currentValue)
+    if try current.cliSessionId !== s.id || !(try validDesktopRecord(["file": s.file, "record": currentValue])).truthy { throw EngineError("source Desktop record changed identity") }
+    if try recordSemantic(currentValue) !== s.recordSemantic { throw EngineError("source Desktop record changed since inventory") }
+    if current.forkedFromSessionId !== DesktopRecord(s.record).forkedFromSessionId { throw EngineError("source Desktop lineage changed since inventory") }
+    let taskSessionsMap = check.taskSessions
     if !s.taskFamily.truthy {
         var owned = current.notifySessionId.truthy
         if !owned && current.scheduledTaskId.truthy {
             if !s.coldRun.truthy { owned = true } else {
-                let owners = Value([s.account.taskFile, to.taskFile].map { file -> Value in ["taskSessions": taskSessionsMap.get(file)] })
-                owned = try coldBlocked(current, owners).truthy
+                let owners = Value([s.account.taskFile, destination.taskFile].map { file -> Value in ["taskSessions": taskSessionsMap.get(file)] })
+                owned = try coldBlocked(currentValue, owners).truthy
             }
         }
         if owned { throw EngineError("source Desktop ownership changed since inventory") }
@@ -403,24 +422,24 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
     let sourceTasks = taskSessionsMap.get(s.account.taskFile)
     if sourceTasks.nullish { throw EngineError.type("Cannot read properties of \(sourceTasks) (reading 'has')") }
     if TaskRegistry(sourceTasks).notifies(current.sessionId) { throw EngineError("source scheduled task ownership changed since inventory") }
-    let targetTasks = TaskRegistry(taskSessionsMap.get(to.taskFile)).tasks
+    let targetTasks = TaskRegistry(taskSessionsMap.get(destination.taskFile)).tasks
     if targetTasks.elements.contains(where: { task in
-        task.notifySessionId === current.sessionId &&
-            !s.taskFamily.replaced.elements.contains(where: { row in stable(row.task) == stable(task) })
+        task["notifySessionId"] === current.sessionId &&
+            !s.taskFamily["replaced"].elements.contains(where: { row in stable(row["task"]) == stable(task) })
     }) { throw EngineError("target scheduled task collision") }
-    if try ownsWorker(`guard`.workers, s.id, current.sessionId).truthy { throw EngineError("running worker") }
-    let title = or(or(Value((current.title ?? "").description.trimmingWhitespace), s.title), "Untitled")
-    let record = path.join(str(to.dir), path.basename(str(s.file)))
+    if try ownsWorker(check.workers, s.id, current.sessionId).truthy { throw EngineError("running worker") }
+    let title = or(or(Value((current.title ?? "").description.trimmingWhitespace), s.raw["title"]), "Untitled")
+    let record = path.join(destination.dir, path.basename(str(s.file)))
     let sourceRecordSha = sha(sourceRecord)
-    let placed = Value.spread(try without(current, .strings(ACCOUNT_ERROR_KEYS)), ["bridgeSessionIds": .newArray()])
+    let placed = Value.spread(try without(currentValue, .strings(ACCOUNT_ERROR_KEYS)), ["bridgeSessionIds": .newArray()])
     let recordText = jsonText(placed)
     let recordSha = sha(recordText)
     _ = try journal.call(["strategy": "rehome", "recordSha": Value(recordSha)])
-    if `guard`.check.isFunction { _ = try `guard`.check.call() }
+    if check.check.isFunction { _ = try check.check.call() }
     _ = try writeNew(Value(record), Value(recordText), Value { args in
         let made = args.first ?? .undefined
-        let dev = made.dev, ino = made.ino
-        `guard`.created.put(Value(record), ["dev": dev, "ino": ino])
+        let dev = made["dev"], ino = made["ino"]
+        check.created.put(Value(record), ["dev": dev, "ino": ino])
         _ = try journal.call(["created": ["dev": dev, "ino": ino]])
         return .undefined
     })
@@ -429,28 +448,28 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
     let afterSidecars = try treeFingerprint(Value(sidecarRoot))
     if afterTranscriptFingerprint !== transcriptFingerprint { throw EngineError("source changed during move") }
     if sha(afterRecord) != sourceRecordSha { throw EngineError("source Desktop record changed during move") }
-    if !(try sameTree(sourceSidecars, afterSidecars)).truthy { throw EngineError("source sidecars changed during move") }
-    if `guard`.check.isFunction { _ = try `guard`.check.call() }
+    if !(try sameTree(sourceSidecars.raw, afterSidecars)).truthy { throw EngineError("source sidecars changed during move") }
+    if check.check.isFunction { _ = try check.check.call() }
     var placedFingerprint = transcriptFingerprint
-    if append.truthy {
-        _ = try journal.call(["bridgeAppend": append], true)
-        let after: Value
-        do { after = try appendBridge(append, `guard`.inspect) }
+    if append.isPresent {
+        _ = try journal.call(["bridgeAppend": append.raw], true)
+        let after: BridgeState
+        do { after = BridgeState(try appendBridge(append.raw, check.inspect)) }
         catch {
-            if errorObject(error).bridgeUntouched.truthy { _ = try journal.call(["bridgeAppend": .null], true) }
+            if errorObject(error)["bridgeUntouched"].truthy { _ = try journal.call(["bridgeAppend": .null], true) }
             throw error
         }
         placedFingerprint = after.fingerprint
         append.applied = true
-        _ = try journal.call(["bridgeAppend": append], true)
+        _ = try journal.call(["bridgeAppend": append.raw], true)
         let sourceSha = s.contentSha
-        for member in `guard`.sources.elements where member.transcript === s.transcript && member.contentSha === sourceSha && member.transcriptFingerprint === transcriptFingerprint {
+        for member in check.sources.elements.map(MoveSource.init) where member.transcript === s.transcript && member.contentSha === sourceSha && member.transcriptFingerprint === transcriptFingerprint {
             member.contentSha = after.sha
             member.transcriptFingerprint = placedFingerprint
-            member.bridgeAppend = append
+            member.bridgeAppend = append.raw
         }
     }
-    for member in (s.members ?? [s]).elements {
+    for member in s.members {
         member.strategy = "rehome"
         member.transcriptFingerprint = placedFingerprint
         member.sidecar = Value.spread(member.sidecar, ["fingerprint": sourceSidecars.fingerprint])
@@ -460,21 +479,21 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
     o["id"] = s.id
     o["targetId"] = s.id
     o["title"] = title
-    o["archived"] = Value(current.isArchived === true)
+    o["archived"] = Value(current.isArchived)
     o["transcript"] = s.transcript
     o["targetTranscript"] = s.transcript
-    o["targetDir"] = sourceSidecars["count"].truthy ? Value(path.join(path.dirname(str(s.transcript)), str(s.id))) : .null
+    o["targetDir"] = sourceSidecars.count.truthy ? Value(path.join(path.dirname(str(s.transcript)), str(s.id))) : .null
     o["record"] = Value(record)
     o["recordSha"] = Value(recordSha)
     o["recordSnapshot"] = recordSnapshot(placed)
     o["recordSemantic"] = try recordSemantic(placed)
     o["targetRecordId"] = current.sessionId
-    o["taskFile"] = to.taskFile
+    o["taskFile"] = destination.taskFile
     o["taskOwned"] = false
-    if s.taskFamily.truthy { o["taskFamily"] = s.taskFamily.key }
+    if s.taskFamily.truthy { o["taskFamily"] = s.taskFamily["key"] }
     o["transcriptFingerprint"] = placedFingerprint
-    if append.truthy { o["bridgeAppend"] = append }
-    o["sidecars"] = ["count": sourceSidecars["count"], "bytes": sourceSidecars["bytes"], "fingerprint": sourceSidecars.fingerprint, "canonicalRoot": sourceSidecars.canonicalRoot]
+    if append.isPresent { o["bridgeAppend"] = append.raw }
+    o["sidecars"] = ["count": sourceSidecars.count, "bytes": sourceSidecars.bytes, "fingerprint": sourceSidecars.fingerprint, "canonicalRoot": sourceSidecars.canonicalRoot]
     o["events"] = s.roots["size"]
     return .object(o)
 }
@@ -482,75 +501,83 @@ func rehomeOne(_ s: Value = .undefined, _ to: Value = .undefined, _ journal: Val
 // MARK: - Ownership and failures
 
 func knownOf(_ row: Value = .undefined) throws -> Value {
-    ["semantic": row.targetSemantic, "semanticVersion": row.targetSemanticVersion]
+    let session = PlacedSession(row)
+    return ["semantic": session.targetSemantic, "semanticVersion": session.targetSemanticVersion]
 }
 func artifacts(_ row: Value = .undefined) throws -> Value {
-    row.strategy === "rehome" ? [row.record] : [row.targetTranscript, row.targetDir, row.record].filter { $0.truthy }.value
+    let session = PlacedSession(row)
+    return session.strategy === "rehome" ? [session.record] : [session.targetTranscript, session.targetDir, session.record].filter { $0.truthy }.value
 }
 public func retiredCount(_ receipt: Value = .undefined) throws -> Value { try retiredCount(Receipt(receipt)) }
 func retiredCount(_ receipt: Receipt) throws -> Value {
-    Value((receipt.superseded ?? .newArray()).elements.filter { $0.source.truthy }.count)
+    Value((receipt.superseded ?? .newArray()).elements.filter { $0["source"].truthy }.count)
 }
 func retiredFiles(_ receipt: Receipt) throws -> Value {
-    .newSet((receipt.superseded ?? .newArray()).elements.filter { $0.source.truthy }.flatMap { row in row.moved.elements.map { $0[0] } })
+    .newSet((receipt.superseded ?? .newArray()).elements.filter { $0["source"].truthy }.flatMap { row in RetirementItem(row).moved.elements.map { $0[0] } })
 }
 func ownership(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ bridges: Value = .undefined) throws -> Value {
     let bridges = bridges.isUndefined ? Value(true) : bridges
-    let record = try desktopRecordOf(row)
-    let worker = try row.worker.truthy || ownsWorker(liveWorkers, row.id, record.sessionId).truthy
+    let source = MoveSource(row), record = source.desktopRecord
+    let worker = try source.hasWorker || ownsWorker(liveWorkers, source.id, record.sessionId).truthy
     let parts: [String?] = [
         bridges.truthy && record.bridgeSessionIds["length"].truthy ? "Remote Control bridge" : nil,
-        bridges.truthy && row.bridge.truthy ? "transcript bridge" : nil,
-        record.scheduledTaskId.truthy && !row.coldRun.truthy ? "scheduled task" : nil,
+        bridges.truthy && source.bridge.truthy ? "transcript bridge" : nil,
+        record.scheduledTaskId.truthy && !source.coldRun.truthy ? "scheduled task" : nil,
         record.notifySessionId.truthy ? "notification route" : nil,
-        row.taskOwned.truthy ? "scheduled task registry" : nil,
+        source.taskOwned ? "scheduled task registry" : nil,
         worker ? "running worker" : nil
     ]
     return Value(parts.compactMap { $0 }.joined(separator: ", "))
 }
 func rehomeOwnership(_ row: Value = .undefined, _ liveWorkers: Value = .undefined) throws -> Value {
-    if row.taskFamily.truthy && !row.taskFamily.error.truthy {
-        return try row.worker.truthy || ownsWorker(liveWorkers, row.id, try desktopRecordOf(row).sessionId).truthy ? "running worker" : ""
+    let source = MoveSource(row)
+    if source.taskFamily.truthy && !source.taskFamily["error"].truthy {
+        return try source.hasWorker || ownsWorker(liveWorkers, source.id, source.desktopRecord.sessionId).truthy ? "running worker" : ""
     }
     return try ownership(row, liveWorkers, false)
 }
 public func retirementOwnership(_ inv: Value = .undefined, _ row: Value = .undefined, _ owner: Value = .undefined, _ liveWorkers: Value = .undefined) throws -> Value { try retirementOwnership(MovePlan(inv), row, owner, liveWorkers) }
 func retirementOwnership(_ inv: MovePlan, _ row: Value = .undefined, _ owner: Value = .undefined, _ liveWorkers: Value = .undefined) throws -> Value {
-    owner.history.strategy === "rehome" || inv.cloudRequested.truthy ? try rehomeOwnership(row, liveWorkers) : try ownership(row, liveWorkers)
+    PlacedSession(owner["history"]).strategy === "rehome" || inv.cloudRequested.truthy ? try rehomeOwnership(row, liveWorkers) : try ownership(row, liveWorkers)
 }
 func sourceIdentity(_ row: Value = .undefined) throws -> Value {
-    let rest: Value = ["label": try accountLabel(row.account), "id": row.id, "sessionId": row.record.sessionId, "file": row.file,
-                       "title": row.title, "remoteIds": try remoteIdsOf(row)]
-    return Value.spread(try accountRef(row.account), rest, row.recordSha.truthy ? ["recordSha": row.recordSha] : [:])
+    let source = MoveSource(row)
+    let rest: Value = ["label": try accountLabel(source.account.raw), "id": source.id, "sessionId": DesktopRecord(source.record).sessionId, "file": source.file,
+                       "title": row["title"], "remoteIds": try remoteIdsOf(row)]
+    return Value.spread(try accountRef(source.account.raw), rest, source.recordSha.truthy ? ["recordSha": source.recordSha] : [:])
 }
 func failureIdentity(_ item: Value = .undefined) throws -> Value {
-    let rows = try (item.members ?? [item]).elements.filter { try $0.account.truthy && validDesktopRecord($0).truthy }
-    return ["sources": Value(try rows.map { try sourceIdentity($0) })]
+    let rows = try MoveSource(item).members.filter { try $0.account.raw.truthy && validDesktopRecord($0.raw).truthy }
+    return ["sources": Value(try rows.map { try sourceIdentity($0.raw) })]
 }
 func inventoryFailure(_ item: Value = .undefined) throws -> Value {
+    let source = MoveSource(item)
+    func name(_ row: MoveSource) -> String { "\(row.account.raw["label"]) | \(or(row.raw["title"], Value(path.basename(str(row.file)))))" }
     let title: String
-    if toNumber(item.members["length"]) > 1 {
-        title = item.members.elements.map { member in "\(member.account.label) | \(or(member.title, Value(path.basename(str(member.file)))))" }.joined(separator: " + ")
+    if toNumber(item["members"]["length"]) > 1 {
+        title = item["members"].elements.map { name(MoveSource($0)) }.joined(separator: " + ")
     } else {
-        title = "\(item.account.label) | \(or(item.title, Value(path.basename(str(item.file)))))"
+        title = name(source)
     }
-    let head: Value = ["id": item.id ?? .null, "title": Value(title), "error": item.error ?? "unreadable Desktop record"]
-    return Value.spread(head, item.code.truthy ? ["code": item.code] : [:], try failureIdentity(item))
+    let head: Value = ["id": source.id ?? .null, "title": Value(title), "error": source.error ?? "unreadable Desktop record"]
+    return Value.spread(head, source.code.truthy ? ["code": source.code] : [:], try failureIdentity(item))
 }
 func taggedCloudFailure(_ cloud: Value = .undefined, _ failure: Value = .undefined) throws -> Value {
-    Value.spread(failure, ["cloudAccount": cloud.account, "cloudOrg": cloud.org])
+    Value.spread(failure, ["cloudAccount": AccountPair(cloud).accountId, "cloudOrg": AccountPair(cloud).orgId])
 }
 func cloudTagged(_ row: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
-    Value(row.cloudAccount === cloud.account && row.cloudOrg === cloud.org)
+    let failure = FailedSession(row), pair = AccountPair(cloud)
+    return Value(failure.cloudAccount === pair.accountId && failure.cloudOrg === pair.orgId)
 }
 public func inventoryFailures(_ inv: Value = .undefined) throws -> Value { try inventoryFailures(MovePlan(inv)) }
 func inventoryFailures(_ inv: MovePlan) throws -> Value {
     let local = try (inv.unreadable.elements + inv.rejected.elements + (inv.blocked ?? .newArray()).elements).map { try inventoryFailure($0) }
-    let cloud = try (inv.cloud.blocked ?? .newArray()).elements.map { try taggedCloudFailure(inv.cloud, try inventoryFailure($0)) }
+    let cloud = try (inv.cloud["blocked"] ?? .newArray()).elements.map { try taggedCloudFailure(inv.cloud, try inventoryFailure($0)) }
     return Value(local + cloud)
 }
 func localFailureKey(_ row: Value = .undefined) throws -> Value {
-    Value("\(row.account)/\(row.org)/\(row.sessionId)")
+    let source = FailureSource(row)
+    return Value("\(source.account)/\(source.org)/\(source.sessionId)")
 }
 func failureCause(_ error: Value = .undefined) throws -> Value {
     let text = error.description
@@ -563,7 +590,7 @@ func failureCause(_ error: Value = .undefined) throws -> Value {
 public func receiptSummary(_ receipt: Value = .undefined) throws -> Value { try receiptSummary(Receipt(receipt)) }
 func receiptSummary(_ receipt: Receipt) throws -> Value {
     let failed = (receipt.failed ?? .newArray()).elements
-    let local = failed.filter { !$0.cloudAccount.truthy }
+    let local = failed.map(FailedSession.init).filter { !$0.cloudAccount.truthy }
     let byKey = ValueMap()
     for row in local {
         for source in (row.sources ?? .newArray()).elements {
@@ -572,10 +599,10 @@ func receiptSummary(_ receipt: Receipt) throws -> Value {
         }
     }
     let notMoved = byKey.values
-    let moved = receipt.finalizing.truthy ? receipt.appendCheckpoint.sessions ?? 0 : receipt.sessions["length"] ?? 0
-    let groups = groupBy(notMoved) { $0.cause }.entries.map { pair -> Value in ["cause": pair.0, "records": pair.1] }
+    let moved = receipt.finalizing.truthy ? receipt.appendCheckpoint["sessions"] ?? 0 : receipt.sessions["length"] ?? 0
+    let groups = groupBy(notMoved) { FailureSource($0).cause }.entries.map { pair -> Value in ["cause": pair.0, "records": pair.1] }
     let attention = try failed.filter { row in
-        row.cloudAccount.truthy ? try actionableCloudFailure(receipt, row).truthy : !row.sources["length"].truthy
+        FailedSession(row).cloudAccount.truthy ? try actionableCloudFailure(receipt, row).truthy : !FailedSession(row).sources["length"].truthy
     }
     let keep = try keptCopy(receipt), failedArray = Value(failed)
     let kept = try failed.enumerated().filter { try keep.call($0.element, Value($0.offset), failedArray).truthy }.map { $0.element }
@@ -590,8 +617,8 @@ func receiptSummary(_ receipt: Receipt) throws -> Value {
 
 func projectLocalFailures(_ receipt: Receipt, _ paths: DataLayout, _ project: Value = .undefined) throws -> Value {
     let project = project.isUndefined ? Value(true) : project
-    let local = (receipt.failed ?? .newArray()).elements.filter { !$0.cloudAccount.truthy }
-    if local.isEmpty && !(receipt.failed ?? .newArray()).elements.contains(where: { $0.blockedByLocal["length"].truthy }) { return .undefined }
+    let local = (receipt.failed ?? .newArray()).elements.map(FailedSession.init).filter { !$0.cloudAccount.truthy }
+    if local.isEmpty && !(receipt.failed ?? .newArray()).elements.contains(where: { FailedSession($0).blockedByLocal["length"].truthy }) { return .undefined }
     var candidates: [Value]? = nil
     var pool: Value = .undefined
     let verified = ValueMap()
@@ -599,16 +626,17 @@ func projectLocalFailures(_ receipt: Receipt, _ paths: DataLayout, _ project: Va
         if project.truthy && !failure.sources["length"].truthy && failure.id.truthy && receipt.fromAccounts["length"].truthy {
             if candidates == nil {
                 var collected: [Value] = []
-                for account in receipt.fromAccounts.elements {
+                for accountValue in receipt.fromAccounts.elements {
+                    let account = AccountPair(accountValue)
                     do {
-                        if !UUID.test(account.account.description) || !UUID.test(account.org.description) { collected.append(.null); continue }
+                        if !UUID.test(account.accountId.description) || !UUID.test(account.orgId.description) { collected.append(.null); continue }
                         let files: Value
-                        do { files = try recordFiles(Value(try strictJoin([Value(paths.records), account.account, account.org]))) }
-                        catch { if errorObject(error).code === "ENOENT" { files = .newArray() } else { throw error } }
+                        do { files = try recordFiles(Value(try strictJoin([Value(paths.records), account.accountId, account.orgId]))) }
+                        catch { if errorObject(error)["code"] === "ENOENT" { files = .newArray() } else { throw error } }
                         var rows: [Value] = []
                         for file in files.elements {
                             let raw = try readFile(file), record = try JSON.parse(raw.asData ?? Data())
-                            rows.append(Value.spread(try desktopSession(file, record), ["account": account, "observedRecordSha": Value(sha(raw))]))
+                            rows.append(Value.spread(try desktopSession(file, record), ["account": accountValue, "observedRecordSha": Value(sha(raw))]))
                         }
                         collected.append(Value(rows))
                     } catch { collected.append(.null) }
@@ -617,35 +645,35 @@ func projectLocalFailures(_ receipt: Receipt, _ paths: DataLayout, _ project: Va
             }
             let all = candidates ?? []
             let matches = try all.flatMap { ($0 ?? .newArray()).elements }.filter { row in
-                try validDesktopRecord(row).truthy && [row.id, row.record.sessionId].contains(where: { $0 === failure.id })
+                try validDesktopRecord(row).truthy && [row["id"], DesktopRecord(row["record"]).sessionId].contains(where: { $0 === failure.id })
             }
             if all.allSatisfy({ $0.truthy }) && matches.count == 1 {
-                let row = matches[0]
-                let current = (try? readFile(row.file)) ?? ""
-                if Value(sha(current)) === row.observedRecordSha {
-                    failure.sources = [Value.spread(try sourceIdentity(row), ["observedRecordSha": row.observedRecordSha])]
+                let row = matches[0], observed = row["observedRecordSha"]
+                let current = (try? readFile(row["file"])) ?? ""
+                if Value(sha(current)) === observed {
+                    failure.sources = [Value.spread(try sourceIdentity(row), ["observedRecordSha": observed])]
                 }
             }
         }
-        for source in (failure.sources ?? .newArray()).elements {
+        for source in (failure.sources ?? .newArray()).elements.map(FailureSource.init) {
             do {
-                if try !(try receipt.fromAccounts.elements.contains(where: { try sameAccount($0, source).truthy })) || !LOCAL_RECORD.test((source.sessionId ?? "").description) ||
+                if try !(try receipt.fromAccounts.elements.contains(where: { try sameAccount($0, source.raw).truthy })) || !LOCAL_RECORD.test((source.sessionId ?? "").description) ||
                     source.file !== Value(try strictJoin([Value(paths.records), source.account, source.org, Value("\(source.sessionId).json")])) { continue }
-                let raw = try readFile(source.file), record = try JSON.parse(raw.asData ?? Data())
+                let raw = try readFile(source.file), recordValue = try JSON.parse(raw.asData ?? Data()), record = DesktopRecord(recordValue)
                 if record.sessionId !== source.sessionId || record.cliSessionId !== source.id ||
                     Value(sha(raw)) !== (source.recordSha ?? source.observedRecordSha) { continue }
-                let relevant = try (receipt.failed ?? .newArray()).elements.filter { try cloudTagged($0, source).truthy && remoteId($0.id).truthy }
+                let relevant = try (receipt.failed ?? .newArray()).elements.filter { try cloudTagged($0, source.raw).truthy && remoteId(FailedSession($0).id).truthy }
                 if relevant.isEmpty { continue }
                 if pool.nullish { pool = try index(Value(paths.pool)) }
                 let transcript = try locate(pool, source.id, record.cwd)
                 if !transcript.truthy { continue }
-                let before = try fingerprint(transcript), data = try load(transcript)
-                let bridges = data.entries.elements.filter { $0["type"] === "bridge-session" }
+                let before = try fingerprint(transcript), data = TranscriptLoad(try load(transcript))
+                let bridges = data.entries.elements.map(BridgeEntry.init).filter { $0.type === "bridge-session" }
                 let recordIds = try (record.bridgeSessionIds ?? .newArray()).elements.map { try remoteId($0) }.filter { $0.truthy }
                 let ownedBridges = try bridges.filter { entry in !data.invalid.truthy && entry.ownerAccountUuid === source.account && entry.ownerOrganizationUuid === source.org }
-                    .map { try remoteId($0.bridgeSessionId ?? $0.bridge_session_id) }.filter { $0.truthy }
+                    .map { try remoteId($0.bridgeSessionId) }.filter { $0.truthy }
                 let owned = try unique(recordIds + ownedBridges).filter { id in
-                    try bridges.filter { try remoteId($0.bridgeSessionId ?? $0.bridge_session_id) === id }.allSatisfy { entry in
+                    try bridges.filter { try remoteId($0.bridgeSessionId) === id }.allSatisfy { entry in
                         (!entry.ownerAccountUuid.truthy || entry.ownerAccountUuid === source.account) &&
                             (!entry.ownerOrganizationUuid.truthy || entry.ownerOrganizationUuid === source.org)
                     }
@@ -654,22 +682,22 @@ func projectLocalFailures(_ receipt: Receipt, _ paths: DataLayout, _ project: Va
                 if try before !== fingerprint(transcript) || sha(try readFile(source.file)) != sha(raw) { continue }
                 if source.observedRecordSha.truthy && !source.recordSha.truthy { source.remoteIds = ownedValue }
                 let kept = (source.remoteIds ?? .newArray()).elements.filter { ownedValue.includes($0) }
-                verified.set(try localFailureKey(source), Value.spread(source, ["remoteIds": Value(kept)]))
+                verified.set(try localFailureKey(source.raw), Value.spread(source.raw, ["remoteIds": Value(kept)]))
             } catch {}
         }
     }
-    for failure in (receipt.failed ?? .newArray()).elements where failure.cloudAccount.truthy {
+    for failure in (receipt.failed ?? .newArray()).elements.map(FailedSession.init) where failure.cloudAccount.truthy {
         let links = try verified.entries.filter { pair in
-            try cloudTagged(failure, pair.1).truthy && pair.1.remoteIds.includes(try remoteId(failure.id))
+            try cloudTagged(failure.raw, pair.1).truthy && FailureSource(pair.1).remoteIds.includes(try remoteId(failure.id))
         }.map { $0.0 }
         if !links.isEmpty { failure.blockedByLocal = Value(links) }
-        else { failure.removeKey("blockedByLocal") }
+        else { failure.raw.removeKey("blockedByLocal") }
     }
     let kept = try keptCopy(receipt)
-    for check in (receipt.cloudChecks ?? .newArray()).elements {
+    for check in (receipt.cloudChecks ?? .newArray()).elements.map(CloudCheck.init) {
         if check.status === "complete" || check.status === "cancelled" { continue }
-        let failures = try (receipt.failed ?? .newArray()).elements.filter { try cloudTagged($0, check).truthy && !(try kept.call($0)).truthy }
-        let blocked = !failures.isEmpty && failures.allSatisfy { $0.blockedByLocal["length"].truthy } && !check.waiting["length"].truthy &&
+        let failures = try (receipt.failed ?? .newArray()).elements.filter { try cloudTagged($0, check.raw).truthy && !(try kept.call($0)).truthy }
+        let blocked = !failures.isEmpty && failures.allSatisfy { FailedSession($0).blockedByLocal["length"].truthy } && !check.waiting["length"].truthy &&
             check.checkedAt.truthy && !receipt.cloudError.truthy
         if blocked { check.status = "blocked-local" }
         else if check.status === "blocked-local" { check.status = "failed" }
@@ -679,10 +707,11 @@ func projectLocalFailures(_ receipt: Receipt, _ paths: DataLayout, _ project: Va
 
 // MARK: - Target checks
 
-func changed(_ file: Value = .undefined, _ sessionId: Value = .undefined, _ known: Value = .undefined) throws -> Value {
+func changed(_ file: Value = .undefined, _ sessionId: Value = .undefined, _ knownValue: Value = .undefined) throws -> Value {
+    let known = KnownTarget(knownValue)
     if !exists(file) { return false }
     if !known.semantic.truthy || known.semanticVersion !== Value(SEMANTIC_VERSION) { return true }
-    let data = try load(file)
+    let data = TranscriptLoad(try load(file))
     if try semantic(data.entries, sessionId, data.invalid) !== known.semantic { return true }
     return Value(!known.bridge.isUndefined && Value(data.entries.elements.contains { $0["type"] === "bridge-session" }) !== known.bridge)
 }
@@ -690,49 +719,50 @@ func changed(_ file: Value = .undefined, _ sessionId: Value = .undefined, _ know
 func targetChanges(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ checkShared: Value = .undefined, _ allowRecordDrift: Value = .undefined) throws -> Value {
     let checkShared = checkShared.isUndefined ? Value(true) : checkShared
     let allowRecordDrift = allowRecordDrift.isUndefined ? Value(false) : allowRecordDrift
+    let session = PlacedSession(row)
     let changes = Value.newArray()
-    if row.strategy === "rehome" {
-        let currentFingerprint = (try? fingerprint(row.targetTranscript)) ?? .null
+    if session.strategy === "rehome" {
+        let currentFingerprint = (try? fingerprint(session.targetTranscript)) ?? .null
         if !currentFingerprint.truthy { changes.push("transcript missing") }
-        else if checkShared.truthy && row.transcriptFingerprint.truthy && currentFingerprint !== row.transcriptFingerprint { changes.push("transcript") }
+        else if checkShared.truthy && session.transcriptFingerprint.truthy && currentFingerprint !== session.transcriptFingerprint { changes.push("transcript") }
         else if try checkShared.truthy && !(try bridgeIntact(row)).truthy { changes.push("transcript") }
-        let targetDir = row.targetDir ?? Value(path.join(path.dirname(str(row.targetTranscript)), str(row.targetId)))
-        let sidecarsExist = !row.sidecars["count"].truthy || exists(targetDir)
+        let targetDir = session.targetDir ?? Value(path.join(path.dirname(str(session.targetTranscript)), str(session.targetId)))
+        let sidecarsExist = !SidecarTree(session.sidecars).count.truthy || exists(targetDir)
         if !sidecarsExist { changes.push("sidecars missing") }
-        else if try row.sidecars.canonicalRoot.truthy && ((try? mappedPath(targetDir)) ?? .null) !== row.sidecars.canonicalRoot ||
-            checkShared.truthy && row.sidecars.fingerprint.truthy && !(try sameTree(row.sidecars, (try? treeFingerprint(targetDir)) ?? .null)).truthy {
+        else if try SidecarTree(session.sidecars).canonicalRoot.truthy && ((try? mappedPath(targetDir)) ?? .null) !== SidecarTree(session.sidecars).canonicalRoot ||
+            checkShared.truthy && SidecarTree(session.sidecars).fingerprint.truthy && !(try sameTree(session.sidecars, (try? treeFingerprint(targetDir)) ?? .null)).truthy {
             changes.push("sidecars")
         }
     } else {
-        if try !exists(row.targetTranscript) || (try changed(row.targetTranscript, row.targetId, try knownOf(row))).truthy { changes.push("transcript") }
-        let targetDir = row.targetDir ?? Value(path.join(path.dirname(str(row.targetTranscript)), str(row.targetId)))
+        if try !exists(session.targetTranscript) || (try changed(session.targetTranscript, session.targetId, try knownOf(row))).truthy { changes.push("transcript") }
+        let targetDir = session.targetDir ?? Value(path.join(path.dirname(str(session.targetTranscript)), str(session.targetId)))
         let currentSidecars = (try? manifest(targetDir)) ?? .null
-        if !currentSidecars.truthy || currentSidecars.sha !== row.sidecars.sha { changes.push("sidecars") }
+        if !currentSidecars.truthy || SidecarTree(currentSidecars).sha !== SidecarTree(session.sidecars).sha { changes.push("sidecars") }
     }
-    let currentRecord = (try? readFile(row.record)) ?? .null
+    let currentRecord = (try? readFile(session.record)) ?? .null
     var recordChanged = !currentRecord.truthy
     if currentRecord.truthy {
         do {
-            let record = try JSON.parse(currentRecord.asData ?? Data())
-            if allowRecordDrift.truthy && row.recordSnapshot.truthy {
-                var rewound = row.strategy === "rehome" && record.cliSessionId !== row.targetId && UUID.test((record.cliSessionId ?? "").description)
-                if rewound { rewound = try priorSessions(record).includes(row.targetId) }
+            let recordValue = try JSON.parse(currentRecord.asData ?? Data()), record = DesktopRecord(recordValue)
+            if allowRecordDrift.truthy && session.recordSnapshot.truthy {
+                var rewound = session.strategy === "rehome" && record.cliSessionId !== session.targetId && UUID.test((record.cliSessionId ?? "").description)
+                if rewound { rewound = try priorSessions(recordValue).includes(session.targetId) }
                 if rewound {
-                    let detail = try? fs.stat(path.join(path.dirname(str(row.targetTranscript)), "\(record.cliSessionId).jsonl"))
+                    let detail = try? fs.stat(path.join(path.dirname(str(session.targetTranscript)), "\(record.cliSessionId).jsonl"))
                     rewound = detail?.isFile ?? false
                 }
-                recordChanged = try !validDesktopRecord(["file": row.record, "record": record]).truthy ||
-                    ["sessionId", "cwd", "originCwd"].contains(where: { record[$0] !== row.recordSnapshot[$0] }) ||
-                    row.recordSnapshot.cliSessionId !== row.targetId || (!rewound && record.cliSessionId !== row.targetId) || record.sessionId !== row.targetRecordId
+                recordChanged = try !validDesktopRecord(["file": session.record, "record": recordValue]).truthy ||
+                    ["sessionId", "cwd", "originCwd"].contains(where: { recordValue[$0] !== session.recordSnapshot[$0] }) ||
+                    DesktopRecord(session.recordSnapshot).cliSessionId !== session.targetId || (!rewound && record.cliSessionId !== session.targetId) || record.sessionId !== session.targetRecordId
             } else {
-                recordChanged = try !row.recordSemantic.truthy || recordSemantic(record) !== row.recordSemantic
+                recordChanged = try !session.recordSemantic.truthy || recordSemantic(recordValue) !== session.recordSemantic
             }
         } catch { recordChanged = true }
     }
     if recordChanged { changes.push("desktop record") }
-    if try !allowRecordDrift.truthy && !row.taskFamily.truthy && row.taskFile.truthy &&
-        Value(try taskRegistry(row.taskFile).notifies(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned { changes.push("scheduled tasks") }
-    if try !allowRecordDrift.truthy && ownsWorker(liveWorkers, row.targetId, row.targetRecordId).truthy { changes.push("running worker") }
+    if try !allowRecordDrift.truthy && !session.taskFamily.truthy && session.taskFile.truthy &&
+        Value(try taskRegistry(session.taskFile).notifies(session.targetRecordId ?? Value("local_\(session.targetId)"))) !== session.taskOwned { changes.push("scheduled tasks") }
+    if try !allowRecordDrift.truthy && ownsWorker(liveWorkers, session.targetId, session.targetRecordId).truthy { changes.push("running worker") }
     return changes
 }
 
@@ -740,7 +770,7 @@ func restoreProblems(_ plan: Value = .undefined, _ root: Value = .undefined, _ p
     let parkedOnly = parkedOnly.isUndefined ? Value(false) : parkedOnly
     let problems = Value.newArray()
     func pairs(_ v: Value) -> ValueMap { ValueMap((v ?? .newArray()).elements.map { ($0[0], $0[1]) }) }
-    for item in plan.elements {
+    for item in plan.elements.map(RetirementItem.init) {
         let hashes = pairs(item.hashes), trees = pairs(item.trees), semantics = pairs(item.semantics)
         let name = or(item.title, item.id)
         for pair in item.moved.elements {
@@ -764,7 +794,7 @@ func restoreProblems(_ plan: Value = .undefined, _ root: Value = .undefined, _ p
                 let expectedSemantic = semantics.get(original)
                 let changedText = Value("\(name) | recovery artifact changed | \(path.basename(str(available)))")
                 if expectedHash.truthy && Value(sha((try? readFile(available)) ?? Value(Data()))) !== expectedHash { problems.push(changedText) }
-                else if expectedTree.truthy && ((try? manifest(available)) ?? .null).sha !== expectedTree { problems.push(changedText) }
+                else if expectedTree.truthy && SidecarTree((try? manifest(available)) ?? .null).sha !== expectedTree { problems.push(changedText) }
                 else if try expectedSemantic.truthy && recordSemantic((try? readJson(available)) ?? .newObject()) !== expectedSemantic { problems.push(changedText) }
             }
         }
@@ -772,18 +802,19 @@ func restoreProblems(_ plan: Value = .undefined, _ root: Value = .undefined, _ p
     return problems
 }
 
-func snapshotPlan(_ item: Value = .undefined) throws -> Value {
+func snapshotPlan(_ itemValue: Value = .undefined) throws -> Value {
+    let item = RetirementItem(itemValue)
     let hashes = try (item.hashes ?? .newArray()).elements.map { pair -> Value in [pair[0], Value(sha(try readFile(pair[0])))] }
-    let trees = try (item.trees ?? .newArray()).elements.map { pair -> Value in [pair[0], try manifest(pair[0]).sha] }
+    let trees = try (item.trees ?? .newArray()).elements.map { pair -> Value in [pair[0], SidecarTree(try manifest(pair[0])).sha] }
     let semantics = try (item.semantics ?? .newArray()).elements.map { pair -> Value in [pair[0], try recordSemantic(try readJson(pair[0]))] }
-    let plan = Value.spread(item, ["hashes": Value(hashes), "trees": Value(trees), "semantics": Value(semantics)])
+    let plan = RetirementItem(Value.spread(itemValue, ["hashes": Value(hashes), "trees": Value(trees), "semantics": Value(semantics)]))
     for pair in item.moved.elements {
         let file = pair[0], parked = pair[1]
         if !LOCAL_RECORD.test(path.basename(str(file), ".json")) { continue }
         let temp = "\(file).tmp"
         let detail: FileStat
         do { detail = try fs.lstat(temp) }
-        catch { if errorObject(error).code === "ENOENT" { continue }; throw error }
+        catch { if errorObject(error)["code"] === "ENOENT" { continue }; throw error }
         if !detail.isFile { throw EngineError("Desktop record temp is not a regular file: \(path.basename(temp))") }
         let raw = try readFile(Value(temp))
         if stable(try JSON.parse(raw.asData ?? Data())) != stable(try readJson(file)) { throw EngineError("Desktop record has a different pending update: \(path.basename(str(file)))") }
@@ -791,17 +822,17 @@ func snapshotPlan(_ item: Value = .undefined) throws -> Value {
         plan.required = Value((plan.required ?? .newArray()).elements + [Value(temp)])
         plan.moved = Value(plan.moved.elements + [[Value(temp), Value("\(parked).tmp")]])
     }
-    return plan
+    return plan.raw
 }
 
 func verify(_ rows: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined) throws -> Value {
     let report = fnOr(report), check = fnOr(check)
     var bad: [String: Int] = ["transcript": 0, "sidecars": 0, "desktop": 0]
     let problems = Value.newArray()
-    func flag(_ key: String, _ r: Value) { bad[key, default: 0] += 1; problems.push(["id": r.targetId, "title": r.title, "check": Value(key)]) }
+    func flag(_ key: String, _ r: PlacedSession) { bad[key, default: 0] += 1; problems.push(["id": r.targetId, "title": r.title, "check": Value(key)]) }
     let total = Value(rows.length)
     _ = try progress(report, "verify", 0, total)
-    for (i, r) in rows.elements.enumerated() {
+    for (i, r) in rows.elements.map(PlacedSession.init).enumerated() {
         _ = try check.call()
         _ = try withFinally({
             let targetDir = r.targetDir ?? Value(path.join(path.dirname(str(r.targetTranscript)), str(r.targetId)))
