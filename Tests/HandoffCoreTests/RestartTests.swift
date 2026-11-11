@@ -58,11 +58,15 @@ extension Engine {
                 for child in children where child.isRunning { child.terminate() }
                 for child in children { child.waitUntilExit() }
             }
-            // /usr/bin/python3 is a shim that re-execs; ps shows no argv for a process caught mid-exec.
+            // Each child writes one byte once Python is running.
             for pipe in ready { _ = pipe.fileHandleForReading.readData(ofLength: 1) }
-            let listing = ChildProcess.nativeSpawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,command="], SpawnOptions(timeout: 2000, maxBuffer: 16 * 1024 * 1024))
+            // Under load ps can print a running process without its argv, so read until the children's argv shows.
+            let ps = { ChildProcess.nativeSpawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,command="], SpawnOptions(timeout: 2000, maxBuffer: 16 * 1024 * 1024)) }
+            var listing = ps()
+            let deadline = Date().addingTimeInterval(5)
+            while listing.status == 0 && listing.stdout.utf8.count <= 1024 * 1024 && Date() < deadline { usleep(200_000); listing = ps() }
             eq(listing.status.map { Value(Int($0)) } ?? nil, 0)
-            ok(listing.stdout.utf8.count > 1024 * 1024)
+            ok(listing.stdout.utf8.count > 1024 * 1024, "ps listed \(listing.stdout.utf8.count) bytes")
             let to = try h.account("T")
             eq(try inventory([], to, h.paths).move.length, 0)
         }
