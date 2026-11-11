@@ -250,7 +250,7 @@ public func dateParse(_ s: String) -> Double {
     return .nan
 }
 
-// Building a DateFormatter or Calendar compiles ICU state; dateParse runs once per ps row, so reuse them per time zone.
+// Building a DateFormatter or Calendar compiles ICU state.
 final class DateCache: @unchecked Sendable {
     static let shared = DateCache()
     private static let formats = ["EEE MMM d HH:mm:ss yyyy", "EEE, dd MMM yyyy HH:mm:ss zzz", "EEE MMM dd yyyy HH:mm:ss 'GMT'Z"]
