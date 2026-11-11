@@ -7,26 +7,19 @@
 | `Sources/HandoffCore` | the engine: account discovery, planning, moves, receipts, recovery, the CLI |
 | `Sources/claude-handoff` | the CLI entry point |
 | `Sources/ClaudeHandoff` | the menu bar app, which runs the bundled CLI for every operation |
-| `Sources/handoff-parity` | a debug server that lets the Node test suite drive the Swift engine |
-| `Tests/HandoffCoreTests` | Swift unit tests for the runtime |
-| `Tests/Reference` | the Node reference engine and its test suite |
-| `Tests/Parity` | the harness that runs that suite against the Swift engine |
+| `Tests/HandoffCoreTests` | the engine behaviour suite (Swift Testing, under `Engine`) and the runtime unit tests |
 
 ## Tests
 
 ```bash
-swift build --build-tests && swift test
+swift test --skip Engine                 # runtime unit tests
+scripts/test-engine.sh                   # the engine behaviour suite
+swift test --filter 'Engine/Receipts/'   # one suite while you work on it
 ```
 
-The behavioural suite lives in `Tests/Reference/engine.test.js`. CI runs it twice: once against the Node reference engine, and once with every engine call served by Swift.
+The behaviour suite is the `Engine` suite in `Tests/HandoffCoreTests`, one nested suite per area (Accounts, Moves, Inventory, Receipts, Restarts, Cloud, CLI, MenuBar). `scripts/test-engine.sh` builds it once with optimisation and runs each suite as its own test process, several at a time (`JOBS` sets how many); CI's `engine` job runs the same script. The tables the tests swap (`fs`, `process`, `childProcess`, `cloudFetch`) are process-global, so suites run in parallel processes, never parallel threads.
 
-```bash
-(cd Tests/Reference && npm test)
-swift build -c release -Xswiftc -enable-testing --product handoff-parity
-node Tests/Parity/run.mjs .build/release/handoff-parity        # add 1/6 … 6/6 to run a shard
-```
-
-A change to engine behaviour goes into both engines in the same pull request, or the parity job fails. Set `PARITY_STATS=/tmp/parity.jsonl` to record which calls ran in Swift and which fell back to Node.
+Every test runs inside the `Sandboxed` trait, which gives it fresh native tables and a temporary `HOME`. Native Desktop commands and the keychain fail unless the test mocks them. `Support/` holds the fixture (`home()` and friends), the assertion helpers and the crash fence that stands in for a process killed mid-move.
 
 Ground rules:
 - Tests use a synthetic `HOME` and their own `TMPDIR`.
@@ -48,7 +41,7 @@ Ground rules:
    - signs the DMG for Sparkle;
    - publishes a GitHub release with the DMG and `appcast.xml`.
 
-The tag is the only place a version is set. In the repository, `Version.swift` and `Tests/Reference/package.json` both stay at `0.0.0-dev`. The release build writes the tag's version into the app and its build number, `major×10000 + minor×100 + patch`, which Sparkle uses to tell that a release is newer. Installed apps read updates from `releases/latest/download/appcast.xml`.
+The tag is the only place a version is set. In the repository, `Version.swift` stays at `0.0.0-dev`. The release build writes the tag's version into the app and its build number, `major×10000 + minor×100 + patch`, which Sparkle uses to tell that a release is newer. Installed apps read updates from `releases/latest/download/appcast.xml`.
 
 Repository secrets:
 

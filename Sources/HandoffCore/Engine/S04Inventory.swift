@@ -638,10 +638,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
     out["cacheStats"] = cache["stats"]
     out["cloud"] = cloudPlan
     if options["inspect"].nullish {
-        let inspect = Value { _ in try options["processes"] ?? processTable(paths["claudeApp"]) }
-        // Lets the parity harness rebuild this closure on the Node side; invisible to JSON and the engine.
-        inspect["$recipe"] = ["inspect", options["processes"], paths["claudeApp"]]
-        out["inspect"] = inspect
+        out["inspect"] = Value { _ in try options["processes"] ?? processTable(paths["claudeApp"]) }
     } else {
         out["inspect"] = options["inspect"]
     }

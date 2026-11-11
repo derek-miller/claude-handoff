@@ -106,10 +106,10 @@ VERSION=0.0.0 scripts/build-app.sh    # ad-hoc signed dist/Claude Handoff.app
 swift test
 ```
 
-[CONTRIBUTING.md](CONTRIBUTING.md) covers the parity suite and releases.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the test suite and releases.
 
 ## Credits
 
-Inspired by [vitaliyhayda/claude-transplant](https://github.com/vitaliyhayda/claude-transplant), which worked out how Desktop stores sessions and how to move them safely. Claude Handoff's Swift engine began as a port of that project's Node engine, which is kept under `Tests/Reference` so the test suite can check the two agree.
+Inspired by [vitaliyhayda/claude-transplant](https://github.com/vitaliyhayda/claude-transplant), which worked out how Desktop stores sessions and how to move them safely. Claude Handoff's Swift engine began as a port of that project's Node engine, and its behaviour suite as a port of that engine's tests.
 
 MIT licensed. See [LICENSE](LICENSE).
