@@ -85,60 +85,62 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
         firstPass.append(session.raw)
     }
     var filtered: [Value] = []
-    for session in firstPass {
-        guard let cutoffTime else { filtered.append(session); continue }
-        let createdAt = toNumber(try milliseconds(session["created_at"]))
+    for session in firstPass.map(RemoteSession.init) {
+        guard let cutoffTime else { filtered.append(session.raw); continue }
+        let createdAt = toNumber(try milliseconds(session.createdAt))
         if createdAt > cutoffTime {
-            later.push(["id": session["id"] ?? .null, "title": session["title"] ?? "Remote Control", "createdAt": session["created_at"]])
+            later.push(["id": session.id ?? .null, "title": session.title ?? "Remote Control", "createdAt": session.createdAt])
             continue
         }
-        if createdAt >= 0 { filtered.append(session); continue }
-        blocked.push(["id": session["id"] ?? .null, "title": session["title"] ?? "Remote Control", "account": account, "error": "Remote Control creation time is missing, check refused to widen the original move"])
+        if createdAt >= 0 { filtered.append(session.raw); continue }
+        blocked.push(["id": session.id ?? .null, "title": session.title ?? "Remote Control", "account": account, "error": "Remote Control creation time is missing, check refused to widen the original move"])
     }
     let eligibleSessions = try stableSorted(filtered) { a, b in
         comparatorChain([try retryOrder(a["id"]) - retryOrder(b["id"]), deferredOrder(a["id"]) - deferredOrder(b["id"])])
     }
     let sessions: [Value] = options["budgetRetry"].truthy ? sliceArray(eligibleSessions, 0, 1) : eligibleSessions
     if options["budgetRetry"].truthy {
-        for session in sliceArray(eligibleSessions, 1) {
-            waiting.push(["id": session["id"], "title": or(session["title"], "Untitled session"), "localId": .null, "code": "CLOUD_MEMORY_DEFERRED"])
+        for session in sliceArray(eligibleSessions, 1).map(RemoteSession.init) {
+            waiting.push(["id": session.id, "title": or(session.title, "Untitled session"), "localId": .null, "code": "CLOUD_MEMORY_DEFERRED"])
         }
     }
     let matches = Value.newArray()
     let artifacts = try artifactBudget(options["artifactLimit"])
     var completed = 0
     var deferralSequence = sessions.reduce(0.0) { maximum, session in
-        Swift.max(maximum, deferredOrder(session["id"]).isFinite ? deferredOrder(session["id"]) : 0)
+        let order = deferredOrder(RemoteSession(session).id)
+        return Swift.max(maximum, order.isFinite ? order : 0)
     }
     // Sessions are analyzed one at a time, so each artifact check runs after the previous one finished.
     if !sessions.isEmpty { try progress(report, "cloud scan", Value(completed), Value(sessions.count)) }
     let analyze = { (session: Value) throws -> CloudOutcome in
+        let listing = RemoteSession(session)
         let result: CloudOutcome
         do {
             result = try { () throws -> CloudOutcome in
-                let sessionId = try wireRemoteId(session["id"])
-                let named = candidates.filter { $0["title"] === session["title"] }
+                let sessionId = try wireRemoteId(listing.id)
+                let named = candidates.filter { $0["title"] === listing.title }
                 let linked = candidates.filter { $0["remoteIds"].has(sessionId) }
-                let detail = try cloud["session"].call(session["id"])
+                let detail = try cloud["session"].call(listing.id)
                 if remoteOpenStatus(detail["status"]), try remoteOpen(detail).truthy {
                     let local = waitingCandidates.filter { $0["remoteIds"].has(sessionId) }
                     let same: Value = ValueSet(local.map { $0["id"] }).size == 1 ? local[0] : .null
                     let recordId: Value = same.truthy ? try desktopRecordOf(same["row"])["sessionId"] : .null
-                    let row: Value = ["id": session["id"], "title": or(session["title"], "Untitled session"), "localId": same["id"] ?? .null, "recordId": recordId]
+                    let row: Value = ["id": listing.id, "title": or(listing.title, "Untitled session"), "localId": same["id"] ?? .null, "recordId": recordId]
                     return .waiting(row)
                 }
-                if linked.count > 1 { return .blocked(["id": session["id"], "title": session["title"], "account": account, "error": "multiple local targets carry the Remote Control id"]) }
+                if linked.count > 1 { return .blocked(["id": listing.id, "title": listing.title, "account": account, "error": "multiple local targets carry the Remote Control id"]) }
                 try assertRemoteIdle(detail)
-                let signature = Value(sha(stable(["id": session["id"], "updatedAt": session["updated_at"], "lastEventAt": detail["last_event_at"], "status": detail["status"]])))
-                var remote = try cacheLookup(cache, "remote", session["id"], signature)
+                let signature = Value(sha(stable(["id": listing.id, "updatedAt": listing.updatedAt, "lastEventAt": detail["last_event_at"], "status": detail["status"]])))
+                var remote = try cacheLookup(cache, "remote", listing.id, signature)
                 var remoteConversation = remote["conversation"]
                 let refresh = { () throws in
-                    let rows = try stableRemoteRows(cloud, session["id"])["rows"]
+                    let rows = try stableRemoteRows(cloud, listing.id)["rows"]
                     let current = try conversationFromRows(rows)
                     if remoteConversation.truthy && sha(stable(current)) != sha(stable(remoteConversation)) { throw EngineError("Remote Control history changed since cached analysis") }
                     remoteConversation = current
                     remote = ["conversation": current, "events": try remoteEvents(rows)]
-                    try cacheStore(cache, "remote", session["id"], signature, remote)
+                    try cacheStore(cache, "remote", listing.id, signature, remote)
                 }
                 if !remoteConversation.truthy { try refresh() }
                 let findCovered = { (items: [Value]) throws -> [Value] in
@@ -164,7 +166,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                 let covered = try findCovered(eligible)
                 let linkedCovered = covered.filter { $0["remoteIds"].has(sessionId) }
                 let verified = linkedCovered.count == 1 ? linkedCovered : covered
-                if verified.count > 1 { return .blocked(["id": session["id"], "title": session["title"], "account": account, "error": "multiple verified local target histories"]) }
+                if verified.count > 1 { return .blocked(["id": listing.id, "title": listing.title, "account": account, "error": "multiple verified local target histories"]) }
                 if verified.count == 1 { return .match(["session": session, "target": verified[0], "conversationSha": Value(sha(stable(remoteConversation))), "account": account]) }
                 let anchors = !linked.isEmpty ? linked : named
                 let base: Value = anchors.count == 1 ? anchors[0] : .null
@@ -184,7 +186,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                         if !linked.isEmpty && !artifactLinked { throw EngineError(try artifactError("the retained parent history cannot be verified")) }
                         if !remote["events"].isArray { try refresh() }
                         fullBudget = artifacts["used"] === 0
-                        deferredAt = deferredOrder(session["id"])
+                        deferredAt = deferredOrder(listing.id)
                         let inputs = try artifactInputs(selected["row"])
                         retrySignature = Value(sha(stable(["engine": try artifactEngine(), "limit": artifacts["limit"], "remote": signature, "id": selected["id"], "record": selected["row"]["recordSemantic"], "files": inputs["fingerprints"]])))
                         let previous = remote["artifactFailure"]
@@ -204,19 +206,19 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                             }
                         }
                         let typed = error["code"].asString?.hasPrefix("CLOUD_ARTIFACT_") ?? false
-                        settled = .blocked(["id": session["id"], "title": session["title"], "account": account, "code": typed ? error["code"] : "CLOUD_ARTIFACT_UNCERTAIN",
+                        settled = .blocked(["id": listing.id, "title": listing.title, "account": account, "code": typed ? error["code"] : "CLOUD_ARTIFACT_UNCERTAIN",
                                             "error": typed ? error["message"] : "Supplemental cloud coverage is uncertain: local artifacts could not be verified"])
                     }
                     // finally
-                    if checked { try cacheStore(cache, "remote", session["id"], signature, remote) }
+                    if checked { try cacheStore(cache, "remote", listing.id, signature, remote) }
                     if let settled { return settled }
                 }
-                return .blocked(["id": session["id"], "title": session["title"], "account": account, "code": "CLOUD_UNPROVEN", "error": .string("not proven to be on this Mac, kept in \(account["label"])")])
+                return .blocked(["id": listing.id, "title": listing.title, "account": account, "code": "CLOUD_UNPROVEN", "error": .string("not proven to be on this Mac, kept in \(account["label"])")])
             }()
         } catch {
             let error = errorObject(error)
             do {
-                result = .blocked(["id": session["id"], "title": session["title"], "account": account, "code": try memoryErrorCode(error), "error": .string("Remote Control history unreadable: \(error["message"])")])
+                result = .blocked(["id": listing.id, "title": listing.title, "account": account, "code": try memoryErrorCode(error), "error": .string("Remote Control history unreadable: \(error["message"])")])
             } catch {
                 completed += 1
                 try progress(report, "cloud scan", Value(completed), Value(sessions.count))
