@@ -58,18 +58,15 @@ extension Engine {
                 for child in children where child.isRunning { child.terminate() }
                 for child in children { child.waitUntilExit() }
             }
-            // /usr/bin/python3 is a shim that re-execs; ps shows no argv for a process caught mid-exec.
+            // Each child writes one byte once Python is running.
             for pipe in ready { _ = pipe.fileHandleForReading.readData(ofLength: 1) }
-            let listing = ChildProcess.nativeSpawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,command="], SpawnOptions(timeout: 2000, maxBuffer: 16 * 1024 * 1024))
+            // Under load ps can print a running process without its argv, so read until the children's argv shows.
+            let ps = { ChildProcess.nativeSpawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,command="], SpawnOptions(timeout: 2000, maxBuffer: 16 * 1024 * 1024)) }
+            var listing = ps()
+            let deadline = Date().addingTimeInterval(5)
+            while listing.status == 0 && listing.stdout.utf8.count <= 1024 * 1024 && Date() < deadline { usleep(200_000); listing = ps() }
             eq(listing.status.map { Value(Int($0)) } ?? nil, 0)
-            let size = listing.stdout.utf8.count
-            ok(size > 1024 * 1024, size > 1024 * 1024 ? nil : {
-                let marker = String(repeating: "x", count: 1024)
-                let argv = listing.stdout.split(separator: "\n").filter { $0.contains(marker) }.map { $0.utf8.count }
-                usleep(1_000_000)
-                let again = ChildProcess.nativeSpawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,command="], SpawnOptions(timeout: 2000, maxBuffer: 16 * 1024 * 1024)).stdout.utf8.count
-                return "ps listed \(size) bytes, argv lines \(argv), \(children.filter(\.isRunning).count)/9 children running, \(again) bytes a second later"
-            }())
+            ok(listing.stdout.utf8.count > 1024 * 1024, "ps listed \(listing.stdout.utf8.count) bytes")
             let to = try h.account("T")
             eq(try inventory([], to, h.paths).move.length, 0)
         }
