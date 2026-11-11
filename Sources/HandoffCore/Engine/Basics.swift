@@ -237,23 +237,20 @@ public func retryableCode(_ code: Value = .undefined) throws -> Value {
 func loginLabel(_ row: Value = .undefined) throws -> Value {
     Value(try accountLabel(row).description.components(separatedBy: " · ")[0])
 }
-func openCloudChecks(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func openCloudChecks(_ receipt: Receipt) throws -> Value {
     (receipt.cloudChecks ?? []).elements.filter { check in !(["complete", "cancelled", "blocked-local"] as [Value]).contains(check.status) }.value
 }
-func actionableCloudFailure(_ receipt: Value = .undefined, _ row: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func actionableCloudFailure(_ receipt: Receipt, _ row: Value = .undefined) throws -> Value {
     if !row.cloudAccount.truthy { return row.cloudAccount }
     if try keptCopy(receipt).call(row).truthy { return false }
     if optLength(row.blockedByLocal).truthy { return false }
     return Value(try receiptCloudCheck(receipt, ["account": row.cloudAccount, "org": row.cloudOrg])["status"] !== "cancelled")
 }
-func cloudCheckLabels(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func cloudCheckLabels(_ receipt: Receipt) throws -> Value {
     unique(try openCloudChecks(receipt).elements.map { $0.label }).value
 }
-public func waitingSessions(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+public func waitingSessions(_ receipt: Value = .undefined) throws -> Value { try waitingSessions(Receipt(receipt)) }
+func waitingSessions(_ receipt: Receipt) throws -> Value {
     var rows: [Value] = (receipt.held ?? []).elements.map { row in
         ["id": row.id, "title": row.title, "localId": row.id, "recordId": row.recordId]
     }
@@ -279,8 +276,8 @@ public func cloudCancelToken(_ file: Value = .undefined, _ check: Value = .undef
     return Value(sha(stable(["file": file, "account": check.account, "org": check.org, "sessionIds": sessionIds])))
 }
 
-public func pendingPresentation(_ receipt: Value = .undefined, _ source: Value = .undefined, _ account: Value = .undefined, _ mode: Value = .undefined, _ table: Value = .undefined, _ scheduler: Value = .undefined, _ timeouts: Value = .undefined, _ identity: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+public func pendingPresentation(_ receipt: Value = .undefined, _ source: Value = .undefined, _ account: Value = .undefined, _ mode: Value = .undefined, _ table: Value = .undefined, _ scheduler: Value = .undefined, _ timeouts: Value = .undefined, _ identity: Value = .undefined) throws -> Value { try pendingPresentation(Receipt(receipt), source, account, mode, table, scheduler, timeouts, identity) }
+func pendingPresentation(_ receipt: Receipt, _ source: Value = .undefined, _ account: Value = .undefined, _ mode: Value = .undefined, _ table: Value = .undefined, _ scheduler: Value = .undefined, _ timeouts: Value = .undefined, _ identity: Value = .undefined) throws -> Value {
     let table = table.isUndefined ? [] : table
     let scheduler = scheduler.isUndefined ? false : scheduler
     let timeouts = timeouts.isUndefined ? Value.newMap() : timeouts
@@ -340,22 +337,21 @@ public func pendingPresentation(_ receipt: Value = .undefined, _ source: Value =
         state = failures.length > 0 || waiting.elements.contains { $0.code === "CLOUD_MEMORY_DEFERRED" } ? "waiting" : waiting.length > 0 ? "cloud-open" : "cleanup"
     }
     let action: Value
-    if blocked.truthy { action = "blocked" } else if !account.signedIn.truthy { action = "sign-in" } else if try waiting.length > 0 && canRestartWaiting(["cloudChecks": [source]], table).truthy { action = "restart" } else { action = "wait" }
+    if blocked.truthy { action = "blocked" } else if !account.signedIn.truthy { action = "sign-in" } else if try waiting.length > 0 && canRestartWaiting(Receipt(["cloudChecks": [source]]), table).truthy { action = "restart" } else { action = "wait" }
     let retryAt: Value = account.signedIn.truthy && !blocked.truthy && state !== "cloud-open" ? try cloudRetryAt(receipt, source, identity) : .null
     return ["pendingState": state, "pendingAction": action, "pendingCount": countValue, "pendingAutomatic": Value(!blocked.truthy), "pendingRetryAt": retryAt]
 }
 
-public func needsRecovery(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+public func needsRecovery(_ receipt: Value = .undefined) throws -> Value { try needsRecovery(Receipt(receipt)) }
+func needsRecovery(_ receipt: Receipt) throws -> Value {
     Value(receipt.pending.truthy || receipt.retiring.truthy || receipt.finalizing.truthy || receipt.undoing.truthy || receipt.remotePending.truthy || optLength(receipt.remoteUndoing).truthy)
 }
 
-func recoveryFamilies(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func recoveryFamilies(_ receipt: Receipt) throws -> Value {
     let transfers = receipt.taskTransfers ?? [], checkpoint = receipt.appendCheckpoint
     if !checkpoint.truthy { return transfers }
     if ["sessions", "superseded"].contains(where: { key in
-        !isSafeInteger(checkpoint[key]) || toNumber(checkpoint[key]) < 0 || toNumber(checkpoint[key]) > toNumber(optLength(receipt[key]) ?? 0)
+        !isSafeInteger(checkpoint[key]) || toNumber(checkpoint[key]) < 0 || toNumber(checkpoint[key]) > toNumber(optLength(receipt.raw[key]) ?? 0)
     }) || !checkpoint.held.isArray { throw EngineError("invalid append checkpoint") }
     if receipt.undoing.truthy { return transfers }
     let offset = checkpoint.taskTransfers
@@ -376,8 +372,8 @@ func recoveryFamilies(_ receipt: Value = .undefined) throws -> Value {
 func inspector(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     options.inspect ?? options.io.inspect ?? Value { _ in try options.processes ?? processTable(Value(paths.claudeApp)) }
 }
-public func keptCopy(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+public func keptCopy(_ receipt: Value = .undefined) throws -> Value { try keptCopy(Receipt(receipt)) }
+func keptCopy(_ receipt: Receipt) throws -> Value {
     let linked = ValueSet(try (receipt.failed ?? []).elements.filter { !$0.cloudAccount.truthy }
         .flatMap { row in (row.sources ?? []).elements.flatMap { source in (source.remoteIds ?? []).elements } })
     return Value { args in
@@ -385,13 +381,12 @@ public func keptCopy(_ receipt: Value = .undefined) throws -> Value {
         return Value(try row.code === "CLOUD_UNPROVEN" && !optLength(row.blockedByLocal).truthy && !linked.has(remoteId(row.id)))
     }
 }
-func receiptOkay(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func receiptOkay(_ receipt: Receipt) throws -> Value {
     let kept = try keptCopy(receipt)
     return Value(try receipt.verification.ok !== false && (receipt.failed ?? []).elements.allSatisfy { try kept.call($0).truthy })
 }
-public func finishOkay(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+public func finishOkay(_ receipt: Value = .undefined) throws -> Value { try finishOkay(Receipt(receipt)) }
+func finishOkay(_ receipt: Receipt) throws -> Value {
     Value(try receipt.verification.ok !== false && !optLength(receipt.verification.problems).truthy &&
         !(receipt.failed ?? []).elements.contains { row in try actionableCloudFailure(receipt, row).truthy } &&
         !(receipt.cloudError.truthy && openCloudChecks(receipt).length > 0))
@@ -399,8 +394,7 @@ public func finishOkay(_ receipt: Value = .undefined) throws -> Value {
 public func problemText(_ problem: Value = .undefined) throws -> Value {
     Value("\(problem.title ?? problem.id) | \(problem.check) verification failed")
 }
-func cancelCloudChecks(_ receipt: Value = .undefined, _ checks: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func cancelCloudChecks(_ receipt: Receipt, _ checks: Value = .undefined) throws -> Value {
     let checks = checks.isUndefined ? try openCloudChecks(receipt) : checks
     for check in checks.elements {
         check.status = try (receipt.failed ?? []).elements.contains { row in try cloudTagged(row, check).truthy && optLength(row.blockedByLocal).truthy } ? "blocked-local" : "cancelled"
@@ -558,8 +552,7 @@ func workerGroups(_ table: Value = .undefined) throws -> [WorkerGroup] {
     return groups
 }
 
-func canRestartWaiting(_ receipt: Value = .undefined, _ table: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func canRestartWaiting(_ receipt: Receipt, _ table: Value = .undefined) throws -> Value {
     Value(try waitingSessions(receipt).elements.contains { row in
         let owns = { (ids: [Value]) throws -> Bool in try ownsWorker(Value.newSet(ids), row.localId, row.recordId).truthy }
         return try workerGroups(table).contains { try owns($0.ids) } && !processRows(table).contains { worker in try worker.isWorker && !worker.hasDesktop && owns(worker.ids) }
@@ -734,8 +727,7 @@ func appendRestartEvent(_ paths: DataLayout, _ event: Value = .undefined) throws
     return .undefined
 }
 
-func foldRestartHistory(_ paths: DataLayout, _ file: Value = .undefined, _ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func foldRestartHistory(_ paths: DataLayout, _ file: Value = .undefined, _ receipt: Receipt) throws -> Value {
     if try needsRecovery(receipt).truthy || !receipt.restartHistory.isUndefined &&
         (!receipt.restartHistory.isArray || receipt.restartHistory.elements.contains { row in !row.truthy || row.typeOf != "object" }) { return .undefined }
     let receiptId = try restartReceiptId(paths, file)
@@ -923,7 +915,7 @@ func withDesktopRestart(_ plan: Value = .undefined, _ paths: DataLayout, _ work:
     if !failure.truthy {
         do {
             let receiptFile = result.truthy && result.hasOwn("file") ? result.file : origin
-            let receipt = try updateRestartReceipt(paths, receiptFile, Value { args in try foldRestartHistory(paths, receiptFile, arg(args, 0)) })
+            let receipt = try updateRestartReceipt(paths, receiptFile, Value { args in try foldRestartHistory(paths, receiptFile, Receipt(arg(args, 0))) })
             if receipt.truthy && result.receipt.truthy { Value.assign(result.receipt, receipt) }
         } catch {}
     }

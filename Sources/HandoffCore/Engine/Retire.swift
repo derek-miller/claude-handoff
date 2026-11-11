@@ -33,8 +33,7 @@ fileprivate func isStopCode(_ error: Value) -> Bool {
     return code === "MOVE_STALLED" || code === "RESTART_REOPENED"
 }
 
-func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Value = .undefined, _ paths: DataLayout, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Receipt, _ paths: DataLayout, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let check = fnOr(check)
     let snapshots: Value = snapshots.isUndefined ? .null : snapshots
@@ -393,8 +392,7 @@ func applyActivation(_ activation: Value = .undefined, _ row: Value = .undefined
     return .undefined
 }
 
-func activationProblems(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func activationProblems(_ receipt: Receipt) throws -> Value {
     let problems = Value.newArray()
     for row in (try spreadable(receipt.remote ?? []) + [receipt.remotePending]).filter({ $0.truthy }) {
         let activation = row["activation"]
@@ -412,8 +410,7 @@ func activationProblems(_ receipt: Value = .undefined) throws -> Value {
     return problems
 }
 
-func restoreActivations(_ receipt: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func restoreActivations(_ receipt: Receipt) throws -> Value {
     for row in try spreadable(receipt.remote ?? []).reversed() {
         let activation = row["activation"]
         if !activation.truthy || !exists(activation["record"]) { continue }
@@ -450,14 +447,12 @@ func rollbackActivation(_ activation: Value = .undefined, _ row: Value = .undefi
     return .undefined
 }
 
-func receiptCloudCheck(_ receipt: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func receiptCloudCheck(_ receipt: Receipt, _ cloud: Value = .undefined) throws -> Value {
     for check in (receipt.cloudChecks ?? []).elements where try sameAccount(check, cloud).truthy { return check }
     return .null
 }
 
-func clearCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ retain: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func clearCloudAttempt(_ receipt: Receipt, _ cloud: Value = .undefined, _ retain: Value = .undefined) throws -> Value {
     let retain = retain.isUndefined ? Value { _ in false } : retain
     receipt.failed = Value(try (receipt.failed ?? []).elements.filter { failure in
         try !cloudTagged(failure, cloud).truthy || failure["blockedByLocal"]["length"].truthy || retain.call(failure).truthy
@@ -479,8 +474,7 @@ func clearCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefine
     return check
 }
 
-func addCloudFailure(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ failure: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func addCloudFailure(_ receipt: Receipt, _ cloud: Value = .undefined, _ failure: Value = .undefined) throws -> Value {
     let check = try receiptCloudCheck(receipt, cloud)
     if failure["code"] === "REMOTE_OPEN" && check.truthy {
         check["waiting"] = Value(try spreadable(check["waiting"] ?? []) + [["id": failure["id"], "title": failure["title"], "localId": failure["localId"] ?? .null]])
@@ -488,8 +482,7 @@ func addCloudFailure(_ receipt: Value = .undefined, _ cloud: Value = .undefined,
     return .undefined
 }
 
-func finishCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ later: Value = .undefined, _ waiting: Value = .undefined, _ options: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func finishCloudAttempt(_ receipt: Receipt, _ cloud: Value = .undefined, _ later: Value = .undefined, _ waiting: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let later: Value = later.isUndefined ? [] : later
     let waiting: Value = waiting.isUndefined ? [] : waiting
     let options: Value = options.isUndefined ? [:] : options
@@ -534,13 +527,11 @@ func finishCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefin
     return check
 }
 
-func cloudProgress(_ receipt: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func cloudProgress(_ receipt: Receipt, _ cloud: Value = .undefined) throws -> Value {
     Value.spread(["moved": Value(receipt.sessions.length)], try sourceProgress(cloud["source"]))
 }
 
-func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func archiveCloud(_ inv: Value = .undefined, _ receipt: Receipt, _ save: Value = .undefined, _ report: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let matches = (inv["cloud"]["matches"] ?? []).elements.filter { !$0["target"]["failed"].truthy }
     if matches.isEmpty {
@@ -674,8 +665,7 @@ func cloudScope(_ supplied: Value = .undefined, _ source: Value = .undefined) th
     if !supplied.truthy || supplied.isFunction { return true }
     return try sameAccount(supplied, source)
 }
-func cloudAttemptAt(_ receipt: Value = .undefined, _ source: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func cloudAttemptAt(_ receipt: Receipt, _ source: Value = .undefined) throws -> Value {
     let key = "\(source["account"])/\(source["org"])", at = receipt.cloudAttempts[key] ?? 0
     return isFiniteNumber(at) && toNumber(at) >= 0 ? at : 0
 }
@@ -701,8 +691,7 @@ func historyLimited(_ source: Value = .undefined, _ memory: Value = .undefined) 
     if !failuresLength.truthy { return failuresLength }
     return Value(try source["failures"].elements.allSatisfy { try limitedFailure(source, $0, memory).truthy })
 }
-func cloudRetryAt(_ receipt: Value = .undefined, _ source: Value = .undefined, _ active: Value = .undefined, _ now: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func cloudRetryAt(_ receipt: Receipt, _ source: Value = .undefined, _ active: Value = .undefined, _ now: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
     let now: Value = now.isUndefined ? Value(dateNow()) : now
     let memory = memory.isUndefined ? try operationMemory() : memory
     if try historyLimited(source, memory).truthy { return .null }
@@ -722,15 +711,13 @@ func sourceCloud(_ paths: DataLayout, _ source: Value = .undefined, _ supplied: 
     return cloud
 }
 
-func receiptCloud(_ receipt: Value = .undefined, _ paths: DataLayout, _ supplied: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func receiptCloud(_ receipt: Receipt, _ paths: DataLayout, _ supplied: Value = .undefined) throws -> Value {
     let row = receipt.remotePending ?? receipt.remote[0]
     if !row.truthy { return .null }
     return try sourceCloud(paths, row, supplied)
 }
 
-func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
-    let receipt = Receipt(receipt)
+func restoreRemote(_ receipt: Receipt, _ file: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? [:] : options
     if !receipt.remoteUndoing["length"].truthy { return ["problems": [], "pending": []] }
     var restored = 0
@@ -753,7 +740,7 @@ func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ 
                 if !setHas(REMOTE_OPEN, after["status"]) { throw EngineError("Remote Control unarchive verification returned \(after["status"] ?? "unknown")") }
                 receipt.remoteUndoing = Value(receipt.remoteUndoing.elements.filter { $0 !== row })
                 restored += 1
-                try saveJson(file, receipt)
+                try saveJson(file, receipt.raw)
             } catch {
                 let caught = errorObject(error)
                 problems.push(.string("\(row["title"]) | \(caught["message"])"))
@@ -761,7 +748,7 @@ func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ 
         }
     }
     if receipt.remoteUndoing.length == 0 { receipt.clear(.remoteUndoing) }
-    try saveJson(file, receipt)
+    try saveJson(file, receipt.raw)
     var pending: [Value] = []
     for row in (receipt.remoteUndoing ?? []).elements { pending.append(try loginLabel(row)) }
     let result: Value = [

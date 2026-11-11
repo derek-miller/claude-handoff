@@ -242,7 +242,7 @@ public func main(_ argv: [String]) throws {
                 "code": result.code ?? (result.restoreProblems["length"].truthy ? "UNDO_BLOCKED" : .null),
                 "retryable": try retryableCode(result.code),
                 "held": receipt.held ?? [],
-                "waiting": receipt.truthy ? try waitingSessions(receipt) : [],
+                "waiting": receipt.isPresent ? try waitingSessions(receipt) : [],
                 "reason": result.reason,
                 "restarted": result.restarted,
             ]
