@@ -430,8 +430,8 @@ extension Engine {
             let before = try readData(transcript), desktop = try readData(record)
             let result = try undo(h.paths, ["processes": []])
             eq(result.dest.truthy, !recordChanged)
-            do { let actual = try readData(transcript); let expected = before; #expect(actual == expected) }
-            if recordChanged { do { let actual = try readData(record); let expected = desktop; #expect(actual == expected) } }
+            eq(try readData(transcript), before)
+            if recordChanged { eq(try readData(record), desktop) }
             else { deq(try readJSON(h.recordFile("P", SOURCE)).bridgeSessionIds, ["session_prior"]) }
         }
 
@@ -481,7 +481,7 @@ extension Engine {
             }
             let first = try moveOnce()
             eq(first.ok, true)
-            do { let actual = try readData(transcript); let expected = cleared; #expect(actual == expected) }
+            eq(try readData(transcript), cleared)
             deq(try readJSON(path.join(targetDir, "local_\(SOURCE).json")).bridgeSessionIds, [])
             ok(try undo(h.paths).dest)
             deq(.strings(try readdir(targetDir)), [])
@@ -503,9 +503,9 @@ extension Engine {
             eq(moved.ok, true)
             let placed = try readJSON(h.recordFile("T", SOURCE))
             for key in saved.ownKeys { eq(placed.hasOwn(key), false, key) }
-            do { let actual = try readData(moved.receipt.superseded.find { $0.source.truthy }.moved[0][1].str); let expected = original; #expect(actual == expected) }
+            eq(try readData(moved.receipt.superseded.find { $0.source.truthy }.moved[0][1].str), original)
             ok(try undo(h.paths).dest)
-            do { let actual = try readData(source); let expected = original; #expect(actual == expected) }
+            eq(try readData(source), original)
             deq(.strings(try readdir(h.dir("T"))), [])
         }
 
@@ -563,7 +563,7 @@ extension Engine {
             let recovered = try undo(h.paths, ["processes": []])
             if checkpoint == "unacknowledged newer bridge" {
                 match(recovered.reconciled.error, "transcript restoration witness changed")
-                do { let actual = try readData(transcript); let expected = beforeRecovery; #expect(actual == expected) }
+                eq(try readData(transcript), beforeRecovery)
                 ok(exists(h.recordFile("Z", SOURCE)))
                 return
             }
@@ -578,7 +578,7 @@ extension Engine {
             ok(exists(h.recordFile("P", SOURCE)))
             deq(.strings(try readdir(h.dir("Z"))), [])
             _ = try undo(h.paths, ["processes": []])
-            do { let actual = try readData(transcript); let expected = after; #expect(actual == expected) }
+            eq(try readData(transcript), after)
         }
 
         @Test("bridge Undo preserves later messages, newer bridges and replaced transcripts", arguments: ["later messages", "newer bridge", "rewritten prefix", "replacement"])
@@ -690,7 +690,7 @@ extension Engine {
             let result = try undo(h.paths, ["processes": []])
             eq(result.dest.truthy, false)
             ok(result.restoreProblems.length > 0 || result.changed.length > 0 || result.reconciled.error.truthy)
-            do { let actual = try readData(transcriptPath); let expected = transcript; #expect(actual == expected) }
+            eq(try readData(transcriptPath), transcript)
             deq(try fixtureSnapshot(h, roots), before)
         }
 
@@ -737,7 +737,7 @@ extension Engine {
                 throwsError("Synthetic continuation interruption") { try undo(h.paths, ["processes": []]) }
                 fs = NodeFS()
                 #expect(repeated)
-                do { let actual = try readData(transcript).prefix(partial.count); let expected = partial; #expect(actual == expected) }
+                eq(try readData(transcript).prefix(partial.count), partial)
             }
             if checkpoint == "synced" || checkpoint == "restored" { try appendText(transcript, "\(JSON.text(entry("assistant", 4, 3, SOURCE)))\n") }
             let recovered = try undo(h.paths, ["processes": []])
@@ -750,7 +750,7 @@ extension Engine {
             deq(.strings(try readdir(h.dir("Z"))), [])
             ok(exists(h.recordFile("P", SOURCE)))
             _ = try undo(h.paths, ["processes": []])
-            do { let actual = try readData(transcript); let expected = after; #expect(actual == expected) }
+            eq(try readData(transcript), after)
         }
     }
 }

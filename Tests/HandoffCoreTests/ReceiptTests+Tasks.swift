@@ -37,7 +37,7 @@ extension Engine.Receipts {
                 deq(try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str]), before)
             } else {
                 ok(kept.refused.length > 0, scenario)
-                do { let actual = try readData(moved.file.str); let expected = receiptBefore; #expect(actual == expected, "\(scenario)") }
+                eq(try readData(moved.file.str), receiptBefore, "\(scenario)")
             }
         }
     }
@@ -88,10 +88,10 @@ extension Engine.Receipts {
             eq(placed.isArchived, false)
             eq(placed.forkedFromSessionId, Value("local_\(SOURCE)"))
             deq(placed.bridgeSessionIds, location == "P" ? [] : ["session_linked_fork"])
-            do { let actual = try readData(parentFile); let expected = originalParent; #expect(actual == expected) }
+            eq(try readData(parentFile), originalParent)
             ok(try undo(h.paths, ["cloud": cloud]).dest)
             eq(status, "active")
-            do { let actual = try readData(parentFile); let expected = originalParent; #expect(actual == expected) }
+            eq(try readData(parentFile), originalParent)
             deq(try readJSON(h.recordFile(location, child)), originalFork)
         }
     }
@@ -249,7 +249,7 @@ extension Engine.Receipts {
         try writeJSON(moved.file.str, receipt)
         ok(try finishWorkflow(h.paths, ["processes": []]).dest)
         deq(try readJSON(h.sourceFile), h.sourceRegistry)
-        do { let actual = try h.sessions.map { try readData(h.recordFile("P", $0)) }; let expected = h.originalRecords; #expect(actual == expected) }
+        eq(try h.sessions.map { try readData(h.recordFile("P", $0)) }, h.originalRecords)
         ok(!exists(h.targetFile))
         deq(.strings(try readdir(h.dir("T"))), [])
     }
@@ -266,7 +266,7 @@ extension Engine.Receipts {
             eq(moved.receipt.sessions.length, 4)
             deq(try readJSON(h.sourceFile), h.sourceAfter)
             deq(try readJSON(h.targetFile), h.targetAfter)
-            do { let actual = try h.tasks.elements.map { try readData($0.filePath.str) }; let expected = prompts; #expect(actual == expected) }
+            eq(try h.tasks.elements.map { try readData($0.filePath.str) }, prompts)
             deq(moved.receipt.taskTransfers[0].state, [
                 "recordedSkips": ["task_0": h.sourceRegistry.recordedSkips.task_0, "task_1": h.sourceRegistry.recordedSkips.task_1],
                 "runRetries": ["task_0": h.sourceRegistry.runRetries.task_0],
@@ -286,7 +286,7 @@ extension Engine.Receipts {
             ok(undone.dest)
             deq(try readJSON(h.sourceFile), h.sourceRegistry)
             deq(try readJSON(h.targetFile), h.targetRegistry)
-            do { let actual = try h.tasks.elements.map { try readData($0.filePath.str) }; let expected = prompts; #expect(actual == expected) }
+            eq(try h.tasks.elements.map { try readData($0.filePath.str) }, prompts)
             for sid in [SOURCE, h.run, h.second, h.cold] { ok(exists(h.recordFile("P", sid))) }
         }
     }
@@ -304,7 +304,7 @@ extension Engine.Receipts {
         let result = try move(inv, fresh.to, h.paths)
         eq(result.ok, false)
         ne(result.file, first.file)
-        do { let actual = try readData(first.file.str); let expected = before; #expect(actual == expected) }
+        eq(try readData(first.file.str), before)
         eq(result.receipt.sessions.length, 0)
         eq(result.added ?? 0, 0)
         eq(result.targetChanged ?? false, false)
@@ -393,7 +393,7 @@ extension Engine.Receipts {
                 let problems = result.reconciled.problems.nullish ? (result.restoreProblems.nullish ? result.changed : result.restoreProblems) : result.reconciled.problems
                 match(Value(problems.join(" ")), source ? "scheduled task state changed" : "scheduled task")
                 deq(try readJSON(file), changed, label)
-                if source { do { let actual = try readData(h.targetFile); let expected = target; #expect(actual == expected, "\(label)") } }
+                if source { eq(try readData(h.targetFile), target, "\(label)") }
                 ok(exists(h.recordFile("T", SOURCE)), label)
                 try writeData(file, before)
                 let retried = recovery ? try finishWorkflow(h.paths, ["processes": []]) : try undo(h.paths, ["processes": []])

@@ -132,7 +132,7 @@ extension Engine.Receipts {
             fs = NodeFS()
             if scenario.hasPrefix("E") { eq(removals, 1, scenario) }
             if scenario == "EACCES" {
-                do { let actual = try readData(h.targetFile); let expected = target; #expect(actual == expected) }
+                eq(try readData(h.targetFile), target)
                 undone = try finishWorkflow(h.paths, ["processes": []])
             }
             ok(undone.dest, scenario)
@@ -258,13 +258,13 @@ extension Engine.Receipts {
             eq(archived.isArchived, true)
             eq(archived.forkedFromSessionId, parent.sessionId)
             for file in files {
-                do { let actual = try readData(file.file); let expected = file.bytes; #expect(actual == expected) }
+                eq(try readData(file.file), file.bytes)
                 eq(try stat(file.file).ino, file.inode)
             }
             let restored = try undo(h.paths)
             ok(restored.dest)
             deq(.strings(try readdir(targetDir)), [])
-            for (index, sid) in [SOURCE, child].enumerated() { do { let actual = try readData(h.recordFile("P", sid)); let expected = originalRecords[index]; #expect(actual == expected) } }
+            for (index, sid) in [SOURCE, child].enumerated() { eq(try readData(h.recordFile("P", sid)), originalRecords[index]) }
         }
     }
 
@@ -287,14 +287,14 @@ extension Engine.Receipts {
         eq(moved.receipt.retiring, nil)
         eq(moved.receipt.sessions.length, 0)
         for (file, bytes) in originals {
-            do { let actual = try readData(file); let expected = bytes; #expect(actual == expected) }
+            eq(try readData(file), bytes)
             ok(!exists(path.join(h.dir("T"), path.basename(file))))
         }
         let swept = try sweep(h.paths, ["processes": []])
         match(swept.verification.notMoved.at(-1).error, "unreadable Desktop record")
         try unlink(corruptFile)
         ok(try undo(h.paths).dest)
-        for (file, bytes) in originals { do { let actual = try readData(file); let expected = bytes; #expect(actual == expected) } }
+        for (file, bytes) in originals { eq(try readData(file), bytes) }
         deq(.strings(try readdir(h.dir("T"))), [])
     }
 
@@ -328,9 +328,9 @@ extension Engine.Receipts {
                 #expect(injected, "\(label)")
                 eq(refused.dest, .undefined, label)
                 match(refused.restoreProblems[0], unreadable ? "unreadable Desktop record:" : "parent Desktop record would be removed by Undo")
-                for (file, bytes) in destination { do { let actual = try readData(file); let expected = bytes; #expect(actual == expected, "\(label)") } }
+                for (file, bytes) in destination { eq(try readData(file), bytes, "\(label)") }
                 if !unreadable { eq(try readJSON(h.recordFile("T", later)).forkedFromSessionId, Value("local_\(SOURCE)"), label) }
-                for (file, bytes) in originals { do { let actual = try readData(file); let expected = bytes; #expect(actual == expected, "\(label)") } }
+                for (file, bytes) in originals { eq(try readData(file), bytes, "\(label)") }
                 let receipt = try readJSON(moved.file.str)
                 eq(receipt.undoing.length, 2, label)
                 deq(receipt.superseded, moved.receipt.superseded, label)
@@ -338,13 +338,13 @@ extension Engine.Receipts {
                 let retried = try finishPending(h.paths)
                 eq(retried.ok, false, label)
                 match(retried.reconciled.problems[0], unreadable ? "unreadable Desktop record:" : "parent Desktop record would be removed by Undo")
-                for (file, bytes) in destination { do { let actual = try readData(file); let expected = bytes; #expect(actual == expected, "\(label)") } }
+                for (file, bytes) in destination { eq(try readData(file), bytes, "\(label)") }
                 try unlink(h.recordFile("T", later))
                 let undone = try finishWorkflow(h.paths)
                 ok(undone.dest, label)
                 eq(undone.complete, true, label)
                 eq(try readJSON(path.join(undone.dest.str, "receipt.json"))["at"], moved.receipt["at"], label)
-                for (file, bytes) in originals { do { let actual = try readData(file); let expected = bytes; #expect(actual == expected, "\(label)") } }
+                for (file, bytes) in originals { eq(try readData(file), bytes, "\(label)") }
                 deq(.strings(try readdir(h.dir("T"))), [], label)
             }
         }
@@ -388,10 +388,10 @@ extension Engine.Receipts {
             eq(refused.dest, .undefined, change)
             match(refused.restoreProblems[0], "parent Desktop record would be removed by Undo")
             if change != "source fork" { ok(refused.restoreProblems.some { JSRegExp.cached("restore path occupied|recovery artifact changed").test($0.str) }, change) }
-            do { let actual = try readData(foreignFile); let expected = foreignBytes; #expect(actual == expected, "\(change)") }
-            for (file, bytes) in originals { do { let actual = try readData(file); let expected = (file == foreignFile ? foreignBytes : bytes); #expect(actual == expected, "\(change) \(file)") } }
-            for (file, bytes) in destination { do { let actual = try readData(file); let expected = (file == foreignFile ? foreignBytes : bytes); #expect(actual == expected, "\(change) \(file)") } }
-            if change == "destination parent" { do { let actual = try readData(parkedParent); let expected = destination[targetParent]; #expect(actual == expected) } }
+            eq(try readData(foreignFile), foreignBytes, "\(change)")
+            for (file, bytes) in originals { eq(try readData(file), (file == foreignFile ? foreignBytes : bytes), "\(change) \(file)") }
+            for (file, bytes) in destination { eq(try readData(file), (file == foreignFile ? foreignBytes : bytes), "\(change) \(file)") }
+            if change == "destination parent" { eq(try readData(parkedParent), destination[targetParent]) }
             let receipt = try readJSON(moved.file.str)
             eq(receipt.undoing.length, 2, change)
             deq(receipt.superseded, moved.receipt.superseded, change)
@@ -404,9 +404,9 @@ extension Engine.Receipts {
             let undone = try finishWorkflow(h.paths)
             ok(undone.dest, change)
             eq(undone.complete, true, change)
-            for (file, bytes) in originals { do { let actual = try readData(file); let expected = bytes; #expect(actual == expected, "\(change) \(file)") } }
+            for (file, bytes) in originals { eq(try readData(file), bytes, "\(change) \(file)") }
             for file in destination.keys { eq(readOrNil(file), nil, change) }
-            do { let actual = try readData(change == "source fork" ? foreignFile : "\(foreignFile).foreign"); let expected = foreignBytes; #expect(actual == expected, "\(change)") }
+            eq(try readData(change == "source fork" ? foreignFile : "\(foreignFile).foreign"), foreignBytes, "\(change)")
         }
     }
 
@@ -633,7 +633,7 @@ extension Engine.Receipts {
             let recovered = try sweep(h.paths)
             ok(recovered.recovered)
             eq(try readdir(h.dir("T")).count, 0)
-            do { let actual = try readData(h.recordFile("P", SOURCE)); let expected = original; #expect(actual == expected) }
+            eq(try readData(h.recordFile("P", SOURCE)), original)
             eq(try readdir(h.paths.state.str).contains { $0.hasSuffix(".journal") }, false)
             eq(try sweep(h.paths).recovered, .undefined)
         }
@@ -823,8 +823,8 @@ extension Engine.Receipts {
                 try writeJSON(moved.file.str, moved.receipt)
             }
             ok(try undo(h.paths, ["processes": []]).dest, "\(legacy)")
-            do { let actual = try readData(transcript); let expected = before; #expect(actual == expected) }
-            do { let actual = try readData(path.join(h.project, SOURCE, "ordinary")); let expected = data; #expect(actual == expected) }
+            eq(try readData(transcript), before)
+            eq(try readData(path.join(h.project, SOURCE, "ordinary")), data)
             eq(String(decoding: try NodeFS.nativeReadlink(path.join(h.project, SOURCE, "dangling")), as: UTF8.self), "absent")
         }
     }
