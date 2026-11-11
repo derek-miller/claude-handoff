@@ -33,7 +33,7 @@ fileprivate func isStopCode(_ error: Value) -> Bool {
     return code === "MOVE_STALLED" || code === "RESTART_REOPENED"
 }
 
-func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Value = .undefined, _ paths: DataLayout, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
+func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Receipt, _ paths: DataLayout, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let check = fnOr(check)
     let snapshots: Value = snapshots.isUndefined ? .null : snapshots
@@ -44,7 +44,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
     let dest = path.join(paths.state, "quarantine", at.description)
     var plan: [Value] = []
     var landed: [Value] = []
-    for row in receipt["sessions"].elements {
+    for row in receipt.sessions.elements {
         let history: Value = bad.has(row["targetId"]) ? .null : (inv["move"].elements.first { $0["id"] === row["id"] } ?? .undefined)
         if history.truthy { landed.append(["by": row["targetId"], "history": history]) }
     }
@@ -70,7 +70,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
             if try gone.has(t) || requiredParents.has(t["record"]) || !t["transcript"].truthy || !included(t, history).truthy { continue }
             let claim = try ownership(t, liveWorkers)
             if claim.truthy {
-                if !blocked.has(t["session"]["file"]) { receipt["failed"].push(["id": t["id"], "title": t["session"]["title"], "error": .string("\(claim) kept in destination")]) }
+                if !blocked.has(t["session"]["file"]) { receipt.failed.push(["id": t["id"], "title": t["session"]["title"], "error": .string("\(claim) kept in destination")]) }
                 blocked.add(t["session"]["file"])
                 continue
             }
@@ -106,15 +106,15 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
         var bodyError: Error? = nil
         do {
             func body() throws {
-                if receipt["held"].elements.contains(where: { held in held["sources"].elements.contains { $0["file"] === s["file"] } }) { return }
+                if receipt.held.elements.contains(where: { held in held["sources"].elements.contains { $0["file"] === s["file"] } }) { return }
                 let owner = ready.get(s)
                 if !owner.truthy {
-                    if expected.has(s) { receipt["failed"].push(Value.spread(["id": s["id"], "title": s["title"], "error": "destination changed since inventory, source kept"], try failureIdentity(s))) }
+                    if expected.has(s) { receipt.failed.push(Value.spread(["id": s["id"], "title": s["title"], "error": "destination changed since inventory, source kept"], try failureIdentity(s))) }
                     return
                 }
                 let claim = try retirementOwnership(inv, s, owner, liveWorkers)
                 if claim.truthy {
-                    receipt["failed"].push(Value.spread(["id": s["id"], "title": s["title"], "error": .string("\(claim) kept in source")], try failureIdentity(s)))
+                    receipt.failed.push(Value.spread(["id": s["id"], "title": s["title"], "error": .string("\(claim) kept in source")], try failureIdentity(s)))
                     return
                 }
                 let moved: Value = [[s["file"], .string(path.join(dest, "sources", path.relative(paths.records, s["file"].description)))]]
@@ -128,7 +128,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
         if let bodyError { throw bodyError }
     }
     try report.call("finalize", "preparing", ["live": true])
-    let carriers = Value.newMap(receipt["sessions"].elements.map { ($0["targetId"], $0) })
+    let carriers = Value.newMap(receipt.sessions.elements.map { ($0["targetId"], $0) })
     for target in stableTargets where !carriers.has(target["id"]) { carriers.put(target["id"], target) }
     liveWorkers = try workers()
     settled.asMap!.clearAll()
@@ -152,7 +152,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
     if invalid.length > 0 {
         for id in invalid.elements {
             let members = Value(plan.filter { $0["by"] === id && $0["source"].truthy }.map { sourceRows.get($0["moved"][0][0]) })
-            receipt["failed"].push(Value.spread(["id": id, "title": "destination", "error": "destination changed before retirement, source kept"], try failureIdentity(["members": members])))
+            receipt.failed.push(Value.spread(["id": id, "title": "destination", "error": "destination changed before retirement, source kept"], try failureIdentity(["members": members])))
         }
         plan = plan.filter { !invalid.has($0["by"]) }
     }
@@ -162,7 +162,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
         let unchanged: Value = row.truthy ? try untouched(row, liveWorkers, Value(row["strategy"] !== "rehome")) : row
         if !row.truthy || !unchanged.truthy {
             let identity: Value = item["source"].truthy && row.truthy ? try failureIdentity(row) : [:]
-            receipt["failed"].push(Value.spread(["id": item["id"], "title": item["title"], "error": .string("\(item["source"].truthy ? "source" : "destination") changed before retirement, kept")], identity))
+            receipt.failed.push(Value.spread(["id": item["id"], "title": item["title"], "error": .string("\(item["source"].truthy ? "source" : "destination") changed before retirement, kept")], identity))
         } else { readyPlan.append(try snapshotPlan(item)) }
     }
     plan = readyPlan
@@ -207,12 +207,12 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
                     let error = errorObject(error)
                     if isStopCode(error) { throw EngineError(error) }
                     try restoreItems(group)
-                    receipt["failed"].push(Value.spread(["id": group[0]["id"], "title": group[0]["title"], "error": error["message"]], try failureIdentity(["members": retiringRows(group)])))
+                    receipt.failed.push(Value.spread(["id": group[0]["id"], "title": group[0]["title"], "error": error["message"]], try failureIdentity(["members": retiringRows(group)])))
                 }
             }
             return done
         }
-        receipt["retiring"] = Value(plan)
+        receipt.retiring = Value(plan)
         try save.call()
         try check.call(true)
         try checkParents(false)
@@ -248,13 +248,13 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
         let error = errorObject(error)
         if isStopCode(error) { throw EngineError(error) }
         try restoreItems(plan)
-        receipt["retiring"] = .null
-        receipt["failed"].push(Value.spread(["id": .null, "title": "retirement", "error": error["message"]], try failureIdentity(["members": retiringRows(plan)])))
+        receipt.retiring = .null
+        receipt.failed.push(Value.spread(["id": .null, "title": "retirement", "error": error["message"]], try failureIdentity(["members": retiringRows(plan)])))
         try save.call()
         return retained
     }
-    receipt["superseded"] = Value(try spreadable(receipt["superseded"]) + plan)
-    receipt["retiring"] = .null
+    receipt.superseded = Value(try spreadable(receipt.superseded) + plan)
+    receipt.retiring = .null
     try save.call()
     return retained
 }
@@ -392,9 +392,9 @@ func applyActivation(_ activation: Value = .undefined, _ row: Value = .undefined
     return .undefined
 }
 
-func activationProblems(_ receipt: Value = .undefined) throws -> Value {
+func activationProblems(_ receipt: Receipt) throws -> Value {
     let problems = Value.newArray()
-    for row in (try spreadable(receipt["remote"] ?? []) + [receipt["remotePending"]]).filter({ $0.truthy }) {
+    for row in (try spreadable(receipt.remote ?? []) + [receipt.remotePending]).filter({ $0.truthy }) {
         let activation = row["activation"]
         if !activation.truthy { continue }
         let raw = orNull { try readFile(activation["record"]) }
@@ -410,8 +410,8 @@ func activationProblems(_ receipt: Value = .undefined) throws -> Value {
     return problems
 }
 
-func restoreActivations(_ receipt: Value = .undefined) throws -> Value {
-    for row in try spreadable(receipt["remote"] ?? []).reversed() {
+func restoreActivations(_ receipt: Receipt) throws -> Value {
+    for row in try spreadable(receipt.remote ?? []).reversed() {
         let activation = row["activation"]
         if !activation.truthy || !exists(activation["record"]) { continue }
         let current = try readJson(activation["record"])
@@ -447,21 +447,21 @@ func rollbackActivation(_ activation: Value = .undefined, _ row: Value = .undefi
     return .undefined
 }
 
-func receiptCloudCheck(_ receipt: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
-    for check in (receipt["cloudChecks"] ?? []).elements where try sameAccount(check, cloud).truthy { return check }
+func receiptCloudCheck(_ receipt: Receipt, _ cloud: Value = .undefined) throws -> Value {
+    for check in (receipt.cloudChecks ?? []).elements where try sameAccount(check, cloud).truthy { return check }
     return .null
 }
 
-func clearCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ retain: Value = .undefined) throws -> Value {
+func clearCloudAttempt(_ receipt: Receipt, _ cloud: Value = .undefined, _ retain: Value = .undefined) throws -> Value {
     let retain = retain.isUndefined ? Value { _ in false } : retain
-    receipt["failed"] = Value(try (receipt["failed"] ?? []).elements.filter { failure in
+    receipt.failed = Value(try (receipt.failed ?? []).elements.filter { failure in
         try !cloudTagged(failure, cloud).truthy || failure["blockedByLocal"]["length"].truthy || retain.call(failure).truthy
     })
-    receipt["cloudError"] = .null
-    if receipt["verification"].truthy {
-        let retried = try (receipt["verification"]["problems"] ?? []).elements.contains { try cloudTagged($0, cloud).truthy }
-        receipt["verification"]["problems"] = Value(try (receipt["verification"]["problems"] ?? []).elements.filter { try !cloudTagged($0, cloud).truthy })
-        receipt["verification"]["ok"] = Value(receipt["verification"]["problems"].length == 0 && (receipt["verification"]["ok"] !== false || retried))
+    receipt.cloudError = .null
+    if receipt.verification.truthy {
+        let retried = try (receipt.verification["problems"] ?? []).elements.contains { try cloudTagged($0, cloud).truthy }
+        receipt.verification["problems"] = Value(try (receipt.verification["problems"] ?? []).elements.filter { try !cloudTagged($0, cloud).truthy })
+        receipt.verification["ok"] = Value(receipt.verification["problems"].length == 0 && (receipt.verification["ok"] !== false || retried))
     }
     let check = try receiptCloudCheck(receipt, cloud)
     if check.truthy {
@@ -474,21 +474,21 @@ func clearCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefine
     return check
 }
 
-func addCloudFailure(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ failure: Value = .undefined) throws -> Value {
+func addCloudFailure(_ receipt: Receipt, _ cloud: Value = .undefined, _ failure: Value = .undefined) throws -> Value {
     let check = try receiptCloudCheck(receipt, cloud)
     if failure["code"] === "REMOTE_OPEN" && check.truthy {
         check["waiting"] = Value(try spreadable(check["waiting"] ?? []) + [["id": failure["id"], "title": failure["title"], "localId": failure["localId"] ?? .null]])
-    } else { receipt["failed"].push(try taggedCloudFailure(cloud, failure)) }
+    } else { receipt.failed.push(try taggedCloudFailure(cloud, failure)) }
     return .undefined
 }
 
-func finishCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ later: Value = .undefined, _ waiting: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+func finishCloudAttempt(_ receipt: Receipt, _ cloud: Value = .undefined, _ later: Value = .undefined, _ waiting: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let later: Value = later.isUndefined ? [] : later
     let waiting: Value = waiting.isUndefined ? [] : waiting
     let options: Value = options.isUndefined ? [:] : options
     let check = try receiptCloudCheck(receipt, cloud)
     if !check.truthy { return .null }
-    let failures = try receipt["failed"].elements.filter { try cloudTagged($0, cloud).truthy }
+    let failures = try receipt.failed.elements.filter { try cloudTagged($0, cloud).truthy }
     let budget = try memorySignature(try options["memory"] ?? cloud["memory"] ?? operationMemory())
     let isolatedId = options.hasOwn("isolatedId") ? options["isolatedId"] : cloud["isolatedId"]
     let limitCodes: [Value] = ["CLOUD_MEMORY_BUDGET", "CLOUD_HISTORY_LIMIT", "CLOUD_BUDGET_LIMIT", "CLOUD_PARSER_LIMIT"]
@@ -527,11 +527,11 @@ func finishCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefin
     return check
 }
 
-func cloudProgress(_ receipt: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
-    Value.spread(["moved": Value(receipt["sessions"].length)], try sourceProgress(cloud["source"]))
+func cloudProgress(_ receipt: Receipt, _ cloud: Value = .undefined) throws -> Value {
+    Value.spread(["moved": Value(receipt.sessions.length)], try sourceProgress(cloud["source"]))
 }
 
-func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined) throws -> Value {
+func archiveCloud(_ inv: Value = .undefined, _ receipt: Receipt, _ save: Value = .undefined, _ report: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let matches = (inv["cloud"]["matches"] ?? []).elements.filter { !$0["target"]["failed"].truthy }
     if matches.isEmpty {
@@ -539,14 +539,14 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
         return .undefined
     }
     let cloud = inv["cloud"]["client"]
-    let failedVerification = Value.newSet(receipt["verification"]["problems"].elements.map { $0["id"] })
+    let failedVerification = Value.newSet(receipt.verification["problems"].elements.map { $0["id"] })
     var archived = 0
     let total = Value(matches.count)
     try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
     for (index, match) in matches.enumerated() {
         let row: Value = match["target"]["kind"] === "existing"
             ? match["target"]["row"]
-            : (receipt["sessions"].elements.first { $0["targetId"] === match["target"]["id"] } ?? .undefined)
+            : (receipt.sessions.elements.first { $0["targetId"] === match["target"]["id"] } ?? .undefined)
         if failedVerification.has(row["targetId"] ?? match["target"]["id"]) {
             try addCloudFailure(receipt, inv["cloud"], ["id": match["session"]["id"], "title": match["session"]["title"], "error": "local target failed verification, Remote Control source kept"])
             archived += 1
@@ -587,7 +587,7 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
         }
         var activation: Value = .undefined
         do {
-            let keep = match["target"]["kind"] === "existing" && receipt["sessions"].elements.contains { $0["record"] === row["session"]["file"] && !$0["archived"].truthy }
+            let keep = match["target"]["kind"] === "existing" && receipt.sessions.elements.contains { $0["record"] === row["session"]["file"] && !$0["archived"].truthy }
             activation = try targetActivation(row, Value(keep))
         } catch {
             let error = errorObject(error)
@@ -597,7 +597,7 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
             continue
         }
         let pending = Value.spread(try remoteReceipt(match), ["lastEventAt": lastEventAt, "stateSha": stateSha, "activation": activation])
-        receipt["remotePending"] = pending
+        receipt.remotePending = pending
         try save.call()
         var attempted = false
         do {
@@ -627,9 +627,9 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
             try cloud["archive"].call(pending["id"])
             let after = try waitRemote(cloud, pending["id"], ["archived"])
             if after["status"] !== "archived" { throw EngineError("Remote Control archive verification returned \(after["status"] ?? "unknown")") }
-            if receipt["remote"].nullish { receipt["remote"] = [] }
-            receipt["remote"].push(pending)
-            receipt.removeKey("remotePending")
+            if receipt.remote.nullish { receipt.remote = [] }
+            receipt.remote.push(pending)
+            receipt.clear(.remotePending)
             try save.call()
         } catch {
             let error = errorObject(error)
@@ -637,7 +637,7 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
             if !attempted {
                 do {
                     try rollbackActivation(pending["activation"], row)
-                    receipt.removeKey("remotePending")
+                    receipt.clear(.remotePending)
                     rolledBack = true
                 } catch {}
             }
@@ -653,7 +653,7 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
         archived += 1
         try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
     }
-    if receipt["remote"]["length"].truthy { try report.call("cloud", .string("\(count(receipt["remote"].length)) source mirrors archived")) }
+    if receipt.remote["length"].truthy { try report.call("cloud", .string("\(count(receipt.remote.length)) source mirrors archived")) }
     return .undefined
 }
 
@@ -665,8 +665,8 @@ func cloudScope(_ supplied: Value = .undefined, _ source: Value = .undefined) th
     if !supplied.truthy || supplied.isFunction { return true }
     return try sameAccount(supplied, source)
 }
-func cloudAttemptAt(_ receipt: Value = .undefined, _ source: Value = .undefined) throws -> Value {
-    let key = "\(source["account"])/\(source["org"])", at = receipt["cloudAttempts"][key] ?? 0
+func cloudAttemptAt(_ receipt: Receipt, _ source: Value = .undefined) throws -> Value {
+    let key = "\(source["account"])/\(source["org"])", at = receipt.cloudAttempts[key] ?? 0
     return isFiniteNumber(at) && toNumber(at) >= 0 ? at : 0
 }
 func unchangedLimit(_ source: Value = .undefined, _ row: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
@@ -691,7 +691,7 @@ func historyLimited(_ source: Value = .undefined, _ memory: Value = .undefined) 
     if !failuresLength.truthy { return failuresLength }
     return Value(try source["failures"].elements.allSatisfy { try limitedFailure(source, $0, memory).truthy })
 }
-func cloudRetryAt(_ receipt: Value = .undefined, _ source: Value = .undefined, _ active: Value = .undefined, _ now: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
+func cloudRetryAt(_ receipt: Receipt, _ source: Value = .undefined, _ active: Value = .undefined, _ now: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
     let now: Value = now.isUndefined ? Value(dateNow()) : now
     let memory = memory.isUndefined ? try operationMemory() : memory
     if try historyLimited(source, memory).truthy { return .null }
@@ -711,46 +711,46 @@ func sourceCloud(_ paths: DataLayout, _ source: Value = .undefined, _ supplied: 
     return cloud
 }
 
-func receiptCloud(_ receipt: Value = .undefined, _ paths: DataLayout, _ supplied: Value = .undefined) throws -> Value {
-    let row = receipt["remotePending"] ?? receipt["remote"][0]
+func receiptCloud(_ receipt: Receipt, _ paths: DataLayout, _ supplied: Value = .undefined) throws -> Value {
+    let row = receipt.remotePending ?? receipt.remote[0]
     if !row.truthy { return .null }
     return try sourceCloud(paths, row, supplied)
 }
 
-func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
+func restoreRemote(_ receipt: Receipt, _ file: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? [:] : options
-    if !receipt["remoteUndoing"]["length"].truthy { return ["problems": [], "pending": []] }
+    if !receipt.remoteUndoing["length"].truthy { return ["problems": [], "pending": []] }
     var restored = 0
     var errorMessage: Value = .undefined
     let problems = Value.newArray()
     let active = try cloudIdentity(paths, options)
     let bySource = ValueMap()
-    for row in receipt["remoteUndoing"].elements where try sameLogin(row, active).truthy && cloudScope(options["cloud"], row).truthy {
+    for row in receipt.remoteUndoing.elements where try sameLogin(row, active).truthy && cloudScope(options["cloud"], row).truthy {
         bySource.set(.string("\(row["account"])/\(row["org"])"), row)
     }
     for source in bySource.values {
         let cloud: Value
         do { cloud = try sourceCloud(paths, source, options["cloud"]) }
         catch { errorMessage = errorObject(error)["message"]; continue }
-        for row in try receipt["remoteUndoing"].elements.filter({ try sameAccount($0, source).truthy }) {
+        for row in try receipt.remoteUndoing.elements.filter({ try sameAccount($0, source).truthy }) {
             do {
                 let current = try cloud["session"].call(row["id"])
                 if current["status"] === "archived" { try cloud["unarchive"].call(row["id"]) }
                 let after = try waitRemote(cloud, row["id"], ["active", "paused"])
                 if !setHas(REMOTE_OPEN, after["status"]) { throw EngineError("Remote Control unarchive verification returned \(after["status"] ?? "unknown")") }
-                receipt["remoteUndoing"] = Value(receipt["remoteUndoing"].elements.filter { $0 !== row })
+                receipt.remoteUndoing = Value(receipt.remoteUndoing.elements.filter { $0 !== row })
                 restored += 1
-                try saveJson(file, receipt)
+                try saveJson(file, receipt.raw)
             } catch {
                 let caught = errorObject(error)
                 problems.push(.string("\(row["title"]) | \(caught["message"])"))
             }
         }
     }
-    if receipt["remoteUndoing"].length == 0 { receipt.removeKey("remoteUndoing") }
-    try saveJson(file, receipt)
+    if receipt.remoteUndoing.length == 0 { receipt.clear(.remoteUndoing) }
+    try saveJson(file, receipt.raw)
     var pending: [Value] = []
-    for row in (receipt["remoteUndoing"] ?? []).elements { pending.append(try loginLabel(row)) }
+    for row in (receipt.remoteUndoing ?? []).elements { pending.append(try loginLabel(row)) }
     let result: Value = [
         "problems": problems,
         "pending": Value(unique(pending)),

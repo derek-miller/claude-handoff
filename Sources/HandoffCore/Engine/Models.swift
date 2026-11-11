@@ -190,3 +190,147 @@ enum CloudOutcome {
     // It cannot be archived, with the reason.
     case blocked(Value)
 }
+
+// A move receipt (<state>/<at>.json): what a move changed, written through a journal as the move runs and read back
+// to finish, recover or undo it. Fields are values because the receipt is saved exactly as the move builds it.
+@dynamicMemberLookup
+struct Receipt {
+    let raw: Value
+    init(_ raw: Value) { self.raw = raw }
+    var isPresent: Bool { raw.truthy }
+    var appendCheckpoint: Value {
+        get { raw["appendCheckpoint"] }
+        nonmutating set { raw["appendCheckpoint"] = newValue }
+    }
+    var at: Value {
+        get { raw["at"] }
+        nonmutating set { raw["at"] = newValue }
+    }
+    var cloudAttempts: Value {
+        get { raw["cloudAttempts"] }
+        nonmutating set { raw["cloudAttempts"] = newValue }
+    }
+    var cloudChecks: Value {
+        get { raw["cloudChecks"] }
+        nonmutating set { raw["cloudChecks"] = newValue }
+    }
+    var cloudError: Value {
+        get { raw["cloudError"] }
+        nonmutating set { raw["cloudError"] = newValue }
+    }
+    var cloudLinks: Value {
+        get { raw["cloudLinks"] }
+        nonmutating set { raw["cloudLinks"] = newValue }
+    }
+    var failed: Value {
+        get { raw["failed"] }
+        nonmutating set { raw["failed"] = newValue }
+    }
+    var finalizing: Value {
+        get { raw["finalizing"] }
+        nonmutating set { raw["finalizing"] = newValue }
+    }
+    var from: Value {
+        get { raw["from"] }
+        nonmutating set { raw["from"] = newValue }
+    }
+    var fromAccounts: Value {
+        get { raw["fromAccounts"] }
+        nonmutating set { raw["fromAccounts"] = newValue }
+    }
+    var held: Value {
+        get { raw["held"] }
+        nonmutating set { raw["held"] = newValue }
+    }
+    var journalSequence: Value {
+        get { raw["journalSequence"] }
+        nonmutating set { raw["journalSequence"] = newValue }
+    }
+    var localCancelledAt: Value {
+        get { raw["localCancelledAt"] }
+        nonmutating set { raw["localCancelledAt"] = newValue }
+    }
+    var localRecovery: Value {
+        get { raw["localRecovery"] }
+        nonmutating set { raw["localRecovery"] = newValue }
+    }
+    var localStopped: Value {
+        get { raw["localStopped"] }
+        nonmutating set { raw["localStopped"] = newValue }
+    }
+    var metadataDrift: Value {
+        get { raw["metadataDrift"] }
+        nonmutating set { raw["metadataDrift"] = newValue }
+    }
+    var pending: Value {
+        get { raw["pending"] }
+        nonmutating set { raw["pending"] = newValue }
+    }
+    var remote: Value {
+        get { raw["remote"] }
+        nonmutating set { raw["remote"] = newValue }
+    }
+    var remotePending: Value {
+        get { raw["remotePending"] }
+        nonmutating set { raw["remotePending"] = newValue }
+    }
+    var remoteUndoing: Value {
+        get { raw["remoteUndoing"] }
+        nonmutating set { raw["remoteUndoing"] = newValue }
+    }
+    var restartHistory: Value {
+        get { raw["restartHistory"] }
+        nonmutating set { raw["restartHistory"] = newValue }
+    }
+    var retained: Value {
+        get { raw["retained"] }
+        nonmutating set { raw["retained"] = newValue }
+    }
+    var retiring: Value {
+        get { raw["retiring"] }
+        nonmutating set { raw["retiring"] = newValue }
+    }
+    var sessions: Value {
+        get { raw["sessions"] }
+        nonmutating set { raw["sessions"] = newValue }
+    }
+    var startedAt: Value {
+        get { raw["startedAt"] }
+        nonmutating set { raw["startedAt"] = newValue }
+    }
+    var superseded: Value {
+        get { raw["superseded"] }
+        nonmutating set { raw["superseded"] = newValue }
+    }
+    var taskTransfers: Value {
+        get { raw["taskTransfers"] }
+        nonmutating set { raw["taskTransfers"] = newValue }
+    }
+    var to: Value {
+        get { raw["to"] }
+        nonmutating set { raw["to"] = newValue }
+    }
+    var toAccount: Value {
+        get { raw["toAccount"] }
+        nonmutating set { raw["toAccount"] = newValue }
+    }
+    var undoing: Value {
+        get { raw["undoing"] }
+        nonmutating set { raw["undoing"] = newValue }
+    }
+    var verification: Value {
+        get { raw["verification"] }
+        nonmutating set { raw["verification"] = newValue }
+    }
+    var writer: Value {
+        get { raw["writer"] }
+        nonmutating set { raw["writer"] = newValue }
+    }
+    func clear(_ field: Field) { raw.removeKey(field.rawValue) }
+
+    enum Field: String { case appendCheckpoint, cloudAttempts, localRecovery, remotePending, remoteUndoing }
+
+    // Unknown names do not compile: every field read goes through a declared property.
+    @available(*, unavailable, message: "declare the receipt field on Receipt")
+    subscript(dynamicMember name: String) -> Value { raw[name] }
+}
