@@ -726,8 +726,8 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
         let pendingRow = receipt.pending
         let id = pendingRow.id, title = pendingRow.title, targetId = pendingRow.targetId, made = pendingRow.made
         let strategy = pendingRow.strategy, creationRequired = pendingRow.creationRequired, created = pendingRow.created
-        let found: Value = creationRequired.truthy ? catchNull { try fs.stat(made[0].description, bigint: false) } : .null
-        let foreign = and(and(creationRequired, found), Value(!created.truthy || found.dev !== created.dev || found.ino !== created.ino))
+        let found: FileStat? = creationRequired.truthy ? try? fs.stat(made[0].description, bigint: false) : nil
+        let foreign = found.map { !created.truthy || $0.devValue !== created.dev || $0.inoValue !== created.ino } ?? false
         do { _ = try restoreBridge(receipt.pending, Value { _ in try saveJson(p.file, receipt, 2, true) }, inspect) }
         catch { return ["title": "bridge recovery blocked", "error": errorMessage(error)] }
         let used: Value
@@ -737,10 +737,10 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
         } else {
             used = try changed(made[0], targetId, knownOf(receipt.pending))
         }
-        if (used.truthy || foreign.truthy) && taskTransfers.elements.contains(where: { $0.recordIds.includes(Value(path.basename(made[0].description, ".json"))) }) {
+        if (used.truthy || foreign) && taskTransfers.elements.contains(where: { $0.recordIds.includes(Value(path.basename(made[0].description, ".json"))) }) {
             return ["title": "scheduled task recovery blocked", "error": "scheduled task target record changed, recovery remains pending"]
         }
-        if !used.truthy && !foreign.truthy {
+        if !used.truthy && !foreign {
             _ = try quarantine(made, failedDirectory, Value { _ in
                 try optCall(options.check, true)
                 if try ownsWorker(workers(inspect.call()), targetId, Value(path.basename(made[0].description, ".json"))).truthy {
@@ -749,9 +749,9 @@ func reconcileFiles(_ paths: Value = .undefined, _ options: Value = .undefined) 
                 return .undefined
             })
         }
-        let error: Value = foreign.truthy ? "interrupted, independently created target left in place" : used.truthy ? "interrupted, target record changed since, left in place" : "interrupted"
-        receipt.failed.push(["id": id, "title": title, "targetId": targetId, "artifacts": made, "retained": and(used, Value(!foreign.truthy)), "error": error])
-        if used.truthy && !foreign.truthy {
+        let error: Value = foreign ? "interrupted, independently created target left in place" : used.truthy ? "interrupted, target record changed since, left in place" : "interrupted"
+        receipt.failed.push(["id": id, "title": title, "targetId": targetId, "artifacts": made, "retained": and(used, Value(!foreign)), "error": error])
+        if used.truthy && !foreign {
             receipt.retained = Value((receipt.retained ?? Value.newArray()).elements + [["id": id, "title": title, "targetId": targetId, "artifacts": made] as Value])
         }
         receipt.pending = .null

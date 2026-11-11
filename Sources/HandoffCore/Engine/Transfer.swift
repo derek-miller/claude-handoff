@@ -363,8 +363,8 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
                 }
                 let raw: Value = (try? readFile(.string(made[0]))) ?? .null
                 let created = rehomeGuard.created.get(.string(made[0]))
-                let found: Value = (try? fs.stat(made[0])) ?? .null
-                if raw.truthy && created.truthy && found["dev"] === created.dev && found["ino"] === created.ino {
+                let found = try? fs.stat(made[0])
+                if raw.truthy && created.truthy, let found, found.devValue === created.dev && found.inoValue === created.ino {
                     if Value.string(sha(raw)) !== receipt.pending.recordSha { throw EngineError(error) }
                     _ = try quarantine(.strings(made), .string(path.join(paths.state.description, "quarantine", at.description, "failed")))
                 }

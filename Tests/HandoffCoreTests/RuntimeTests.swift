@@ -92,4 +92,19 @@ final class RuntimeTests: XCTestCase {
         XCTAssertEqual(UUIDS.matches("a 00000000-0000-4000-8000-000000000001 b 00000000-0000-4000-8000-000000000002").count, 2)
         XCTAssertEqual(re("[:.]", "g").replace("12:34.5", "-"), "12-34-5")
     }
+
+    // identity is stored in caches and receipts: it must stay the dev:ino:size:mtimeNs:ctimeNs join of the stat's fields.
+    func testFileStatIdentity() throws {
+        let file = NSTemporaryDirectory() + "stat-\(randomUUID())"
+        try Data("x".utf8).write(to: URL(fileURLWithPath: file))
+        defer { try? FileManager.default.removeItem(atPath: file) }
+        for bigint in [true, false] {
+            let stat = try FileSystem.nativeStat(file, bigint, follow: true), value = stat.value
+            let joined = Value([value["dev"], value["ino"], value["size"], value["mtimeNs"], value["ctimeNs"]]).join(":")
+            XCTAssertEqual(stat.identity, joined)
+            XCTAssertEqual(stat.isFile, try value["isFile"].call().truthy)
+            XCTAssertFalse(stat.isDirectory)
+            XCTAssertTrue(stat.sizeValue === value["size"] && stat.mtimeMs === value["mtimeMs"] && stat.inoValue === value["ino"])
+        }
+    }
 }

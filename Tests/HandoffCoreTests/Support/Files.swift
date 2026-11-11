@@ -30,8 +30,8 @@ func exists(_ file: String) -> Bool { var s = Darwin.stat(); return Darwin.lstat
 // readdir in directory order, unsorted.
 func readdir(_ dir: String) throws -> [String] { try FileSystem.nativeReaddir(dir).map(\.name) }
 func readdirOrEmpty(_ dir: String) -> [String] { (try? readdir(dir)) ?? [] }
-func stat(_ file: String) throws -> Value { try FileSystem.nativeStat(file, false, follow: true) }
-func lstat(_ file: String) throws -> Value { try FileSystem.nativeStat(file, false, follow: false) }
+func stat(_ file: String) throws -> Value { try FileSystem.nativeStat(file, false, follow: true).value }
+func lstat(_ file: String) throws -> Value { try FileSystem.nativeStat(file, false, follow: false).value }
 
 // Receipts in the state directory, oldest first.
 func receiptFiles(_ h: Home) -> [String] {

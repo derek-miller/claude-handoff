@@ -350,8 +350,8 @@ func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, 
             let before = try artifactStat(canonicalTranscript)
             let detail = try history(id, .string(transcript), ctx, desktopRecordOf(target)["cwd"])
             if !detail["comparable"].truthy { continue }
-            if try artifactStat(canonicalTranscript)["signature"] !== before["signature"] { continue }
-            if Value(sha(try readRegular(canonicalTranscript, before["signature"]))) !== detail["contentSha"] { continue }
+            if try artifactStat(canonicalTranscript).signature !== before.signature { continue }
+            if Value(sha(try readRegular(canonicalTranscript, before.signature))) !== detail["contentSha"] { continue }
             if try mappedPath(.string(transcript)) !== canonicalTranscript { continue }
             // Bridge owners grouped by id.
             let groups = ValueMap()
@@ -377,7 +377,7 @@ func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, 
             target["bridgeIds"] = unique((target["bridgeIds"] ?? []).elements + bridgeIds).value
             if target["retainedHistories"].nullish { target["retainedHistories"] = [] }
             target["retainedHistories"].push([
-                "transcript": .string(transcript), "canonicalTranscript": canonicalTranscript, "fingerprint": before["signature"],
+                "transcript": .string(transcript), "canonicalTranscript": canonicalTranscript, "fingerprint": before.signature,
                 "contentSha": detail["contentSha"], "conversation": detail["conversation"], "bindings": bindings.value,
             ])
         } catch {}

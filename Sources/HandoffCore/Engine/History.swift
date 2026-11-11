@@ -54,14 +54,11 @@ fileprivate func artifactFail(_ text: String, _ code: String = "CLOUD_ARTIFACT_U
     makeError("Supplemental cloud coverage is uncertain: \(text)", code: code)
 }
 
-fileprivate func isFileStat(_ st: Value) throws -> Bool { try st["isFile"].call().truthy }
-fileprivate func isDirectoryStat(_ st: Value) throws -> Bool { try st["isDirectory"].call().truthy }
-
 // lstat with BigInt fields, or null when the file does not exist.
-fileprivate func lstatOrNull(_ file: String) throws -> Value {
+fileprivate func lstatOrNull(_ file: String) throws -> FileStat? {
     do { return try fs.lstat(file, bigint: true) } catch {
         let e = errorObject(error)
-        if e["code"] === "ENOENT" { return .null }
+        if e["code"] === "ENOENT" { return nil }
         throw EngineError(e)
     }
 }
@@ -601,18 +598,16 @@ func eventAgrees(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Val
 func agentName(_ value: Value = .undefined) throws -> Value {
     Value(value.asString.map { re(#"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\z"#).test($0) } ?? false)
 }
-func statIdentity(_ detail: Value = .undefined) throws -> Value {
-    Value(Value([detail["dev"], detail["ino"], detail["size"], detail["mtimeNs"], detail["ctimeNs"]]).join(":"))
-}
+func statIdentity(_ detail: FileStat) -> Value { Value(detail.identity) }
 
 func readRegular(_ file: Value = .undefined, _ signature: Value = .undefined) throws -> Value {
     let signature = signature.isUndefined ? Value.null : signature
     let name = file.description
     let before = try fs.lstat(name, bigint: true)
-    if try !(try isFileStat(before)) || (signature.truthy && (try statIdentity(before)) !== signature) { throw EngineError("regular file changed before reading: \(name)") }
+    if !before.isFile || (signature.truthy && statIdentity(before) !== signature) { throw EngineError("regular file changed before reading: \(name)") }
     let handle = try fs.open(name, O_RDONLY | O_NOFOLLOW, 0o666)
     return try closing(handle) {
-        let identity = try statIdentity(before)
+        let identity = statIdentity(before)
         if try statIdentity(handle.stat(bigint: true)) !== identity { throw EngineError("regular file changed before reading: \(name)") }
         let data = try handle.readFile()
         if try statIdentity(handle.stat(bigint: true)) !== identity || (try statIdentity(fs.lstat(name, bigint: true))) !== identity {
@@ -622,12 +617,17 @@ func readRegular(_ file: Value = .undefined, _ signature: Value = .undefined) th
     }
 }
 
-func artifactStat(_ file: Value = .undefined) throws -> Value {
+struct ArtifactStat {
+    let detail: FileStat
+    let signature: Value
+}
+
+func artifactStat(_ file: Value = .undefined) throws -> ArtifactStat {
     let detail = try fs.lstat(file.description, bigint: true)
-    if try !(try isFileStat(detail)) || (try fs.realpath(file.description)) != file.description {
+    if try !detail.isFile || (try fs.realpath(file.description)) != file.description {
         throw artifactFail("artifact is not a regular file within its session root")
     }
-    return ["detail": detail, "signature": try statIdentity(detail)]
+    return ArtifactStat(detail: detail, signature: statIdentity(detail))
 }
 
 func artifactInputs(_ row: Value = .undefined) throws -> Value {
@@ -638,14 +638,14 @@ func artifactInputs(_ row: Value = .undefined) throws -> Value {
     if row["sidecar"]["canonicalRoot"].truthy && Value(path.join(project, row["id"].description)) !== row["sidecar"]["canonicalRoot"] {
         throw artifactFail("session root mapping changed")
     }
-    let signature = try artifactStat(Value(transcript))["signature"], root = path.join(project, row["id"].description), directory = path.join(root, "subagents")
+    let signature = try artifactStat(Value(transcript)).signature, root = path.join(project, row["id"].description), directory = path.join(root, "subagents")
     var fingerprints: [Value] = [[Value(transcript), signature]]
     var files: [Value] = []
     for dir in [root, directory] {
         let detail = try lstatOrNull(dir)
-        fingerprints.append([Value(dir), detail.truthy ? try statIdentity(detail) : .null])
-        if !detail.truthy { break }
-        if try !(try isDirectoryStat(detail)) || (try fs.realpath(dir)) != dir { throw artifactFail("subagent root is not a real session directory") }
+        fingerprints.append([Value(dir), detail.map { statIdentity($0) } ?? .null])
+        guard let detail else { break }
+        if try !detail.isDirectory || (try fs.realpath(dir)) != dir { throw artifactFail("subagent root is not a real session directory") }
         if dir == directory {
             let entries = try fs.readdir(dir).enumerated().sorted { a, b in
                 let c = localeCompare(a.element.name, b.element.name)
@@ -656,9 +656,8 @@ func artifactInputs(_ row: Value = .undefined) throws -> Value {
                 let agent = sliceString(entry.name, 6, -6), name = path.join(dir, entry.name)
                 if try !entry.isFile || !(try agentName(Value(agent))).truthy { throw artifactFail("subagent entry is not a regular owned file") }
                 let current = try artifactStat(Value(name))
-                fingerprints.append([Value(name), current["signature"]])
-                let mtimeNs: Int64
-                if case .bigint(let ns) = current["detail"]["mtimeNs"] { mtimeNs = ns } else { mtimeNs = Int64(toNumber(current["detail"]["mtimeNs"])) }
+                fingerprints.append([Value(name), current.signature])
+                let mtimeNs = Int64(current.detail.mtime.tv_sec) * 1_000_000_000 + Int64(current.detail.mtime.tv_nsec)
                 files.append(["file": Value(name), "agent": Value(agent), "modified": Value(Double(mtimeNs / 1_000_000))])
             }
         }
@@ -668,13 +667,12 @@ func artifactInputs(_ row: Value = .undefined) throws -> Value {
 
 func artifactIndex(_ file: Value = .undefined, _ kind: Value = .undefined, _ budget: Value = .undefined) throws -> Value {
     let stat = try artifactStat(file)
-    let detail = stat["detail"], signature = stat["signature"]
+    let signature = stat.signature
     let key = Value("\(file)/\(signature)/\(kind)")
     if budget["indexes"].has(key) { return budget["indexes"].get(key) }
     // Only a finished index is cached; a failure leaves no entry, so the next call retries.
     let name = file.description
-    let size: Int
-    if case .bigint(let n) = detail["size"] { size = Int(n) } else { size = Int(toNumber(detail["size"])) }
+    let size = Int(stat.detail.size)
     let handle = try fs.open(name, O_RDONLY | O_NOFOLLOW, 0o666)
     let result: Value = try closing(handle) {
         if try statIdentity(handle.stat(bigint: true)) !== signature { throw artifactFail("artifact changed before reading") }
@@ -751,7 +749,7 @@ func artifactIndex(_ file: Value = .undefined, _ kind: Value = .undefined, _ bud
             }
             try consume()
         }
-        if try artifactStat(file)["signature"] !== signature { throw artifactFail("artifact changed while reading") }
+        if try artifactStat(file).signature !== signature { throw artifactFail("artifact changed while reading") }
         let out: Value = ["main": main.value, "events": events.value, "queued": queued.value, "operations": operations.value]
         if let timestamp { out["timestamp"] = timestamp }
         return out
@@ -864,7 +862,7 @@ func supplementalCoverage(_ events: Value = .undefined, _ row: Value = .undefine
     for pair in inputs["fingerprints"].elements {
         let file = pair[0].description, signature = pair[1]
         let current = try lstatOrNull(file)
-        if try (current.truthy ? try statIdentity(current) : .null) !== signature || (current.truthy && (try fs.realpath(file)) != file) {
+        if try (current.map { statIdentity($0) } ?? .null) !== signature || (current != nil && (try fs.realpath(file)) != file) {
             throw artifactFail("session artifacts changed during coverage analysis")
         }
     }
