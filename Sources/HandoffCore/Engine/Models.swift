@@ -44,7 +44,6 @@ struct DesktopSession {
     var activeAt: Double { toNumber(raw["activeAt"]) }
     var focusedAt: Double { toNumber(raw["focusedAt"]) }
     var record: DesktopRecord { DesktopRecord(raw["record"]) }
-    // Where the session last worked: its cwd and the record's origin, when either is set.
     var workingDirectories: [String] { [raw["cwd"], raw["record"]["originCwd"]].compactMap(\.asString).filter { !$0.isEmpty } }
 }
 
@@ -56,7 +55,6 @@ protocol AccountKey {
 extension AccountKey {
     var accountId: Value { raw["account"] }
     var orgId: Value { raw["org"] }
-    // Both present and naming the same pair.
     func same(_ other: some AccountKey) -> Bool { raw.truthy && other.raw.truthy && accountId === other.accountId && orgId === other.orgId }
 }
 
@@ -80,7 +78,6 @@ struct Account: AccountKey {
     var orgName: Value { raw["orgName"] }
     var activeAt: Double { toNumber(raw["activeAt"]) }
     var sessions: [DesktopSession] { raw["sessions"].elements.map(DesktopSession.init) }
-    // Record files that could not be read.
     var unreadable: [Value] { raw["unreadable"].elements }
     var isEmpty: Bool { raw["sessions"].length == 0 && raw["unreadable"].length == 0 }
     var taskError: Value { raw["taskError"] }
@@ -103,7 +100,6 @@ struct Identity: AccountKey {
     // known, unknown or logged-out.
     var state: Value { raw["state"] }
     var isKnown: Bool { state === "known" }
-    // The same signed-in account, when the identity is known or carries no state.
     func isLogin(of account: some AccountKey) -> Bool { account.accountId.truthy && account.accountId === accountId && (state.nullish || isKnown) }
 }
 
