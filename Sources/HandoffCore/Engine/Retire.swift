@@ -33,7 +33,7 @@ fileprivate func isStopCode(_ error: Value) -> Bool {
     return code === "MOVE_STALLED" || code === "RESTART_REOPENED"
 }
 
-func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Receipt, _ paths: DataLayout, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
+func retire(_ inv: MovePlan, _ to: Value = .undefined, _ receipt: Receipt, _ paths: DataLayout, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let check = fnOr(check)
     let snapshots: Value = snapshots.isUndefined ? .null : snapshots
@@ -45,11 +45,11 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Rece
     var plan: [Value] = []
     var landed: [Value] = []
     for row in receipt.sessions.elements {
-        let history: Value = bad.has(row["targetId"]) ? .null : (inv["move"].elements.first { $0["id"] === row["id"] } ?? .undefined)
+        let history: Value = bad.has(row["targetId"]) ? .null : (inv.move.elements.first { $0["id"] === row["id"] } ?? .undefined)
         if history.truthy { landed.append(["by": row["targetId"], "history": history]) }
     }
     var parentIds: [Value] = []
-    for row in try spreadable(to["sessions"]) + spreadable(inv["move"]) {
+    for row in try spreadable(to["sessions"]) + spreadable(inv.move) {
         let parent = try desktopRecordOf(row)["forkedFromSessionId"]
         if parent.truthy { parentIds.append(parent) }
     }
@@ -66,7 +66,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Rece
     }
     for entry in landed {
         let by = entry["by"], history = entry["history"]
-        for t in inv["targets"].elements {
+        for t in inv.targets.elements {
             if try gone.has(t) || requiredParents.has(t["record"]) || !t["transcript"].truthy || !included(t, history).truthy { continue }
             let claim = try ownership(t, liveWorkers)
             if claim.truthy {
@@ -91,18 +91,18 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Rece
         }
     }
     var stableTargets: [Value] = []
-    for target in inv["targets"].elements {
+    for target in inv.targets.elements {
         if gone.has(target) || !target["transcript"].truthy { continue }
         var anySource = false
-        for source in inv["sources"].elements where try included(source, target).truthy { anySource = true; break }
+        for source in inv.sources.elements where try included(source, target).truthy { anySource = true; break }
         if anySource, try targetStable(target).truthy { stableTargets.append(target) }
     }
     let carried = Value(landed + stableTargets.map { history in ["by": history["id"], "history": history] as Value })
-    let ready = Value.newMap(try owners(inv["sources"], carried).elements.map { ($0["s"], $0["owner"]) })
-    let expected = Value.newSet(try owners(inv["sources"], carrying(inv, Value(landed), gone)).elements.map { $0["s"] })
+    let ready = Value.newMap(try owners(inv.sources, carried).elements.map { ($0["s"], $0["owner"]) })
+    let expected = Value.newSet(try owners(inv.sources, carrying(inv, Value(landed), gone)).elements.map { $0["s"] })
     var checkedSources = 0
-    try progress(report, "retire", Value(checkedSources), Value(inv["sources"].length))
-    for s in inv["sources"].elements {
+    try progress(report, "retire", Value(checkedSources), Value(inv.sources.length))
+    for s in inv.sources.elements {
         var bodyError: Error? = nil
         do {
             func body() throws {
@@ -124,7 +124,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Rece
             try body()
         } catch { bodyError = error }
         checkedSources += 1
-        try progress(report, "retire", Value(checkedSources), Value(inv["sources"].length))
+        try progress(report, "retire", Value(checkedSources), Value(inv.sources.length))
         if let bodyError { throw bodyError }
     }
     try report.call("finalize", "preparing", ["live": true])
@@ -531,26 +531,26 @@ func cloudProgress(_ receipt: Receipt, _ cloud: Value = .undefined) throws -> Va
     Value.spread(["moved": Value(receipt.sessions.length)], try sourceProgress(cloud["source"]))
 }
 
-func archiveCloud(_ inv: Value = .undefined, _ receipt: Receipt, _ save: Value = .undefined, _ report: Value = .undefined) throws -> Value {
+func archiveCloud(_ inv: MovePlan, _ receipt: Receipt, _ save: Value = .undefined, _ report: Value = .undefined) throws -> Value {
     let report = fnOr(report)
-    let matches = (inv["cloud"]["matches"] ?? []).elements.filter { !$0["target"]["failed"].truthy }
+    let matches = (inv.cloud["matches"] ?? []).elements.filter { !$0["target"]["failed"].truthy }
     if matches.isEmpty {
-        if !inv["deferredCloudSources"]["length"].truthy && (!inv["cloudRequested"].truthy || inv["cloud"]["checked"].truthy) { try progress(report, "cloud", 0, 0) }
+        if !inv.deferredCloudSources["length"].truthy && (!inv.cloudRequested.truthy || inv.cloud["checked"].truthy) { try progress(report, "cloud", 0, 0) }
         return .undefined
     }
-    let cloud = inv["cloud"]["client"]
+    let cloud = inv.cloud["client"]
     let failedVerification = Value.newSet(receipt.verification["problems"].elements.map { $0["id"] })
     var archived = 0
     let total = Value(matches.count)
-    try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
+    try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv.cloud))
     for (index, match) in matches.enumerated() {
         let row: Value = match["target"]["kind"] === "existing"
             ? match["target"]["row"]
             : (receipt.sessions.elements.first { $0["targetId"] === match["target"]["id"] } ?? .undefined)
         if failedVerification.has(row["targetId"] ?? match["target"]["id"]) {
-            try addCloudFailure(receipt, inv["cloud"], ["id": match["session"]["id"], "title": match["session"]["title"], "error": "local target failed verification, Remote Control source kept"])
+            try addCloudFailure(receipt, inv.cloud, ["id": match["session"]["id"], "title": match["session"]["title"], "error": "local target failed verification, Remote Control source kept"])
             archived += 1
-            try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
+            try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv.cloud))
             continue
         }
         let liveWorkers = try workers()
@@ -566,9 +566,9 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Receipt, _ save: Value =
             ? try targetChanges(row, liveWorkers, true).length == 0
             : row.truthy ? try untouched(row, liveWorkers).truthy : false
         if try !targetOkay || !retainedUnchanged() {
-            try addCloudFailure(receipt, inv["cloud"], ["id": match["session"]["id"], "title": match["session"]["title"], "error": "local target changed before Remote Control archival"])
+            try addCloudFailure(receipt, inv.cloud, ["id": match["session"]["id"], "title": match["session"]["title"], "error": "local target changed before Remote Control archival"])
             archived += 1
-            try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
+            try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv.cloud))
             continue
         }
         var lastEventAt: Value = .null, stateSha: Value = .null
@@ -580,9 +580,9 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Receipt, _ save: Value =
             if Value(sha(stable(currentConversation))) !== match["conversationSha"] { throw EngineError("Remote Control history changed since inventory") }
         } catch {
             let error = errorObject(error)
-            try addCloudFailure(receipt, inv["cloud"], ["id": match["session"]["id"], "title": match["session"]["title"], "error": error["message"], "code": try memoryErrorCode(error), "localId": match["target"]["id"]])
+            try addCloudFailure(receipt, inv.cloud, ["id": match["session"]["id"], "title": match["session"]["title"], "error": error["message"], "code": try memoryErrorCode(error), "localId": match["target"]["id"]])
             archived += 1
-            try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
+            try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv.cloud))
             continue
         }
         var activation: Value = .undefined
@@ -591,9 +591,9 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Receipt, _ save: Value =
             activation = try targetActivation(row, Value(keep))
         } catch {
             let error = errorObject(error)
-            try addCloudFailure(receipt, inv["cloud"], ["id": match["session"]["id"], "title": match["session"]["title"], "error": error["message"], "code": try memoryErrorCode(error), "localId": match["target"]["id"]])
+            try addCloudFailure(receipt, inv.cloud, ["id": match["session"]["id"], "title": match["session"]["title"], "error": error["message"], "code": try memoryErrorCode(error), "localId": match["target"]["id"]])
             archived += 1
-            try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
+            try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv.cloud))
             continue
         }
         let pending = Value.spread(try remoteReceipt(match), ["lastEventAt": lastEventAt, "stateSha": stateSha, "activation": activation])
@@ -620,7 +620,7 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Receipt, _ save: Value =
                 if Value(sha(stable(events))) !== match["target"]["artifactSignature"] { throw EngineError(try artifactError("remote event identities changed before archival")) }
                 let intact: Bool = row["targetId"].truthy ? try targetChanges(row, try workers(), true).length == 0 : try untouched(row, try workers()).truthy
                 if !intact { throw EngineError(try artifactError("local target changed before archival")) }
-                let proof = try supplementalCoverage(events, match["target"]["row"], inv["cloud"]["artifacts"])
+                let proof = try supplementalCoverage(events, match["target"]["row"], inv.cloud["artifacts"])
                 if !proof.truthy || stable(proof["artifactCounts"]) != stable(match["target"]["artifactCounts"]) { throw EngineError(try artifactError("the selected local artifacts no longer cover the remote history")) }
             }
             attempted = true
@@ -641,17 +641,17 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Receipt, _ save: Value =
                     rolledBack = true
                 } catch {}
             }
-            try addCloudFailure(receipt, inv["cloud"], ["id": pending["id"], "title": pending["title"], "error": error["message"], "code": try memoryErrorCode(error), "localId": match["target"]["id"]])
+            try addCloudFailure(receipt, inv.cloud, ["id": pending["id"], "title": pending["title"], "error": error["message"], "code": try memoryErrorCode(error), "localId": match["target"]["id"]])
             if !rolledBack {
                 for skipped in matches.dropFirst(index + 1) {
-                    try addCloudFailure(receipt, inv["cloud"], ["id": skipped["session"]["id"], "title": skipped["session"]["title"], "error": "not attempted while Remote Control recovery is pending"])
+                    try addCloudFailure(receipt, inv.cloud, ["id": skipped["session"]["id"], "title": skipped["session"]["title"], "error": "not attempted while Remote Control recovery is pending"])
                 }
             }
             try save.call()
             if !rolledBack { break }
         }
         archived += 1
-        try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
+        try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv.cloud))
     }
     if receipt.remote["length"].truthy { try report.call("cloud", .string("\(count(receipt.remote.length)) source mirrors archived")) }
     return .undefined

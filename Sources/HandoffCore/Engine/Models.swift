@@ -334,3 +334,87 @@ struct Receipt {
     @available(*, unavailable, message: "declare the receipt field on Receipt")
     subscript(dynamicMember name: String) -> Value { raw[name] }
 }
+
+// What inventory() found for a move: the sessions to move, the ones already there, the ones blocked or missing, the
+// targets and the cloud plan. Fields are values because the plan is handed to move() and parts are saved in receipts.
+@dynamicMemberLookup
+struct MovePlan {
+    let raw: Value
+    init(_ raw: Value) { self.raw = raw }
+    var isPresent: Bool { raw.truthy }
+    var blocked: Value {
+        get { raw["blocked"] }
+        nonmutating set { raw["blocked"] = newValue }
+    }
+    var cloud: Value {
+        get { raw["cloud"] }
+        nonmutating set { raw["cloud"] = newValue }
+    }
+    var cloudCheckAccounts: Value {
+        get { raw["cloudCheckAccounts"] }
+        nonmutating set { raw["cloudCheckAccounts"] = newValue }
+    }
+    var cloudError: Value {
+        get { raw["cloudError"] }
+        nonmutating set { raw["cloudError"] = newValue }
+    }
+    var cloudRequested: Value {
+        get { raw["cloudRequested"] }
+        nonmutating set { raw["cloudRequested"] = newValue }
+    }
+    var deferredCloudSources: Value {
+        get { raw["deferredCloudSources"] }
+        nonmutating set { raw["deferredCloudSources"] = newValue }
+    }
+    var from: Value {
+        get { raw["from"] }
+        nonmutating set { raw["from"] = newValue }
+    }
+    var fromAccounts: Value {
+        get { raw["fromAccounts"] }
+        nonmutating set { raw["fromAccounts"] = newValue }
+    }
+    var held: Value {
+        get { raw["held"] }
+        nonmutating set { raw["held"] = newValue }
+    }
+    var inspect: Value {
+        get { raw["inspect"] }
+        nonmutating set { raw["inspect"] = newValue }
+    }
+    var move: Value {
+        get { raw["move"] }
+        nonmutating set { raw["move"] = newValue }
+    }
+    var rejected: Value {
+        get { raw["rejected"] }
+        nonmutating set { raw["rejected"] = newValue }
+    }
+    var requestedAt: Value {
+        get { raw["requestedAt"] }
+        nonmutating set { raw["requestedAt"] = newValue }
+    }
+    var sources: Value {
+        get { raw["sources"] }
+        nonmutating set { raw["sources"] = newValue }
+    }
+    var targets: Value {
+        get { raw["targets"] }
+        nonmutating set { raw["targets"] = newValue }
+    }
+    var there: Value {
+        get { raw["there"] }
+        nonmutating set { raw["there"] = newValue }
+    }
+    var toAccount: Value {
+        get { raw["toAccount"] }
+        nonmutating set { raw["toAccount"] = newValue }
+    }
+    var unreadable: Value {
+        get { raw["unreadable"] }
+        nonmutating set { raw["unreadable"] = newValue }
+    }
+
+    @available(*, unavailable, message: "declare the plan field on MovePlan")
+    subscript(dynamicMember name: String) -> Value { raw[name] }
+}

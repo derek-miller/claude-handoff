@@ -559,8 +559,8 @@ func canRestartWaiting(_ receipt: Receipt, _ table: Value = .undefined) throws -
     })
 }
 
-public func restartPlan(_ inv: Value = .undefined, _ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value { try restartPlan(inv, DataLayout(paths), table) }
-func restartPlan(_ inv: Value = .undefined, _ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
+public func restartPlan(_ inv: Value = .undefined, _ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value { try restartPlan(MovePlan(inv), DataLayout(paths), table) }
+func restartPlan(_ inv: MovePlan, _ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
     let table = table.isUndefined ? try processTable(Value(paths.claudeApp)) : table
     let app = path.join(paths.claudeApp, "Contents/MacOS/Claude")
     let apps = processRows(table).filter { $0.isDesktop || $0.executable == app }.map(\.raw)
@@ -586,10 +586,10 @@ func restartPlan(_ inv: Value = .undefined, _ paths: DataLayout, _ table: Value 
         }
         return Value.spread(row, Value(extra))
     }
-    let target: Value = inv.truthy ? (try all.elements.first { account in try sameAccount(account, inv.toAccount).truthy } ?? .undefined) : inv
+    let target: Value = inv.isPresent ? (try all.elements.first { account in try sameAccount(account, inv.toAccount).truthy } ?? .undefined) : inv.raw
     let released: [Value] = target.truthy ? try localPlan(try (inv.move.elements + inv.blocked.elements).map(release).value, target).move.elements : []
     var candidates: [(row: Value, source: Value)] = []
-    if inv.truthy {
+    if inv.isPresent {
         candidates += released.filter { row in inv.blocked.elements.contains { source in source.file === row.file } }.map { (row: $0, source: $0) }
         for source in inv.there.elements {
             let target = inv.targets.elements.first { row in row.id === source.cloudTargetId }
@@ -624,7 +624,7 @@ func restartPlan(_ inv: Value = .undefined, _ paths: DataLayout, _ table: Value 
         }
     }
     var added = true
-    while added && inv.truthy {
+    while added && inv.isPresent {
         added = false
         for source in released + inv.there.elements {
             let related = try held.elements.first { item in
@@ -640,7 +640,7 @@ func restartPlan(_ inv: Value = .undefined, _ paths: DataLayout, _ table: Value 
             if let related { added = try add(source, source, related.workers.elements) || added }
         }
     }
-    if inv.truthy && held.length == 0 { return .null }
+    if inv.isPresent && held.length == 0 { return .null }
     let known: [Value] = all.elements.flatMap { account in account.sessions.elements.map { session in Value.spread(session, ["account": account]) } }
     let current = try signedIn(paths, table)
     let affected: [Value] = try owned.map { group in

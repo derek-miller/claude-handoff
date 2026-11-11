@@ -146,7 +146,7 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
             ]
             let inv = try inventory(Value(sources), target, paths, preparatory.truthy ? prepareReport : report, inventoryOptions)
             let failedFiles = try receiptSummary(["failed": try inventoryFailures(inv)])["notMoved"].elements.map { $0["file"] }
-            for file in inv["sources"].elements.map({ $0["file"] }) + failedFiles { sessionFiles.add(file) }
+            for file in inv.sources.elements.map({ $0["file"] }) + failedFiles { sessionFiles.add(file) }
             _ = try sessionProgress.call(existing["receipt"])
             return ["inv": inv, "target": target]
         }
@@ -158,7 +158,7 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
             for check in deferred["receipt"]["cloudChecks"].elements where try sameAccount(check, finishAccount).truthy { checks.append(check) }
             if try !canRestartWaiting(Receipt(["cloudChecks": Value(checks)]), try inspect.call()).truthy { return ["nothing": true, "ok": true] }
         }
-        let plan: Value = try saved ?? (try restartPlan(initial["inv"] ?? .null, paths, try inspect.call()))
+        let plan: Value = try saved ?? (try restartPlan(MovePlan(initial["inv"] ?? .null), paths, try inspect.call()))
         if plan.truthy && options["background"].truthy { return ["pendingLocal": true, "ok": true] }
         if plan.truthy && !options["moveOnly"].truthy {
             if !saved.truthy || saved["fingerprint"] !== plan["fingerprint"] {
@@ -191,7 +191,7 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
                 if try !desktop.truthy || restartFingerprint(desktop, live) !== plan["fingerprint"] {
                     return ["ok": false, "code": "RESTART_PLAN_CHANGED", "reason": "Open Claude sessions changed. Review the restart plan again."]
                 }
-                let current = try restartPlan(initial["inv"], paths, live)
+                let current = try restartPlan(MovePlan(initial["inv"]), paths, live)
                 var held: [Value] = (current["held"] ?? []).elements
                 let ready: Value = .newSet((initial["inv"]["move"].elements + initial["inv"]["there"].elements).flatMap(memberFiles))
                 for row in plan["held"].elements {
@@ -207,7 +207,7 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
                 if regular["move"].length > 0 || regular["there"].length > 0 {
                     let at: Value = existing["receipt"]["at"] ?? Value(stamp())
                     _ = existing["file"] ?? Value(path.join(paths.state, "\(at).json"))
-                    prepared = try transfer(regular, initial["target"], paths, prepareReport, ["existing": existing, "at": at, "sessionProgress": sessionProgress])
+                    prepared = try transfer(MovePlan(regular), initial["target"], paths, prepareReport, ["existing": existing, "at": at, "sessionProgress": sessionProgress])
                     if prepared["recoveryRequired"].truthy || prepared["deferred"].truthy { return prepared }
                     if prepared["receipt"].truthy, try needsRecovery(prepared["receipt"]).truthy { return prepared }
                     if prepared["file"].truthy {
@@ -235,12 +235,12 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
                 }
                 if !chosen.truthy { return .null }
                 let planned = try replan(.null, context["check"], .undefined)
-                let inv = planned["inv"], target = planned["target"]
+                let inv = MovePlan(planned["inv"]), target = planned["target"]
                 _ = try context["check"].call()
-                let ready: Value = .newSet((inv["move"].elements + inv["there"].elements).flatMap(memberFiles))
-                inv["held"] = Value(pendingPlan["held"].elements.filter { $0["sources"].elements.contains(where: { !ready.has($0["file"]) }) })
-                inv["deferredCloudSources"] = saved["deferredCloudSources"]
-                _ = try optCall(options["summary"], inv)
+                let ready: Value = .newSet((inv.move.elements + inv.there.elements).flatMap(memberFiles))
+                inv.held = Value(pendingPlan["held"].elements.filter { $0["sources"].elements.contains(where: { !ready.has($0["file"]) }) })
+                inv.deferredCloudSources = saved["deferredCloudSources"]
+                _ = try optCall(options["summary"], inv.raw)
                 let result = try transfer(inv, target, paths, report, Value.spread(context, [
                     "existing": existing, "sessionProgress": sessionProgress,
                     "refreshCloudChecks": and(prepared, Value(!options["resume"].truthy)),
@@ -270,11 +270,11 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
                 ? ["ok": false, "reason": "More than one Claude Desktop instance is running. Close the extra instance before restarting."]
                 : ["nothing": true, "ok": true]
         }
-        let inv = initial["inv"], target = initial["target"]
-        inv["held"] = plan["held"] ?? []
-        let heldFiles: Value = .newSet(inv["held"].elements.flatMap { $0["sources"].elements.map { $0["file"] } })
-        inv["move"] = Value(inv["move"].elements.filter { !memberFiles($0).contains(where: { heldFiles.has($0) }) })
-        _ = try optCall(options["summary"], inv)
+        let inv = MovePlan(initial["inv"]), target = initial["target"]
+        inv.held = plan["held"] ?? []
+        let heldFiles: Value = .newSet(inv.held.elements.flatMap { $0["sources"].elements.map { $0["file"] } })
+        inv.move = Value(inv.move.elements.filter { !memberFiles($0).contains(where: { heldFiles.has($0) }) })
+        _ = try optCall(options["summary"], inv.raw)
         let result = try transfer(inv, target, paths, report, ["existing": existing, "sessionProgress": sessionProgress])
         return result ?? ["nothing": true, "ok": true]
     })
