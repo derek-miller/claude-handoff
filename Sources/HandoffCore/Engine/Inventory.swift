@@ -252,28 +252,31 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
 }
 
 func rehomeReason(_ source: Value = .undefined, _ to: Value = .undefined, _ targetIds: Value = .undefined, _ targetNames: Value = .undefined) throws -> Value {
-    if source["taskFamily"]["error"].truthy || source["account"]["taskError"].truthy || to["taskError"].truthy {
-        return source["taskFamily"]["error"] ?? source["account"]["taskError"] ?? to["taskError"]
+    let row = MoveSource(source), dest = Account(to), family = row.taskFamily, record = row.desktopRecord
+    if family["error"].truthy || row.account.taskError.truthy || dest.taskError.truthy {
+        return family["error"] ?? row.account.taskError ?? dest.taskError
     }
     if ValueSet(source["members"].elements.map { $0["transcript"] }).size > 1 { return "multiple compatible source versions require merging" }
-    if try sameAccount(source["account"], to).truthy { return "source and destination are the same" }
-    if !source["sole"].truthy && source["invalid"].truthy { return .string("\(source["invalid"]) unparseable lines") }
-    if !source["sole"].truthy && source["conflicts"].truthy { return .string("\(source["conflicts"]) conflicting duplicate uuids") }
-    if !source["sole"].truthy && !source["comparable"].truthy { return "history cannot be compared safely" }
-    if !source["taskFamily"].truthy && !source["coldRun"].truthy && source["record"]["scheduledTaskId"].truthy { return "scheduled task owns the Desktop record" }
-    if !source["taskFamily"].truthy && source["record"]["notifySessionId"].truthy { return "notification route owns the Desktop record" }
-    if !source["taskFamily"].truthy && source["taskOwned"].truthy { return "scheduled task registry owns the Desktop record" }
-    if targetIds.has(source["id"]) { return "target session id collision" }
-    if targetNames.has(.string(path.basename(source["file"].description))) { return "target Desktop filename collision" }
-    if (source["members"] ?? [source]).elements.contains(where: { $0["worker"].truthy }) { return .string(WORKER_OWNS) }
-    if source["schedulerBusy"].truthy { return .string(SCHEDULER_OWNS) }
+    if row.account.same(dest) { return "source and destination are the same" }
+    if !row.isSole && row.isInvalid { return .string("\(row.invalid) unparseable lines") }
+    if !row.isSole && row.conflicts.truthy { return .string("\(row.conflicts) conflicting duplicate uuids") }
+    if !row.isSole && !row.isComparable { return "history cannot be compared safely" }
+    if !family.truthy && !row.coldRun.truthy && record.scheduledTaskId.truthy { return "scheduled task owns the Desktop record" }
+    if !family.truthy && record.notifySessionId.truthy { return "notification route owns the Desktop record" }
+    if !family.truthy && row.taskOwned { return "scheduled task registry owns the Desktop record" }
+    if targetIds.has(row.id) { return "target session id collision" }
+    if targetNames.has(.string(path.basename(row.file.description))) { return "target Desktop filename collision" }
+    if row.members.contains(where: \.hasWorker) { return .string(WORKER_OWNS) }
+    if row.schedulerBusy.truthy { return .string(SCHEDULER_OWNS) }
     return .null
 }
 
 func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -> Value {
-    let pendingRows = pending.elements
-    let targetIds = ValueSet(to["sessions"].elements.map { $0["id"] }.filter { $0.truthy })
-    let targetNames = ValueSet(to["sessions"].elements.map { Value(path.basename($0["file"].description)) } + to["unreadable"].elements.map { Value(path.basename($0.description)) })
+    let pendingRows = pending.elements, dest = Account(to)
+    func recordId(_ row: Value) -> Value { MoveSource(row).desktopRecord.sessionId }
+    func parentId(_ row: Value) -> Value { MoveSource(row).desktopRecord.forkedFromSessionId }
+    let targetIds = ValueSet(dest.sessions.map { $0.raw["id"] }.filter { $0.truthy })
+    let targetNames = ValueSet(dest.sessions.map { Value(path.basename($0.file)) } + dest.unreadable.map { Value(path.basename($0.description)) })
     let reasons = ValueMap()
     for source in pendingRows { reasons.set(source, try rehomeReason(source, to, .set(targetIds), .set(targetNames))) }
     for family in ValueSet(pendingRows.map { $0["taskFamily"] }.filter { $0.truthy }).values {
@@ -286,29 +289,29 @@ func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -
         if let blocker {
             for row in members where !hardReason(row) {
                 let reason = reasons.get(blocker)
-                reasons.set(row, hardReason(blocker) ? .string("\(TASK_FAMILY_BLOCKED) \(or(blocker["title"], blocker["record"]["sessionId"])): \(reason)") : reason)
+                reasons.set(row, hardReason(blocker) ? .string("\(TASK_FAMILY_BLOCKED) \(or(blocker["title"], recordId(blocker))): \(reason)") : reason)
             }
         }
     }
-    let availableParents = ValueSet(to["sessions"].elements.map { $0["record"]["sessionId"] }.filter { $0.truthy })
+    let availableParents = ValueSet(dest.sessions.map { $0.record.sessionId }.filter { $0.truthy })
     var added = true
     while added {
         added = false
         for source in pendingRows {
-            if reasons.get(source).truthy || availableParents.has(source["record"]["sessionId"]) { continue }
-            if !source["record"]["forkedFromSessionId"].truthy || availableParents.has(source["record"]["forkedFromSessionId"]) {
-                availableParents.add(source["record"]["sessionId"])
+            if reasons.get(source).truthy || availableParents.has(recordId(source)) { continue }
+            if !parentId(source).truthy || availableParents.has(parentId(source)) {
+                availableParents.add(recordId(source))
                 added = true
             }
         }
     }
-    for source in pendingRows where source["taskFamily"].truthy && !availableParents.has(source["record"]["sessionId"]) {
+    for source in pendingRows where source["taskFamily"].truthy && !availableParents.has(recordId(source)) {
         for row in pendingRows.filter({ $0["taskFamily"] === source["taskFamily"] }) where !reasons.get(row).truthy { reasons.set(row, .string(PARENT_MISSING)) }
     }
     let blocked = Value.newArray()
     var move: [Value] = []
     for source in pendingRows {
-        let reason = or(reasons.get(source), !availableParents.has(source["record"]["sessionId"]) ? .string(PARENT_MISSING) : .null)
+        let reason = or(reasons.get(source), !availableParents.has(recordId(source)) ? .string(PARENT_MISSING) : .null)
         if reason.truthy { blocked.push(Value.spread(source, ["error": reason])) }
         else {
             source["strategy"] = "rehome"
@@ -317,14 +320,14 @@ func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -
     }
     var ordered: [Value] = []
     var pendingMove = move
-    let landedRecords = ValueSet(to["sessions"].elements.map { $0["record"]["sessionId"] }.filter { $0.truthy })
+    let landedRecords = ValueSet(dest.sessions.map { $0.record.sessionId }.filter { $0.truthy })
     while !pendingMove.isEmpty {
-        guard let at = pendingMove.firstIndex(where: { !$0["record"]["forkedFromSessionId"].truthy || landedRecords.has($0["record"]["forkedFromSessionId"]) }) else {
+        guard let at = pendingMove.firstIndex(where: { !parentId($0).truthy || landedRecords.has(parentId($0)) }) else {
             throw EngineError("parent ordering invariant failed")
         }
         let next = pendingMove.remove(at: at)
         ordered.append(next)
-        landedRecords.add(next["record"]["sessionId"])
+        landedRecords.add(recordId(next))
     }
     move = ordered
     return ["move": move.value, "blocked": blocked]
@@ -520,7 +523,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
     for source in found.elements {
         source["sole"] = Value(try soleRecord(source) && !source["lineage"]["length"].truthy && !forked.has(source["id"]))
     }
-    let requiredParents = Value.newSet(found.elements.map { $0["record"]["forkedFromSessionId"] }.filter { $0.truthy })
+    let requiredParents = Value.newSet(found.elements.map { MoveSource($0).desktopRecord.raw["forkedFromSessionId"] }.filter { $0.truthy })
     let ranked = stableSorted(found.elements) { a, b in
         comparatorChain([
             toNumber(b["roots"]["size"]) - toNumber(a["roots"]["size"]),
@@ -550,22 +553,23 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         }
     }
     let covering = { (s: Value) throws -> Value in
-        for target in targets.elements where target["record"].truthy {
+        for target in targets.elements.map(MoveTarget.init) where target.recordId.truthy {
             var all = true
-            for member in s["members"].elements {
-                let ok = try included(member, target).truthy && (!requiredParents.has(member["record"]["sessionId"]) || target["record"] === member["record"]["sessionId"])
+            for member in MoveSource(s).members {
+                let recordId = member.desktopRecord.raw["sessionId"]
+                let ok = try included(member.raw, target.raw).truthy && (!requiredParents.has(recordId) || target.recordId === recordId)
                 if !ok { all = false; break }
             }
-            if all { return target }
+            if all { return target.raw }
         }
         return .null
     }
     let there = Value.newArray()
     let pending = Value.newArray()
     for s in reps {
-        let covered = try covering(s)
-        if covered.truthy && !s["invalid"].truthy {
-            s["cloudTargetId"] = covered["id"]
+        let covered = try covering(s), source = MoveSource(s)
+        if covered.truthy && !source.isInvalid {
+            source.cloudTargetId = covered["id"]
             there.push(s)
         } else { pending.push(s) }
     }
@@ -581,10 +585,10 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
     }
     let apart = divergent.size
     let cloudCutoff = options["cloudCutoff"] ?? (cloudRequested ? requestedAt : .null)
-    let brokenTasks = (from.elements + [to]).first { $0["taskError"].truthy }
-    if options["cloud"].truthy, let brokenTasks { throw EngineError(brokenTasks["taskError"].description) }
+    let brokenTasks = (sources + [target]).first { $0.taskError.truthy }
+    if options["cloud"].truthy, let brokenTasks { throw EngineError(brokenTasks.taskError.description) }
     let cloudPlan = try cloudInventory(options["cloud"], from, targets, options["cloudTargetOnly"].truthy ? [] : move, cache, report, cloudCutoff, found, options["cloudSessionIds"], options["cloudExcludedIds"], options)
-    let retiring = Value.newSet((move.elements + there.elements).flatMap { row in (row["members"] ?? [row]).elements.map { $0["file"] } })
+    let retiring = Value.newSet((move.elements + there.elements).flatMap { MoveSource($0).members.map(\.file) })
     let links = try sourceCloudLinks(Value(move.elements + there.elements))
     var cloudCheckAccounts: [Value] = []
     for account in from.elements {
@@ -626,7 +630,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         "move": move,
         "targets": targets,
         "sources": found,
-        "from": Value(from.elements.map { $0["label"] }),
+        "from": Value(sources.map { $0.raw["label"] }),
     ]
     out["fromAccounts"] = Value(try from.elements.map { try accountRef($0) })
     out["cloudCheckAccounts"] = cloudCheckAccounts.value

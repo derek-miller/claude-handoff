@@ -7,14 +7,15 @@ import Foundation
 struct DesktopRecord {
     let raw: Value
     init(_ raw: Value) { self.raw = raw }
-    var sessionId: String? { raw["sessionId"].asString }
-    var cliSessionId: String? { raw["cliSessionId"].asString }
-    var cwd: String? { raw["cwd"].asString }
-    var title: String? { raw["title"].asString }
+    // Ids stay values: they are compared with ids from other JSON, and an empty string is as absent as a missing key.
+    var sessionId: Value { raw["sessionId"] }
+    var cliSessionId: Value { raw["cliSessionId"] }
+    var cwd: Value { raw["cwd"] }
+    var title: Value { raw["title"] }
     var isArchived: Bool { raw["isArchived"] === true }
-    var forkedFromSessionId: String? { raw["forkedFromSessionId"].asString }
-    var scheduledTaskId: String? { raw["scheduledTaskId"].asString }
-    var notifySessionId: String? { raw["notifySessionId"].asString }
+    var forkedFromSessionId: Value { raw["forkedFromSessionId"] }
+    var scheduledTaskId: Value { raw["scheduledTaskId"] }
+    var notifySessionId: Value { raw["notifySessionId"] }
 }
 
 // A Desktop session as accounts() lists it: the record file, the record and the fields read from it.
@@ -138,7 +139,17 @@ struct MoveSource: RecordHolder {
     var transcript: Value { raw["transcript"] }
     var sidecar: Value { raw["sidecar"] }
     var roots: Value { raw["roots"] }
-    var isInvalid: Bool { raw["invalid"].truthy }
+    var title: Value { raw["title"] }
+    // Counts of unparseable lines and conflicting duplicate uuids, when any.
+    var invalid: Value { raw["invalid"] }
+    var conflicts: Value { raw["conflicts"] }
+    var isInvalid: Bool { invalid.truthy }
+    var isComparable: Bool { raw["comparable"].truthy }
+    // The only record for its history, so it can move even when the history cannot be compared.
+    var isSole: Bool { raw["sole"].truthy }
+    var coldRun: Value { raw["coldRun"] }
+    var taskOwned: Bool { raw["taskOwned"].truthy }
+    var hasWorker: Bool { raw["worker"].truthy }
     // Every copy in this row's group, or the row alone when it is not grouped.
     var members: [MoveSource] { (raw["members"].nullish ? [raw] : raw["members"].elements).map(MoveSource.init) }
     var taskFamily: Value {
