@@ -419,10 +419,6 @@ struct FailureSource {
     }
 }
 
-// A Remote Control check the receipt still owes for one account and org.
-struct CloudCheck {
-    let raw: Value
-    init(_ raw: Value) { self.raw = raw }
     var isPresent: Bool { raw.truthy }
     var account: Value {
         get { raw["account"] }

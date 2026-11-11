@@ -304,7 +304,12 @@ struct HeldRow {
 struct CloudCheck: AccountKey {
     let raw: Value
     init(_ raw: Value) { self.raw = raw }
-    var status: Value { raw["status"] }
+    var status: Value {
+        get { raw["status"] }
+        nonmutating set { raw["status"] = newValue }
+    }
+    var waiting: Value { raw["waiting"] }
+    var checkedAt: Value { raw["checkedAt"] }
 
     @available(*, unavailable, message: "declare the field on CloudCheck")
     subscript(dynamicMember name: String) -> Value { raw[name] }
