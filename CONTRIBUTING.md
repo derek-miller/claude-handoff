@@ -17,7 +17,7 @@ scripts/test-engine.sh                   # the engine behaviour suite
 swift test --filter 'Engine/Receipts/'   # one suite while you work on it
 ```
 
-The behaviour suite is the `Engine` suite in `Tests/HandoffCoreTests`, one nested suite per area (Accounts, Moves, Inventory, Receipts, Restarts, Cloud, CLI, MenuBar). `scripts/test-engine.sh` builds it once with optimisation and runs each suite as its own test process, several at a time (`JOBS` sets how many); CI's `engine` job runs the same script. The tables the tests swap (`fs`, `process`, `childProcess`, `cloudFetch`) are process-global, so suites run in parallel processes, never parallel threads.
+The behaviour suite is the `Engine` suite in `Tests/HandoffCoreTests`, one nested suite per area (Accounts, Moves, Inventory, Receipts, Restarts, Cloud, CLI, MenuBar). `scripts/test-engine.sh` builds it once with optimisation, splits each suite into chunks of tests (`CHUNK`, default 8) and runs the chunks as separate test processes, several at a time (`JOBS`). It fails a chunk that ran fewer tests than it was given. CI splits the chunks across two runners with `SHARD=1/2` and `SHARD=2/2`; the `engine` check passes when both do. The tables the tests swap (`fs`, `process`, `childProcess`, `cloudFetch`) are process-global, so suites run in parallel processes, never parallel threads.
 
 Every test runs inside the `Sandboxed` trait, which gives it fresh native tables and a temporary `HOME`. Native Desktop commands and the keychain fail unless the test mocks them. `Support/` holds the fixture (`home()` and friends), the assertion helpers and the crash fence that stands in for a process killed mid-move.
 

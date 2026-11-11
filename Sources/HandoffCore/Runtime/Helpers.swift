@@ -230,7 +230,6 @@ public func dateParse(_ s: String) -> Double {
         guard (1...12).contains(month), (1...31).contains(day), hour <= 24, minute < 60, second < 60 else { return .nan }
         var comps = DateComponents()
         comps.year = year; comps.month = month; comps.day = day; comps.hour = hour; comps.minute = minute; comps.second = second
-        var cal = Calendar(identifier: .gregorian)
         let dateOnly = m[4] == nil
         var offset = 0
         if let z = m[8], z != "Z" {
@@ -238,21 +237,51 @@ public func dateParse(_ s: String) -> Double {
             let parts = z.dropFirst().split(separator: ":")
             offset = sign * (Int(parts[0])! * 3600 + Int(parts[1])! * 60)
         }
-        cal.timeZone = (dateOnly || m[8] != nil) ? TimeZone(secondsFromGMT: offset)! : TimeZone.current
+        let cal = DateCache.shared.calendar((dateOnly || m[8] != nil) ? TimeZone(secondsFromGMT: offset)! : TimeZone.current)
         guard let d = cal.date(from: comps) else { return .nan }
         return (d.timeIntervalSince1970 * 1000).rounded() + (frac * 1000).rounded(.down)
     }
     // "Fri Sep  4 18:00:00 2026" (ps lstart, local time)
-    let f = DateFormatter()
-    f.locale = Locale(identifier: "en_US_POSIX")
-    f.timeZone = .current
-    for format in ["EEE MMM d HH:mm:ss yyyy", "EEE, dd MMM yyyy HH:mm:ss zzz", "EEE MMM dd yyyy HH:mm:ss 'GMT'Z"] {
-        f.dateFormat = format
-        // Date#toString appends " (Pacific Standard Time)", which Date.parse ignores.
-        let text = re(#"\s*\([^()]*\)$"#).replace(s.replacingOccurrences(of: "  ", with: " ")) { _ in "" }
+    // Date#toString appends " (Pacific Standard Time)", which Date.parse ignores.
+    let text = re(#"\s*\([^()]*\)$"#).replace(s.replacingOccurrences(of: "  ", with: " ")) { _ in "" }
+    for f in DateCache.shared.formatters(TimeZone.current) {
         if let d = f.date(from: text) { return (d.timeIntervalSince1970 * 1000).rounded() }
     }
     return .nan
+}
+
+// Building a DateFormatter or Calendar compiles ICU state.
+final class DateCache: @unchecked Sendable {
+    static let shared = DateCache()
+    private static let formats = ["EEE MMM d HH:mm:ss yyyy", "EEE, dd MMM yyyy HH:mm:ss zzz", "EEE MMM dd yyyy HH:mm:ss 'GMT'Z"]
+    private let lock = NSLock()
+    private var calendars: [TimeZone: Calendar] = [:]
+    private var formatterZone: TimeZone?
+    private var cachedFormatters: [DateFormatter] = []
+
+    func calendar(_ zone: TimeZone) -> Calendar {
+        lock.lock(); defer { lock.unlock() }
+        if let cal = calendars[zone] { return cal }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = zone
+        calendars[zone] = cal
+        return cal
+    }
+
+    func formatters(_ zone: TimeZone) -> [DateFormatter] {
+        lock.lock(); defer { lock.unlock() }
+        if formatterZone != zone {
+            cachedFormatters = DateCache.formats.map { format in
+                let f = DateFormatter()
+                f.locale = Locale(identifier: "en_US_POSIX")
+                f.timeZone = zone
+                f.dateFormat = format
+                return f
+            }
+            formatterZone = zone
+        }
+        return cachedFormatters
+    }
 }
 
 // stamp(): receipt file names.

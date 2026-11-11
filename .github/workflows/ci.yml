@@ -23,15 +23,28 @@ jobs:
           swift build -c release --product claude-handoff
           "$(swift build -c release --show-bin-path)/claude-handoff" --version
           "$(swift build -c release --show-bin-path)/claude-handoff" --help
-  engine:
-    # The engine behaviour suite in a release build, one test process per suite (scripts/test-engine.sh).
+  engine-shard:
+    # The engine behaviour suite in a release build, its chunks split across two runners (scripts/test-engine.sh).
     runs-on: macos-15
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - name: Select Xcode
         run: sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
       - run: scripts/test-engine.sh
+        env:
+          SHARD: ${{ matrix.shard }}/2
+  engine:
+    # The required check: passes only when every engine shard passed.
+    if: always()
+    needs: engine-shard
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.engine-shard.result }}" = success
   app:
     # Packages the universal app ad-hoc signed, the same way the release does with a Developer ID.
     runs-on: macos-15
