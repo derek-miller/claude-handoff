@@ -20,7 +20,7 @@ extension Engine.Cloud {
             fs.link = { a, b in
                 if b == target {
                     attempts += 1
-                    if attempts == 1 || !transient { throw JSError("Synthetic publication failure") }
+                    if attempts == 1 || !transient { throw EngineError("Synthetic publication failure") }
                 }
                 try native(a, b)
             }

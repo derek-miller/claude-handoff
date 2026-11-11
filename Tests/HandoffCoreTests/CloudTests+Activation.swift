@@ -37,7 +37,7 @@ extension Engine.Cloud {
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")
         touchPlaced(h.recordFile("Z", SOURCE))
         let result = try move(try inventory([from], to, h.paths, NOOP, ["cloud": remote.client]), to, h.paths)
-        fs = NodeFS()
+        fs = FileSystem()
         eq(result.ok, false)
         eq(remote.archived, false)
         match(result.receipt.failed.elements.last { !$0.cloudAccount.truthy }?.error ?? .undefined, "desktop changed during the move")
@@ -109,7 +109,7 @@ extension Engine.Cloud {
         try h.record("Z", SOURCE, rehomeRecord(["isArchived": true]))
         var first = true
         let remote = StatusCloud(h, id: "cse_interrupted", entries: entries, archive: {
-            if first { first = false; throw JSError("connection lost after archive") }
+            if first { first = false; throw EngineError("connection lost after archive") }
         })
         let all = try accounts(h.paths)
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")

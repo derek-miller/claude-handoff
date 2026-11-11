@@ -146,7 +146,7 @@ extension Engine.Inventory {
         eq(second.ok, true)
         eq(second.receipt.sessions.length, 0)
         deq(try Self.names(h.dir("P")), [])
-        deq(Value(try readdir(h.dir("Z")).map { Value(jsSlice($0, 6, $0.utf16.count - 5)) }), [older])
+        deq(Value(try readdir(h.dir("Z")).map { Value(sliceString($0, 6, $0.utf16.count - 5)) }), [older])
     }
 
     @Test("nested histories with split sidecars are blocked instead of copied")

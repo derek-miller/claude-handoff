@@ -66,7 +66,7 @@ extension Engine.Restarts {
         eq(planned.plan.held.length, amount)
         let read = fs.readFile, list = fs.readdir
         fs.readFile = { p in
-            if JSRegExp.cached(#"^local_.*\.json$"#).test(path.basename(p)) { recordReads += 1 }
+            if TextPattern.cached(#"^local_.*\.json$"#).test(path.basename(p)) { recordReads += 1 }
             return try read(p)
         }
         fs.readdir = { p in
@@ -145,7 +145,7 @@ extension Engine.Restarts {
             let read = fs.readFile, write = fs.writeFile, list = fs.readdir
             fs.readFile = { p in
                 let result = try read(p)
-                if p.hasPrefix(records) && JSRegExp.cached(#"^local_.*\.json$"#).test(path.basename(p)) { recordReads += 1 }
+                if p.hasPrefix(records) && TextPattern.cached(#"^local_.*\.json$"#).test(path.basename(p)) { recordReads += 1 }
                 return result
             }
             fs.writeFile = { p, d, flag, m in

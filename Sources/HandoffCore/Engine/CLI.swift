@@ -1,23 +1,22 @@
 import Foundation
 
-// Port of engine.js lines 5166-5561: argument parsing, the CLI `main`, and the top-level error handler.
+// Argument parsing, the CLI `main` and the top-level error handler.
 
-// /^[a-f0-9]{64}$/.test(s) — exact, without ICU's "$ before a final newline" leniency.
+// Exactly 64 lowercase hex digits; a trailing newline does not match.
 fileprivate func hex64(_ v: Value) -> Bool {
     let s = v.description
     return s.utf8.count == 64 && s.utf8.allSatisfy { ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }
 }
 
-// `x?.map(f)`: undefined when x is nullish.
+// Maps the elements, or undefined when v is null or undefined.
 fileprivate func mapOpt(_ v: Value, _ f: (Value) throws -> Value) rethrows -> Value {
     v.nullish ? .undefined : Value(try v.elements.map(f))
 }
 
-// L5166
 func parse(_ argv: [String]) throws -> Value {
     let args: Value = ["pair": .null, "from": [], "to": .null, "cmd": .null, "dry": false, "cloud": false, "json": false, "help": false, "version": false, "remove": false, "snapshot": .null, "restartApproved": .null, "moveOnly": false, "leaveChecks": []]
     let value = { (i: Int) throws -> Value in
-        if i >= argv.count || argv[i].hasPrefix("-") { throw JSError("\(argv[i - 1]) needs a value") }
+        if i >= argv.count || argv[i].hasPrefix("-") { throw EngineError("\(argv[i - 1]) needs a value") }
         return .string(argv[i])
     }
     var i = 0
@@ -36,40 +35,38 @@ func parse(_ argv: [String]) throws -> Value {
         else if a == "--pair" {
             i += 1
             let parts = try value(i).description.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-            guard parts.count == 2, try UUID.test(parts[0]), try UUID.test(parts[1]) else { throw JSError("--pair takes <account uuid>/<org uuid>") }
+            guard parts.count == 2, try UUID.test(parts[0]), try UUID.test(parts[1]) else { throw EngineError("--pair takes <account uuid>/<org uuid>") }
             args.pair = ["account": .string(parts[0]), "org": .string(parts[1])]
         }
         else if a == "--version" || a == "-v" { args["version"] = true }
         else if a == "--help" || a == "-h" { args.help = true }
         else if !a.hasPrefix("-") && !args.cmd.truthy { args.cmd = .string(a) }
-        else { throw JSError("unknown argument \(a)") }
+        else { throw EngineError("unknown argument \(a)") }
         i += 1
     }
     let fromCount = args["from"].length
-    if (fromCount > 0) != args.to.truthy { throw JSError("--from and --to go together") }
-    if (args.help.truthy || args["version"].truthy) && argv.count > 1 { throw JSError("\(args.help.truthy ? "--help" : "--version") goes alone") }
+    if (fromCount > 0) != args.to.truthy { throw EngineError("--from and --to go together") }
+    if (args.help.truthy || args["version"].truthy) && argv.count > 1 { throw EngineError("\(args.help.truthy ? "--help" : "--version") goes alone") }
     let incompatible = fromCount > 0 || args.to.truthy || args.dry.truthy || args.cloud.truthy || args.remove.truthy || args.snapshot.truthy
     let cmd = args.cmd.asString
-    if args.pair.truthy && cmd != "tidy" { throw JSError("--pair goes with tidy") }
-    if ["accounts", "keep-local", "sweep", "tidy"].contains(cmd) && (incompatible || args.restartApproved.truthy || args.moveOnly.truthy) { throw JSError("\(args.cmd) accepts only --json") }
-    if ["finish", "undo"].contains(cmd) && (incompatible || cmd == "undo" && args.moveOnly.truthy) { throw JSError("\(args.cmd) accepts only --json and --restart-approved") }
-    if !args.restartApproved.nullish && !hex64(args.restartApproved) { throw JSError("restart approval token must be the one displayed by the engine") }
-    if args.moveOnly.truthy && (args.restartApproved.truthy || args.dry.truthy || (args.cmd.truthy && cmd != "finish")) { throw JSError("--move-only applies only to a move or held continuation") }
-    if args.restartApproved.truthy && (args.dry.truthy || (args.cmd.truthy && !["restart", "finish", "undo"].contains(cmd))) { throw JSError("restart approval applies only to a move, finish, undo, or restart") }
-    if cmd == "restart" && incompatible { throw JSError("restart accepts only --json and --restart-approved") }
-    if cmd == "menubar" && (fromCount > 0 || args.to.truthy || args.dry.truthy || args.cloud.truthy || args.json.truthy || (args.remove.truthy && args.snapshot.truthy)) { throw JSError("menubar accepts only --remove or --snapshot <png>") }
-    if cmd != "menubar" && (args.remove.truthy || args.snapshot.truthy) { throw JSError("--remove and --snapshot require menubar") }
-    if args.leaveChecks.length > 0 && (cmd != "keep-local" || args.leaveChecks.elements.contains { !hex64($0) }) { throw JSError("--leave-check requires a current source-check token and keep-local") }
+    if args.pair.truthy && cmd != "tidy" { throw EngineError("--pair goes with tidy") }
+    if ["accounts", "keep-local", "sweep", "tidy"].contains(cmd) && (incompatible || args.restartApproved.truthy || args.moveOnly.truthy) { throw EngineError("\(args.cmd) accepts only --json") }
+    if ["finish", "undo"].contains(cmd) && (incompatible || cmd == "undo" && args.moveOnly.truthy) { throw EngineError("\(args.cmd) accepts only --json and --restart-approved") }
+    if !args.restartApproved.nullish && !hex64(args.restartApproved) { throw EngineError("restart approval token must be the one displayed by the engine") }
+    if args.moveOnly.truthy && (args.restartApproved.truthy || args.dry.truthy || (args.cmd.truthy && cmd != "finish")) { throw EngineError("--move-only applies only to a move or held continuation") }
+    if args.restartApproved.truthy && (args.dry.truthy || (args.cmd.truthy && !["restart", "finish", "undo"].contains(cmd))) { throw EngineError("restart approval applies only to a move, finish, undo, or restart") }
+    if cmd == "restart" && incompatible { throw EngineError("restart accepts only --json and --restart-approved") }
+    if cmd == "menubar" && (fromCount > 0 || args.to.truthy || args.dry.truthy || args.cloud.truthy || args.json.truthy || (args.remove.truthy && args.snapshot.truthy)) { throw EngineError("menubar accepts only --remove or --snapshot <png>") }
+    if cmd != "menubar" && (args.remove.truthy || args.snapshot.truthy) { throw EngineError("--remove and --snapshot require menubar") }
+    if args.leaveChecks.length > 0 && (cmd != "keep-local" || args.leaveChecks.elements.contains { !hex64($0) }) { throw EngineError("--leave-check requires a current source-check token and keep-local") }
     return args
 }
 
-// L5201
 public func main(_ argv: [String]) throws {
     let requestedAt = Value(isoNow())
     let args = try parse(argv)
     if args.help.truthy { return process.stdout(HELP) }
     if args["version"].truthy { return process.stdout("\(VERSION)\n") }
-    // The Node-version check has no Swift equivalent.
     let paths = try layout()
     let write = { (s: String) in process.stdout(s) }
     let emit = { (o: Value) in process.stdout(JSON.text(o) + "\n") }
@@ -77,7 +74,7 @@ public func main(_ argv: [String]) throws {
     let showPlan = { (plan: Value) throws -> Void in
         let prior: Value = plan.receiptFile.truthy ? ((try? readReceipt(plan.receiptFile)) ?? .null) : .null
         if args.json.truthy {
-            let remaining: Value = plan.remainingCount ?? (plan.selection.nullish ? .undefined : Value(plan.selection["from"].elements.reduce(0.0) { $0 + jsNumber($1.files["length"]) })) ?? .null
+            let remaining: Value = plan.remainingCount ?? (plan.selection.nullish ? .undefined : Value(plan.selection["from"].elements.reduce(0.0) { $0 + toNumber($1.files["length"]) })) ?? .null
             let labels: Value = mapOpt(plan.selection["from"]) { $0.label } ?? mapOpt(prior.fromAccounts) { $0.label } ?? []
             let head: Value = ["plan": true]
             let tail: Value = ["heldCount": try heldCount(plan.held), "remainingCount": remaining,
@@ -141,7 +138,7 @@ public func main(_ argv: [String]) throws {
                                 "sourceLabels": Value(receipt.fromAccounts.elements.map { $0.label }),
                                 "code": code,
                                 "retryable": try retryableCode(result.code)]
-            let second: Value = ["cloudArchived": receipt.remote["length"], "newerCloud": result.newerCloud, "pendingCloud": result.pendingCloud, "pendingLabels": result.pendingLabels, "held": result.held, "waiting": try waitingSessions(receipt), "superseded": Value(jsNumber(receipt.superseded["length"]) - jsNumber(retired)), "retired": retired, "failed": receipt.failed, "problems": problems, "checks": checks, "note": note, "restart": and(refresh, Value(!result.restarted.truthy)), "restarted": result.restarted, "restartOutcome": result.restartOutcome]
+            let second: Value = ["cloudArchived": receipt.remote["length"], "newerCloud": result.newerCloud, "pendingCloud": result.pendingCloud, "pendingLabels": result.pendingLabels, "held": result.held, "waiting": try waitingSessions(receipt), "superseded": Value(toNumber(receipt.superseded["length"]) - toNumber(retired)), "retired": retired, "failed": receipt.failed, "problems": problems, "checks": checks, "note": note, "restart": and(refresh, Value(!result.restarted.truthy)), "restarted": result.restarted, "restartOutcome": result.restartOutcome]
             return emit(Value.spread(first, second))
         }
         let failure = { (f: Value) -> String in "\(or(f.title, f.id)) | \(f.error)" }
@@ -252,7 +249,7 @@ public func main(_ argv: [String]) throws {
             let second: Value = [
                 "cloudArchived": result.cloudArchived ?? 0,
                 "cloudRestored": remoteRestored,
-                "undoPartial": Value(jsNumber(remoteRestored) > 0),
+                "undoPartial": Value(toNumber(remoteRestored) > 0),
                 "cloudChecked": result.cloudChecked ?? 0,
                 "newerCloud": result.newerCloud ?? 0,
                 "pendingCloud": result.pendingCloud ?? 0,
@@ -291,7 +288,7 @@ public func main(_ argv: [String]) throws {
             if result.reconciled.truthy { return emit(["reconciled": result.reconciled, "retry": true]) }
             if result.pendingUndo.truthy {
                 let remoteRestored = result.remoteRestored ?? 0
-                return emit(["done": true, "ok": true, "complete": false, "pendingUndo": result.pendingUndo, "pendingLabels": result.pendingUndo, "cloudRestored": remoteRestored, "undoPartial": Value(jsNumber(remoteRestored) > 0), "note": .string("sign Claude Desktop into \(result.pendingUndo.join(" or ")) and click Finish undo")])
+                return emit(["done": true, "ok": true, "complete": false, "pendingUndo": result.pendingUndo, "pendingLabels": result.pendingUndo, "cloudRestored": remoteRestored, "undoPartial": Value(toNumber(remoteRestored) > 0), "note": .string("sign Claude Desktop into \(result.pendingUndo.join(" or ")) and click Finish undo")])
             }
             if result.retained.truthy { return emit(["refused": Value(result.retained.elements.map { r in Value("\(or(r.title, r.id)) | \(short(r.targetId))") }), "retained": true, "at": result.receipt.at]) }
             if result.changed.truthy { return emit(["refused": result.changed, "at": result.receipt.at]) }
@@ -342,7 +339,7 @@ public func main(_ argv: [String]) throws {
             var recoveryProblem: Value = .null
             var latest: Value
             do { latest = try latestReceipt(paths) } catch let thrown {
-                let error = jsErrorValue(thrown)
+                let error = errorObject(thrown)
                 if error.code !== "OLDER_MOVE" { throw thrown }
                 recoveryProblem = ["receipt": error.file, "error": error["message"], "code": error.code]
                 latest = .null
@@ -353,8 +350,8 @@ public func main(_ argv: [String]) throws {
             }
             var deferred: Value
             do { deferred = try deferredWorkflow(paths, latest) } catch let thrown {
-                let error = jsErrorValue(thrown)
-                if latest.nullish { throw JSError.type("Cannot read properties of \(latest) (reading 'file')") }
+                let error = errorObject(thrown)
+                if latest.nullish { throw EngineError.type("Cannot read properties of \(latest) (reading 'file')") }
                 recoveryProblem = ["receipt": latest.file, "error": error["message"]]
                 deferred = .null
             }
@@ -444,25 +441,25 @@ public func main(_ argv: [String]) throws {
         let width = all.elements.map { $0.label.length }.max() ?? 0
         return write("\(all.elements.map { a in "  \(padEnd(a.label.description, width))  \(a.stats)\(extra.contains("\(a.account)/\(a.org)") ? " | leftover" : "")" }.joined(separator: "\n"))\n")
     }
-    if args.cmd.truthy { throw JSError("unknown command \(args.cmd)") }
+    if args.cmd.truthy { throw EngineError("unknown command \(args.cmd)") }
     var from: Value
     var to: Value
     if args.to.truthy {
         from = Value(try args["from"].elements.map { sel in try find(all, sel) })
         to = try find(all, args.to)
     } else {
-        if !process.stdinIsTTY() { throw JSError("no terminal, pass --from and --to") }
+        if !process.stdinIsTTY() { throw EngineError("no terminal, pass --from and --to") }
         from = try pick("From", all, true)
         let fromNow = from
         to = try pick("To", Value(all.elements.filter { a in !fromNow.includes(a) }), false)[0]
     }
-    if Value.newSet(from.elements.map { account in Value("\(account.account)/\(account.org)") }).length != from.length { throw JSError("from accounts must be unique") }
-    if from.includes(to) { throw JSError("to must differ from from") }
+    if Value.newSet(from.elements.map { account in Value("\(account.account)/\(account.org)") }).length != from.length { throw EngineError("from accounts must be unique") }
+    if from.includes(to) { throw EngineError("to must differ from from") }
     let report = try reporter(args.json)
     var cloud: Value = .null
     var cloudError: Value = .null
     if args.cloud.truthy && !args.restartApproved.truthy {
-        do { cloud = try cloudClient(paths) } catch { cloudError = jsErrorValue(error)["message"] }
+        do { cloud = try cloudClient(paths) } catch { cloudError = errorObject(error)["message"] }
     }
     let deferred = try deferredWorkflow(paths)
     if deferred.truthy {
@@ -532,13 +529,13 @@ public func main(_ argv: [String]) throws {
     return try showMove(try completeActiveCloud(result, paths, ["cloud": cloud, "report": report]))
 }
 
-// L5547 — the `invoked` catch handler.
+// Runs the CLI and maps any uncaught error to its message and exit code.
 public func runCLI(_ argv: [String]) -> Int32 {
     do {
         try main(argv)
         return process.exitCode
     } catch {
-        let e = jsErrorValue(error)
+        let e = errorObject(error)
         let code = e["code"]
         let message = e["message"]
         if argv.contains("--json") {

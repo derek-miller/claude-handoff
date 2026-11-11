@@ -18,7 +18,7 @@ extension Engine.Cloud {
             if failure.hasPrefix("verification") { receipt.verification = ["ok": false, "problems": failure == "verification" ? [["id": Value(SOURCE), "check": "transcript"]] : []] }
             try writeJSON(moved.file.str, receipt)
             let cloud = cloudFixture(h, ["account": from.account, "org": from.org, "list": fn { _ in
-                if failure == "cloud" { throw JSError("fixture offline") }
+                if failure == "cloud" { throw EngineError("fixture offline") }
                 return []
             }])
             let result = try finishPending(h.paths, ["cloud": cloud])
@@ -35,7 +35,7 @@ extension Engine.Cloud {
         let h = try home()
         try h.write(SOURCE, [entry("user", 1, nil, SOURCE)])
         try h.record("P", SOURCE, rehomeRecord(["title": "Cloud outage source"]))
-        let cloud = cloudFixture(h, ["list": fn { _ in throw JSError("service unavailable") }])
+        let cloud = cloudFixture(h, ["list": fn { _ in throw EngineError("service unavailable") }])
         let all = try accounts(h.paths)
         let from = all.find { $0.account.str == h.acct.P && $0.org.str == h.org.P }
         let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
@@ -126,7 +126,7 @@ extension Engine.Cloud {
         let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.T }, to = all.find { $0.account.str == h.acct.Z }
         let first = try moveWithPending(h, [from], to)
         var calls = 0
-        let cloud = cloudFixture(h, ["account": Value(h.acct.T), "org": Value(h.org.T), "list": fn { _ in calls += 1; throw JSError("fixture offline") }])
+        let cloud = cloudFixture(h, ["account": Value(h.acct.T), "org": Value(h.org.T), "list": fn { _ in calls += 1; throw EngineError("fixture offline") }])
         let stale = try finishPending(h.paths, ["cloud": cloud, "receiptFile": Value(first.file.str + ".old"), "automatic": from])
         eq(stale.nothing, true)
         eq(calls, 0)
@@ -313,7 +313,7 @@ extension Engine.Cloud {
             "account": Value(h.acct.T), "org": Value(h.org.T),
             "list": fn { _ in [remoteSession(["id": "cse_retryable", "title": "Retryable cloud source", "status": Value(status)])] },
             "eventRows": fn { _ in
-                if !supported { throw JSError("Remote Control history contains an unsupported content block") }
+                if !supported { throw EngineError("Remote Control history contains an unsupported content block") }
                 return remoteRows(local)
             },
             "session": fn { _ in remoteState(status, ["id": "cse_retryable"]) },

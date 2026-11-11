@@ -6,9 +6,9 @@ public struct SpawnResult {
     public var status: Int32?
     public var stdout: String
     public var stderr: String
-    public var error: JSError?
+    public var error: EngineError?
     public var timedOut = false
-    public init(status: Int32?, stdout: String = "", stderr: String = "", error: JSError? = nil) {
+    public init(status: Int32?, stdout: String = "", stderr: String = "", error: EngineError? = nil) {
         self.status = status; self.stdout = stdout; self.stderr = stderr; self.error = error
     }
     public var value: Value {
@@ -21,14 +21,14 @@ public struct SpawnOptions {
     public var env: [String: String]? = nil
     public var input: Data? = nil
     public var cwd: String? = nil
-    // Node's maxBuffer in bytes per stream; nil = no limit. Exceeding it fails with ENOBUFS.
+    // Bytes allowed per output stream; nil means no limit. Exceeding it fails with ENOBUFS.
     public var maxBuffer: Double? = nil
     public init(timeout: Double? = nil, env: [String: String]? = nil, input: Data? = nil, cwd: String? = nil, maxBuffer: Double? = nil) {
         self.timeout = timeout; self.env = env; self.input = input; self.cwd = cwd; self.maxBuffer = maxBuffer
     }
 }
 
-// External commands go through this table so tests can replace them, like the JS tests patch child_process.
+// External commands go through this table so tests can replace them.
 public final class ChildProcess {
     public var spawnSync: (String, [String], SpawnOptions) -> SpawnResult = ChildProcess.nativeSpawnSync
     // Fire-and-wait with a timeout and ignored stdio: { status, timedOut }.
@@ -74,9 +74,9 @@ public final class ChildProcess {
         group.wait()
         var r = SpawnResult(status: timedOut || p.terminationReason == .uncaughtSignal ? nil : p.terminationStatus,
                             stdout: String(decoding: outData, as: UTF8.self), stderr: String(decoding: errData, as: UTF8.self))
-        if timedOut { r.timedOut = true; r.error = JSError("spawnSync \(file) ETIMEDOUT", code: "ETIMEDOUT") }
+        if timedOut { r.timedOut = true; r.error = EngineError("spawnSync \(file) ETIMEDOUT", code: "ETIMEDOUT") }
         else if let limit = options.maxBuffer, Double(outData.count) > limit || Double(errData.count) > limit {
-            r.error = JSError("spawnSync \(file) ENOBUFS", code: "ENOBUFS")
+            r.error = EngineError("spawnSync \(file) ENOBUFS", code: "ENOBUFS")
         }
         return r
     }

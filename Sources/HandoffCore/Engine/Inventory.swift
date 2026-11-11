@@ -1,11 +1,10 @@
 import Foundation
 
-// engine.js lines 1926-2346: cloudInventory, rehomeReason, localPlan, retainedHistories, inventory.
+// Cloud inventory, rehoming decisions, the local plan, retained histories and the move inventory.
 
-// `REMOTE_OPEN` (engine.js L3827, S07's range): `new Set(['active', 'paused'])`. Kept private here under
-// a distinct name so it cannot collide with S07's global.
-fileprivate let S04_REMOTE_OPEN: Set<String> = ["active", "paused"]
-fileprivate func remoteOpenStatus(_ status: Value) -> Bool { status.asString.map { S04_REMOTE_OPEN.contains($0) } ?? false }
+// Remote session statuses that count as open; private here so it cannot collide with Retire's REMOTE_OPEN.
+fileprivate let OPEN_REMOTE_STATUSES: Set<String> = ["active", "paused"]
+fileprivate func remoteOpenStatus(_ status: Value) -> Bool { status.asString.map { OPEN_REMOTE_STATUSES.contains($0) } ?? false }
 
 // `a - b || c - d || …` used as a sort comparator: NaN and 0 fall through; a final NaN sorts as equal.
 fileprivate func comparatorChain(_ ds: [Double]) -> Double {
@@ -14,10 +13,9 @@ fileprivate func comparatorChain(_ ds: [Double]) -> Double {
     return last.isNaN ? 0 : last
 }
 
-// Array.prototype.flatMap callback result: arrays are flattened one level, anything else is kept.
+// A flatMap callback result: arrays are flattened one level, anything else is kept.
 fileprivate func flatPart(_ v: Value) -> [Value] { v.isArray ? v.elements : [v] }
 
-// L1926
 func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ targets: Value = .undefined, _ move: Value = .undefined, _ cache: Value = .undefined, _ report: Value = .undefined, _ cutoff: Value = .undefined, _ liveSources: Value = .undefined, _ sessionIds: Value = .undefined, _ excludedIds: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let cutoff: Value = cutoff.isUndefined ? .null : cutoff
     let liveSources: Value = liveSources.isUndefined ? .newArray() : liveSources
@@ -48,7 +46,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     do {
         listed = try cloud["list"].call()
     } catch {
-        let error = jsErrorValue(error)
+        let error = errorObject(error)
         let blockedRow: Value = ["id": .null, "title": "Remote Control", "account": account, "error": .string("cloud check failed: \(error["message"])"), "code": try memoryErrorCode(error)]
         let out: Value = [
             "checked": true,
@@ -68,16 +66,16 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     let blocked = Value.newArray()
     let waiting = Value.newArray()
     let later = Value.newArray()
-    let cutoffTime: Double? = cutoff.truthy ? jsNumber(try milliseconds(cutoff)) : nil
-    if cutoff.truthy, let t = cutoffTime, t < 0 { throw JSError("pending move creation time is invalid") }
+    let cutoffTime: Double? = cutoff.truthy ? toNumber(try milliseconds(cutoff)) : nil
+    if cutoff.truthy, let t = cutoffTime, t < 0 { throw EngineError("pending move creation time is invalid") }
     let deferredOrder = { (id: Value) -> Double in
         let value = cache["data"]["remote"][id]["value"]["artifactDeferred"]
-        return isSafeInteger(value) && jsNumber(value) > 0 ? jsNumber(value) : .infinity
+        return isSafeInteger(value) && toNumber(value) > 0 ? toNumber(value) : .infinity
     }
     let priority = Value.newMap((options["budgetRetry"] ?? []).elements.enumerated().map { ($0.element, Value($0.offset)) })
     let retryOrder = { (id: Value) throws -> Double in
         let found = priority.get(try remoteId(id))
-        return found.isUndefined ? .infinity : jsNumber(found)
+        return found.isUndefined ? .infinity : toNumber(found)
     }
     var firstPass: [Value] = []
     for session in listed.elements {
@@ -91,7 +89,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     var filtered: [Value] = []
     for session in firstPass {
         guard let cutoffTime else { filtered.append(session); continue }
-        let createdAt = jsNumber(try milliseconds(session["created_at"]))
+        let createdAt = toNumber(try milliseconds(session["created_at"]))
         if createdAt > cutoffTime {
             later.push(["id": session["id"] ?? .null, "title": session["title"] ?? "Remote Control", "createdAt": session["created_at"]])
             continue
@@ -99,12 +97,12 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
         if createdAt >= 0 { filtered.append(session); continue }
         blocked.push(["id": session["id"] ?? .null, "title": session["title"] ?? "Remote Control", "account": account, "error": "Remote Control creation time is missing, check refused to widen the original move"])
     }
-    let eligibleSessions = try jsSorted(filtered) { a, b in
+    let eligibleSessions = try stableSorted(filtered) { a, b in
         comparatorChain([try retryOrder(a["id"]) - retryOrder(b["id"]), deferredOrder(a["id"]) - deferredOrder(b["id"])])
     }
-    let sessions: [Value] = options["budgetRetry"].truthy ? jsArraySlice(eligibleSessions, 0, 1) : eligibleSessions
+    let sessions: [Value] = options["budgetRetry"].truthy ? sliceArray(eligibleSessions, 0, 1) : eligibleSessions
     if options["budgetRetry"].truthy {
-        for session in jsArraySlice(eligibleSessions, 1) {
+        for session in sliceArray(eligibleSessions, 1) {
             waiting.push(["id": session["id"], "title": or(session["title"], "Untitled session"), "localId": .null, "code": "CLOUD_MEMORY_DEFERRED"])
         }
     }
@@ -114,8 +112,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     var deferralSequence = sessions.reduce(0.0) { maximum, session in
         Swift.max(maximum, deferredOrder(session["id"]).isFinite ? deferredOrder(session["id"]) : 0)
     }
-    // artifactTurn: the JS chains artifact checks so they run one at a time; this port analyzes sessions sequentially,
-    // so each `await preceding` has already resolved.
+    // Sessions are analyzed one at a time, so each artifact check runs after the previous one finished.
     if !sessions.isEmpty { try progress(report, "cloud scan", Value(completed), Value(sessions.count)) }
     let analyze = { (session: Value) throws -> Value in
         let result: Value
@@ -127,7 +124,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                 let detail = try cloud["session"].call(session["id"])
                 if remoteOpenStatus(detail["status"]), try remoteOpen(detail).truthy {
                     let local = waitingCandidates.filter { $0["remoteIds"].has(sessionId) }
-                    let same: Value = JSSet(local.map { $0["id"] }).size == 1 ? local[0] : .null
+                    let same: Value = ValueSet(local.map { $0["id"] }).size == 1 ? local[0] : .null
                     let recordId: Value = same.truthy ? try desktopRecordOf(same["row"])["sessionId"] : .null
                     let row: Value = ["id": session["id"], "title": or(session["title"], "Untitled session"), "localId": same["id"] ?? .null, "recordId": recordId]
                     return ["waiting": row]
@@ -140,7 +137,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                 let refresh = { () throws in
                     let rows = try stableRemoteRows(cloud, session["id"])["rows"]
                     let current = try conversationFromRows(rows)
-                    if remoteConversation.truthy && sha(stable(current)) != sha(stable(remoteConversation)) { throw JSError("Remote Control history changed since cached analysis") }
+                    if remoteConversation.truthy && sha(stable(current)) != sha(stable(remoteConversation)) { throw EngineError("Remote Control history changed since cached analysis") }
                     remoteConversation = current
                     remote = ["conversation": current, "events": try remoteEvents(rows)]
                     try cacheStore(cache, "remote", session["id"], signature, remote)
@@ -186,21 +183,21 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                     var deferredAt: Double? = nil
                     var settled: Value? = nil
                     do {
-                        if !linked.isEmpty && !artifactLinked { throw JSError(try artifactError("the retained parent history cannot be verified")) }
+                        if !linked.isEmpty && !artifactLinked { throw EngineError(try artifactError("the retained parent history cannot be verified")) }
                         if !remote["events"].isArray { try refresh() }
                         fullBudget = artifacts["used"] === 0
                         deferredAt = deferredOrder(session["id"])
                         let inputs = try artifactInputs(selected["row"])
                         retrySignature = Value(sha(stable(["engine": try artifactEngine(), "limit": artifacts["limit"], "remote": signature, "id": selected["id"], "record": selected["row"]["recordSemantic"], "files": inputs["fingerprints"]])))
                         let previous = remote["artifactFailure"]
-                        if options["automatic"].truthy && previous["signature"] === retrySignature { throw JSError(try artifactError("unchanged inputs still exceed the supplemental read limits", previous["code"])) }
+                        if options["automatic"].truthy && previous["signature"] === retrySignature { throw EngineError(try artifactError("unchanged inputs still exceed the supplemental read limits", previous["code"])) }
                         remote.removeKey("artifactFailure")
                         remote.removeKey("artifactDeferred")
                         checked = true
                         let proof = try supplementalCoverage(remote["events"], selected["row"], artifacts, inputs)
                         if proof.truthy { settled = ["match": ["session": session, "target": Value.spread(selected, proof), "conversationSha": Value(sha(stable(remoteConversation))), "account": account]] }
                     } catch {
-                        let error = jsErrorValue(error)
+                        let error = errorObject(error)
                         if checked && retrySignature.truthy {
                             if error["code"] === "CLOUD_ARTIFACT_LINE_LIMIT" || error["code"] === "CLOUD_ARTIFACT_BUDGET" && fullBudget {
                                 remote["artifactFailure"] = ["signature": retrySignature, "code": error["code"]]
@@ -219,7 +216,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                 return ["blocked": ["id": session["id"], "title": session["title"], "account": account, "code": "CLOUD_UNPROVEN", "error": .string("not proven to be on this Mac, kept in \(account["label"])")]]
             }()
         } catch {
-            let error = jsErrorValue(error)
+            let error = errorObject(error)
             do {
                 result = ["blocked": ["id": session["id"], "title": session["title"], "account": account, "code": try memoryErrorCode(error), "error": .string("Remote Control history unreadable: \(error["message"])")]]
             } catch {
@@ -237,7 +234,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     while at < sessions.count {
         let size = options["serial"].truthy ? 1 : (try selectedMemory(Value.spread(options, ["cloud": cloud]))["parallel"].call()).asInt ?? 0
         var batch: [Value] = []
-        for session in jsArraySlice(sessions, at, at + size) { batch.append(try analyze(session)) }
+        for session in sliceArray(sessions, at, at + size) { batch.append(try analyze(session)) }
         at += batch.count
         for result in batch {
             if result["match"].truthy { matches.push(result["match"]) }
@@ -254,12 +251,11 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     return out
 }
 
-// L2087
 func rehomeReason(_ source: Value = .undefined, _ to: Value = .undefined, _ targetIds: Value = .undefined, _ targetNames: Value = .undefined) throws -> Value {
     if source["taskFamily"]["error"].truthy || source["account"]["taskError"].truthy || to["taskError"].truthy {
         return source["taskFamily"]["error"] ?? source["account"]["taskError"] ?? to["taskError"]
     }
-    if JSSet(source["members"].elements.map { $0["transcript"] }).size > 1 { return "multiple compatible source versions require merging" }
+    if ValueSet(source["members"].elements.map { $0["transcript"] }).size > 1 { return "multiple compatible source versions require merging" }
     if try sameAccount(source["account"], to).truthy { return "source and destination are the same" }
     if !source["sole"].truthy && source["invalid"].truthy { return .string("\(source["invalid"]) unparseable lines") }
     if !source["sole"].truthy && source["conflicts"].truthy { return .string("\(source["conflicts"]) conflicting duplicate uuids") }
@@ -274,14 +270,13 @@ func rehomeReason(_ source: Value = .undefined, _ to: Value = .undefined, _ targ
     return .null
 }
 
-// L2104
 func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -> Value {
     let pendingRows = pending.elements
-    let targetIds = JSSet(to["sessions"].elements.map { $0["id"] }.filter { $0.truthy })
-    let targetNames = JSSet(to["sessions"].elements.map { Value(path.basename($0["file"].description)) } + to["unreadable"].elements.map { Value(path.basename($0.description)) })
-    let reasons = JSMap()
+    let targetIds = ValueSet(to["sessions"].elements.map { $0["id"] }.filter { $0.truthy })
+    let targetNames = ValueSet(to["sessions"].elements.map { Value(path.basename($0["file"].description)) } + to["unreadable"].elements.map { Value(path.basename($0.description)) })
+    let reasons = ValueMap()
     for source in pendingRows { reasons.set(source, try rehomeReason(source, to, .set(targetIds), .set(targetNames))) }
-    for family in JSSet(pendingRows.map { $0["taskFamily"] }.filter { $0.truthy }).values {
+    for family in ValueSet(pendingRows.map { $0["taskFamily"] }.filter { $0.truthy }).values {
         let members = pendingRows.filter { $0["taskFamily"] === family }
         let hardReason = { (row: Value) -> Bool in
             let reason = reasons.get(row)
@@ -295,7 +290,7 @@ func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -
             }
         }
     }
-    let availableParents = JSSet(to["sessions"].elements.map { $0["record"]["sessionId"] }.filter { $0.truthy })
+    let availableParents = ValueSet(to["sessions"].elements.map { $0["record"]["sessionId"] }.filter { $0.truthy })
     var added = true
     while added {
         added = false
@@ -322,10 +317,10 @@ func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -
     }
     var ordered: [Value] = []
     var pendingMove = move
-    let landedRecords = JSSet(to["sessions"].elements.map { $0["record"]["sessionId"] }.filter { $0.truthy })
+    let landedRecords = ValueSet(to["sessions"].elements.map { $0["record"]["sessionId"] }.filter { $0.truthy })
     while !pendingMove.isEmpty {
         guard let at = pendingMove.firstIndex(where: { !$0["record"]["forkedFromSessionId"].truthy || landedRecords.has($0["record"]["forkedFromSessionId"]) }) else {
-            throw JSError("parent ordering invariant failed")
+            throw EngineError("parent ordering invariant failed")
         }
         let next = pendingMove.remove(at: at)
         ordered.append(next)
@@ -335,7 +330,6 @@ func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -
     return ["move": move.value, "blocked": blocked]
 }
 
-// L2156
 func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, _ options: Value = .undefined, _ owners: Value = .undefined, _ enabled: Value = .undefined) throws -> Value {
     let cloudBridgeIds = options["cloudBridgeIds"]
     target["artifactBridgeIds"] = unique(try remoteIdsOf(target).elements + (cloudBridgeIds.get(target["id"]) ?? []).elements.map(remoteId).filter { $0.truthy }).value
@@ -359,8 +353,8 @@ func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, 
             if try artifactStat(canonicalTranscript)["signature"] !== before["signature"] { continue }
             if Value(sha(try readRegular(canonicalTranscript, before["signature"]))) !== detail["contentSha"] { continue }
             if try mappedPath(.string(transcript)) !== canonicalTranscript { continue }
-            // Map.groupBy(detail.bridgeOwners, owner => owner.id)
-            let groups = JSMap()
+            // Bridge owners grouped by id.
+            let groups = ValueMap()
             for owner in detail["bridgeOwners"].elements {
                 let key = owner["id"]
                 if groups.has(key) { groups.get(key).push(owner) } else { groups.set(key, [owner]) }
@@ -391,7 +385,6 @@ func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, 
     return .undefined
 }
 
-// L2183
 public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let options: Value = options.isUndefined ? .newObject() : options
@@ -414,7 +407,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
         for id in try priorSessions(s["record"]).elements where id !== s["id"] && ctx["index"].has(id) { return false }
         return true
     }
-    let analyzed = JSMap()
+    let analyzed = ValueMap()
     let missing = Value.newArray()
     let unreadable = Value.newArray()
     let rejected = Value.newArray()
@@ -456,7 +449,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
                         found.push(source)
                     } else { rejected.push(Value.spread(s, ["account": account, "error": "Desktop record identity is invalid"])) }
                 } catch {
-                    rejected.push(Value.spread(s, ["account": account, "error": jsErrorValue(error)["message"]]))
+                    rejected.push(Value.spread(s, ["account": account, "error": errorObject(error)["message"]]))
                 }
             }
             do { try scan() } catch {
@@ -502,7 +495,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
                     } else { rejected.push(["id": s["id"], "title": s["title"], "account": to, "target": true, "error": "Desktop record identity is invalid"]) }
                 }
             } catch {
-                rejected.push(["id": s["id"], "title": s["title"], "account": to, "target": true, "error": jsErrorValue(error)["message"]])
+                rejected.push(["id": s["id"], "title": s["title"], "account": to, "target": true, "error": errorObject(error)["message"]])
             }
         }
         do { try scan() } catch {
@@ -515,17 +508,17 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
         try progress(report, "scan", Value(completed), Value(workTotal))
         try check()
     }
-    let forked = JSSet((found.elements + targets.elements).flatMap { flatPart($0["lineage"] ?? []) })
+    let forked = ValueSet((found.elements + targets.elements).flatMap { flatPart($0["lineage"] ?? []) })
     for source in found.elements {
         source["sole"] = Value(try soleRecord(source) && !source["lineage"]["length"].truthy && !forked.has(source["id"]))
     }
     let requiredParents = Value.newSet(found.elements.map { $0["record"]["forkedFromSessionId"] }.filter { $0.truthy })
-    let ranked = jsSorted(found.elements) { a, b in
+    let ranked = stableSorted(found.elements) { a, b in
         comparatorChain([
-            jsNumber(b["roots"]["size"]) - jsNumber(a["roots"]["size"]),
-            jsNumber(b["activeAt"]) - jsNumber(a["activeAt"]),
-            jsNumber(a["forks"]) - jsNumber(b["forks"]),
-            jsNumber(a["createdAt"]) - jsNumber(b["createdAt"]),
+            toNumber(b["roots"]["size"]) - toNumber(a["roots"]["size"]),
+            toNumber(b["activeAt"]) - toNumber(a["activeAt"]),
+            toNumber(a["forks"]) - toNumber(b["forks"]),
+            toNumber(a["createdAt"]) - toNumber(b["createdAt"]),
         ])
     }
     var reps: [Value] = []
@@ -570,7 +563,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
     }
     let plan = try localPlan(pending, to)
     let move = plan["move"], blocked = plan["blocked"]
-    let rootOwner = JSMap(), divergent = JSSet()
+    let rootOwner = ValueMap(), divergent = ValueSet()
     for row in reps {
         for root in row["roots"].elements {
             let prior = rootOwner.get(root)
@@ -581,7 +574,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
     let apart = divergent.size
     let cloudCutoff = options["cloudCutoff"] ?? (cloudRequested ? requestedAt : .null)
     let brokenTasks = (from.elements + [to]).first { $0["taskError"].truthy }
-    if options["cloud"].truthy, let brokenTasks { throw JSError(brokenTasks["taskError"].description) }
+    if options["cloud"].truthy, let brokenTasks { throw EngineError(brokenTasks["taskError"].description) }
     let cloudPlan = try cloudInventory(options["cloud"], from, targets, options["cloudTargetOnly"].truthy ? [] : move, cache, report, cloudCutoff, found, options["cloudSessionIds"], options["cloudExcludedIds"], options)
     let retiring = Value.newSet((move.elements + there.elements).flatMap { row in (row["members"] ?? [row]).elements.map { $0["file"] } })
     let links = try sourceCloudLinks(Value(move.elements + there.elements))
@@ -599,7 +592,7 @@ public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ pa
         _ = try saveAnalysisCache(cache)
         try check()
     } catch {
-        let errorValue = jsErrorValue(error)
+        let errorValue = errorObject(error)
         let isolatedId = cloudPlan["isolatedId"]
         if errorValue["code"] === "CLOUD_MEMORY_BUDGET" && isolatedId.truthy {
             var hit = false

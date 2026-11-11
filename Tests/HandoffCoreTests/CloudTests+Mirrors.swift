@@ -5,7 +5,7 @@ import Testing
 extension Engine.Cloud {
     // A cloud call that must never happen: records an issue and throws.
     static func fail(_ message: String) -> Value {
-        fn { _ in Issue.record(Comment(rawValue: message)); throw JSError(message) }
+        fn { _ in Issue.record(Comment(rawValue: message)); throw EngineError(message) }
     }
 
     @Test("bridge recovery of remote-only work leaves unrelated completed metadata alone")
@@ -51,7 +51,7 @@ extension Engine.Cloud {
             let project = path.join(h.paths.pool.str, "ssh-\(SOURCE)")
             try rename(h.project, project)
             if mode == "native mirror alias" { try symlink(project, h.project) }
-            transcript = try NodeFS.nativeRealpath(path.join(project, "\(SOURCE).jsonl"))
+            transcript = try FileSystem.nativeRealpath(path.join(project, "\(SOURCE).jsonl"))
         }
         let originals = try readdir(h.dir("P")).map { ($0, try readData(path.join(h.dir("P"), $0))) }
         let from = try accounts(h.paths, []).find { $0.account.str == h.acct.P }

@@ -67,7 +67,7 @@ extension Engine {
             deq(counts.map { [$0.sessionTotal, $0.remainingCount] }, [[2, 2], [2, 0]], sourceLocation: sourceLocation)
             ok(counts.every { row in
                 row.live.truthy && isSafeInteger(row.sessionTotal) && isSafeInteger(row.remainingCount)
-                    && jsNumber(row.remainingCount) >= 0 && jsNumber(row.remainingCount) <= jsNumber(row.sessionTotal)
+                    && toNumber(row.remainingCount) >= 0 && toNumber(row.remainingCount) <= toNumber(row.sessionTotal)
             }, sourceLocation: sourceLocation)
             eq(events.at(-1).summary.moved, 2, sourceLocation: sourceLocation)
             eq(events.at(-1).summary.notMoved.length, 0, sourceLocation: sourceLocation)
@@ -482,11 +482,11 @@ extension Engine {
                     let spawn = childProcess.spawnSync, command = childProcess.command
                     let watched = { (file: String) in file.contains(".app/") || ["launchctl", "pkill", "/bin/launchctl", "/usr/bin/open", "/usr/bin/osascript", "swiftc"].contains(file) }
                     childProcess.spawnSync = { file, args, options in
-                        if watched(file) { actions.append(file); return SpawnResult(status: nil, error: JSError("unexpected app action")) }
+                        if watched(file) { actions.append(file); return SpawnResult(status: nil, error: EngineError("unexpected app action")) }
                         return spawn(file, args, options)
                     }
                     childProcess.command = { file, args, timeout in
-                        if watched(file) { actions.append(file); return SpawnResult(status: nil, error: JSError("unexpected app spawn")) }
+                        if watched(file) { actions.append(file); return SpawnResult(status: nil, error: EngineError("unexpected app spawn")) }
                         return command(file, args, timeout)
                     }
                 }
@@ -503,10 +503,10 @@ extension Engine {
             let heap = 4.0 * 1_073_741_824.0 + 48 * 1024 * 1024
             for gib in [8.0, 16, 48] {
                 let setting = try menubarHeapMiB(Value(gib * 1_073_741_824.0), Value(heap))
-                ok(jsNumber(setting) * 1024 * 1024 >= heap)
+                ok(toNumber(setting) * 1024 * 1024 >= heap)
                 eq(setting, Value(max((heap / 1024 / 1024).rounded(.up), (gib * 1_073_741_824.0 * 0.2 * 0.65 / 1024 / 1024).rounded(.down))))
             }
-            ok(jsNumber(try menubarHeapMiB(Value(48 * 1_073_741_824.0), Value(heap))) > jsNumber(try menubarHeapMiB(Value(8 * 1_073_741_824.0), Value(heap))))
+            ok(toNumber(try menubarHeapMiB(Value(48 * 1_073_741_824.0), Value(heap))) > toNumber(try menubarHeapMiB(Value(8 * 1_073_741_824.0), Value(heap))))
         }
     }
 }

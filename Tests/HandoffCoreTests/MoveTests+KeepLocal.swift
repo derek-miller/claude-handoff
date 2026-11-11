@@ -4,7 +4,7 @@ import Testing
 
 extension Engine.Moves {
     static func offline(_ h: Home) -> Value {
-        cloudFixture(h, ["account": Value(h.acct.T), "org": Value(h.org.T), "list": fn { _ in throw JSError("offline") }])
+        cloudFixture(h, ["account": Value(h.acct.T), "org": Value(h.org.T), "list": fn { _ in throw EngineError("offline") }])
     }
 
     @Test("completed local movement suppresses speculative pending")

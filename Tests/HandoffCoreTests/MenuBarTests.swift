@@ -24,13 +24,13 @@ extension Engine {
 
         static func replaceOnce(_ source: String, _ anchor: String, _ replacement: String) throws -> String {
             let parts = source.components(separatedBy: anchor)
-            guard parts.count == 2 else { throw JSError("App.swift splice anchor found \(parts.count - 1) times: \(anchor)") }
+            guard parts.count == 2 else { throw EngineError("App.swift splice anchor found \(parts.count - 1) times: \(anchor)") }
             return parts.joined(separator: replacement)
         }
 
         static func replaceSpan(_ source: String, from start: String, to end: String, with replacement: String) throws -> String {
             guard let lower = source.range(of: start), let upper = source.range(of: end, range: lower.upperBound..<source.endIndex) else {
-                throw JSError("App.swift splice span not found: \(start)")
+                throw EngineError("App.swift splice span not found: \(start)")
             }
             return source.replacingCharacters(in: lower.lowerBound..<upper.lowerBound, with: replacement)
         }
@@ -38,7 +38,7 @@ extension Engine {
         static func splicedApp() throws -> String {
             let app = try readText(path.join(here, "../../Sources/ClaudeHandoff/App.swift"))
             guard var source = app.components(separatedBy: "@main\nstruct HandoffApp: App {").first, source.count < app.count else {
-                throw JSError("App.swift has no HandoffApp entry point")
+                throw EngineError("App.swift has no HandoffApp entry point")
             }
             source = try replaceOnce(source, "import Sparkle\n", "")
             source = try replaceSpan(source, from: "    private func run(_ args: [String]", to: "\n// MenuBarExtra keeps", with: """
@@ -83,13 +83,13 @@ extension Engine {
             let sources = ["Main.swift", "WordingChecks.swift", "StateChecks.swift"].map { path.join(here, "Fixtures/MenuBar", $0) }
             let result = ChildProcess.nativeSpawnSync("/usr/bin/nice", ["-n", "15", "/usr/bin/xcrun", "swiftc", "-parse-as-library", "-o", binary, app] + sources,
                                                       SpawnOptions(timeout: 600_000))
-            guard result.status == 0 else { throw JSError("menu bar checks failed to compile: \(result.stderr)\(result.error?.message ?? "")") }
+            guard result.status == 0 else { throw EngineError("menu bar checks failed to compile: \(result.stderr)\(result.error?.message ?? "")") }
             return binary
         }
 
         static func run(_ check: String, _ directory: String, timeout: Double = 90_000) throws -> String {
             let result = ChildProcess.nativeSpawnSync(try checks(), [check, directory], SpawnOptions(timeout: timeout))
-            guard result.status == 0 else { throw JSError("menu bar \(check) checks failed (\(result.status.map(String.init) ?? "signal")): \(result.stdout)\(result.stderr)") }
+            guard result.status == 0 else { throw EngineError("menu bar \(check) checks failed (\(result.status.map(String.init) ?? "signal")): \(result.stdout)\(result.stderr)") }
             return result.stdout
         }
 
@@ -265,7 +265,7 @@ extension Engine {
             eq(moved.ok, true, moved.reason.description)
             ok(try captured.contains { row in
                 let line = try JSON.parse(row.line.str)
-                return row.preQuit.truthy && line.stage == "move" && jsNumber(line.completed) > 0
+                return row.preQuit.truthy && line.stage == "move" && toNumber(line.completed) > 0
             })
 
             let retryHome = try taskFamilyFixture(), retrySelection = try retryHome.selection()

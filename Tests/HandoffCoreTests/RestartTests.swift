@@ -154,7 +154,7 @@ extension Engine {
             let result = try withDesktopRestart(plan, h.paths, fn { _ in
                 eq(rows.length, 0)
                 calls.append("move")
-                throw JSError("fixture move failed")
+                throw EngineError("fixture move failed")
             }, NOOP, [
                 "now": fn { _ in Value(time) }, "shutdownWait": 400, "reserve": 200, "inspect": fn { _ in rows },
                 "wait": fn { args in time += args[0].asNumber!; rows = []; return .undefined },
@@ -242,7 +242,7 @@ extension Engine {
             let result = try withDesktopRestart(plan, h.paths, fn { _ in ["ok": true] }, fn { args in
                 if args[0] == "reopen" {
                     reportedAfterOpen = calls.contains("/usr/bin/open")
-                    throw JSError("progress output unavailable")
+                    throw EngineError("progress output unavailable")
                 }
                 return .undefined
             }, ["inspect": fn { _ in rows }, "command": fn { args in

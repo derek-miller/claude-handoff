@@ -62,7 +62,7 @@ extension Engine.Restarts {
                 eq(result.receipt.sessions.length, mixed ? 2 : 1, change)
                 eq(result.receipt.held.length, mixed ? 2 : 3, change)
                 eq(result.receipt.startedAt, plan.plan.requestedAt)
-                ok(result.receipt.failed.some { JSRegExp.cached("family member missing").test($0.error.description) }, change)
+                ok(result.receipt.failed.some { TextPattern.cached("family member missing").test($0.error.description) }, change)
                 if !mixed { deq(try readJSON(h.sourceFile), h.sourceRegistry) }
             } else {
                 eq(result.ok, true, result.reason.description)
@@ -184,7 +184,7 @@ extension Engine.Restarts {
         let (from, to) = try Self.pair(h, "P", "T", []), mock = taskHarness()
         let plan = try executeMove([from], to, h.paths, ["io": mock.io]), link = fs.link
         fs.link = { a, b in
-            if b == h.recordFile("T", h.sessions[1]) { throw JSError("fixture second placement failed") }
+            if b == h.recordFile("T", h.sessions[1]) { throw EngineError("fixture second placement failed") }
             try link(a, b)
         }
         let result = try executeMove([from], to, h.paths, ["io": mock.io, "approve": plan.plan.token])

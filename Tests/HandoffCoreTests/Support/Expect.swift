@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import HandoffCore
 
-// node:assert/strict, recorded as Swift Testing issues at the caller's line.
+// Strict assertions on values (no type coercion), recorded as Swift Testing issues at the caller's line.
 
 // assert.equal: Object.is for primitives, identity for objects.
 func eq(_ actual: Value, _ expected: Value, _ message: String? = nil, sourceLocation: SourceLocation = #_sourceLocation) {
@@ -45,15 +45,15 @@ func ok(_ value: Bool, _ message: String? = nil, sourceLocation: SourceLocation 
     if !value { Issue.record(Comment(rawValue: message ?? "expected true"), sourceLocation: sourceLocation) }
 }
 
-// assert.match / assert.doesNotMatch with a JS regular expression.
+// Whether a string matches a TextPattern regular expression.
 func match(_ value: Value, _ pattern: String, _ flags: String = "", sourceLocation: SourceLocation = #_sourceLocation) {
     guard let text = value.asString else { Issue.record("expected a string matching /\(pattern)/, got \(show(value))", sourceLocation: sourceLocation); return }
-    if !JSRegExp.cached(pattern, flags).test(text) { Issue.record("expected /\(pattern)/\(flags) to match \(show(value))", sourceLocation: sourceLocation) }
+    if !TextPattern.cached(pattern, flags).test(text) { Issue.record("expected /\(pattern)/\(flags) to match \(show(value))", sourceLocation: sourceLocation) }
 }
 
 func noMatch(_ value: Value, _ pattern: String, _ flags: String = "", sourceLocation: SourceLocation = #_sourceLocation) {
     guard let text = value.asString else { Issue.record("expected a string, got \(show(value))", sourceLocation: sourceLocation); return }
-    if JSRegExp.cached(pattern, flags).test(text) { Issue.record("expected /\(pattern)/\(flags) not to match \(show(value))", sourceLocation: sourceLocation) }
+    if TextPattern.cached(pattern, flags).test(text) { Issue.record("expected /\(pattern)/\(flags) not to match \(show(value))", sourceLocation: sourceLocation) }
 }
 
 func match(_ value: String, _ pattern: String, _ flags: String = "", sourceLocation: SourceLocation = #_sourceLocation) {
@@ -64,14 +64,14 @@ func noMatch(_ value: String, _ pattern: String, _ flags: String = "", sourceLoc
     noMatch(Value(value), pattern, flags, sourceLocation: sourceLocation)
 }
 
-// assert.throws / assert.rejects with an optional message pattern; returns the thrown error as a JS value.
+// Expects body to throw, optionally with a message matching pattern; returns the thrown error object.
 @discardableResult
 func throwsError(_ pattern: String? = nil, _ flags: String = "", sourceLocation: SourceLocation = #_sourceLocation, _ body: () throws -> Any) -> Value {
     do {
         _ = try body()
     } catch {
-        let value = jsErrorValue(error)
-        if let pattern, !JSRegExp.cached(pattern, flags).test(value.message.description) && !JSRegExp.cached(pattern, flags).test(value.description) {
+        let value = errorObject(error)
+        if let pattern, !TextPattern.cached(pattern, flags).test(value.message.description) && !TextPattern.cached(pattern, flags).test(value.description) {
             Issue.record("expected an error matching /\(pattern)/, got \(value.message)", sourceLocation: sourceLocation)
         }
         return value
@@ -88,7 +88,7 @@ func throwsError(where properties: Value, sourceLocation: SourceLocation = #_sou
     for (key, expected) in properties.ownEntries {
         let actual = value[key]
         if let pattern = expected.asObject?["$regex"].asString {
-            if !JSRegExp.cached(pattern).test(actual.description) { Issue.record("error \(key) \(show(actual)) does not match /\(pattern)/", sourceLocation: sourceLocation) }
+            if !TextPattern.cached(pattern).test(actual.description) { Issue.record("error \(key) \(show(actual)) does not match /\(pattern)/", sourceLocation: sourceLocation) }
         } else if !deepEqual(actual, expected) {
             Issue.record("error \(key): expected \(show(expected)), got \(show(actual))", sourceLocation: sourceLocation)
         }
@@ -147,13 +147,13 @@ extension Value {
     func some(_ predicate: (Value) throws -> Bool) rethrows -> Bool { try elements.contains(where: predicate) }
     func every(_ predicate: (Value) throws -> Bool) rethrows -> Bool { try elements.allSatisfy(predicate) }
     func at(_ index: Int) -> Value { let xs = elements; let i = index < 0 ? xs.count + index : index; return i >= 0 && i < xs.count ? xs[i] : .undefined }
-    func slice(_ start: Int, _ end: Int? = nil) -> Value { Value(jsArraySlice(elements, start, end)) }
+    func slice(_ start: Int, _ end: Int? = nil) -> Value { Value(sliceArray(elements, start, end)) }
     func sorted() -> Value { Value(defaultSorted(elements)) }
     func concat(_ other: Value) -> Value { Value(elements + other.elements) }
     var str: String { asString ?? description }
 }
 
-// A JS function value from a Swift closure.
+// A function value from a Swift closure.
 func fn(_ body: @escaping ([Value]) throws -> Value) -> Value { Value(body) }
 func fn(_ body: @escaping () throws -> Void) -> Value { Value { _ in try body(); return .undefined } }
 let NOOP: Value = fn { () in }

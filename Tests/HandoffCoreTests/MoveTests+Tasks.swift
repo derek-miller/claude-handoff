@@ -247,7 +247,7 @@ extension Engine.Moves {
         let h = try taskFamilyFixture(true), (from, to) = try h.selection()
         let original = fs.link, blocked = h.recordFile("T", SOURCE)
         fs.link = { a, b in
-            if b == blocked { throw JSError("fixture publication failure") }
+            if b == blocked { throw EngineError("fixture publication failure") }
             try original(a, b)
         }
         let result: Value

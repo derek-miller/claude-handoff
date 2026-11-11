@@ -285,7 +285,7 @@ extension Engine {
                         if shared { try h.record("Q", SOURCE, rehomeRecord()) }
                         let before = try readData(transcript), native = fs.readFile
                         if mode == "unreadable" {
-                            fs.readFile = { file in if file == transcript { throw JSError("forced parse failure") }; return try native(file) }
+                            fs.readFile = { file in if file == transcript { throw EngineError("forced parse failure") }; return try native(file) }
                         }
                         defer { fs.readFile = native }
                         let from = try h.account("P"), to = try h.account("T")
@@ -321,7 +321,7 @@ extension Engine {
             let native = fs.readFile, blocked = h.transcript(ancestor)
             var failed = false
             fs.readFile = { file in
-                if file == blocked { failed = true; throw JSError("forced ancestor read failure") }
+                if file == blocked { failed = true; throw EngineError("forced ancestor read failure") }
                 return try native(file)
             }
             let inv: Value

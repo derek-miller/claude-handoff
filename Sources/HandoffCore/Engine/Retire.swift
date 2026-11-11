@@ -1,10 +1,9 @@
 import Foundation
 
-// engine.js lines 3531-4096: retirement into quarantine, Remote Control archival, cloud attempt bookkeeping and Undo of remote archives.
+// Retirement into quarantine, Remote Control archival, cloud attempt bookkeeping and Undo of remote archives.
 
-// Map.groupBy(items, key) → groups in first-seen key order (SameValueZero keys).
 fileprivate func groupBy(_ items: [Value], _ key: (Value) throws -> Value) rethrows -> [[Value]] {
-    let index = JSMap()
+    let index = ValueMap()
     var groups: [[Value]] = []
     for item in items {
         let k = try key(item)
@@ -16,17 +15,16 @@ fileprivate func groupBy(_ items: [Value], _ key: (Value) throws -> Value) rethr
     return groups
 }
 
-// `promise.catch(() => null)`
 fileprivate func orNull(_ work: () throws -> Value) -> Value {
     do { return try work() } catch { return .null }
 }
 
-// `[...value]` — spreading a non-iterable throws in JS.
+// The elements of an iterable value; a non-iterable throws.
 fileprivate func spreadable(_ v: Value) throws -> [Value] {
     switch v {
     case .array, .set, .map: return v.elements
     case .string(let s): return s.utf16.map { .string(String(utf16CodeUnits: [$0], count: 1)) }
-    default: throw JSError.type("\(v.description) is not iterable")
+    default: throw EngineError.type("\(v.description) is not iterable")
     }
 }
 
@@ -35,7 +33,6 @@ fileprivate func isStopCode(_ error: Value) -> Bool {
     return code === "MOVE_STALLED" || code === "RESTART_REOPENED"
 }
 
-// L3531
 func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Value = .undefined, _ paths: Value = .undefined, _ at: Value = .undefined, _ problems: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined, _ check: Value = .undefined, _ snapshots: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let check = fnOr(check)
@@ -174,7 +171,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
     let retiringRows = { (items: [Value]) -> Value in Value(items.flatMap { item in item["source"].truthy ? [sourceRows.get(item["moved"][0][0])] : [] }) }
     let restoreItems = { (items: [Value]) throws in
         let blockedItems = try restoreProblems(Value(items), .string(root), true)
-        if blockedItems.length > 0 { throw JSError("retirement rollback blocked: \(blockedItems.join(", "))") }
+        if blockedItems.length > 0 { throw EngineError("retirement rollback blocked: \(blockedItems.join(", "))") }
         try restore(Value(items), .string(root))
     }
     do {
@@ -194,7 +191,7 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
         let checkParents = { (parked: Bool) throws in
             for pair in try parentReferences(directories, snapshots, check).elements {
                 let file = pair[0], parent = pair[1]
-                if retiring.has(parent) && (parked || !retiring.has(file)) { throw JSError("parent reference changed during retirement: \(file)") }
+                if retiring.has(parent) && (parked || !retiring.has(file)) { throw EngineError("parent reference changed during retirement: \(file)") }
             }
         }
         let carrierSafe = { (id: Value, live: Value) throws -> Bool in
@@ -207,8 +204,8 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
             for group in groupBy(items, { $0["by"] }) {
                 do { try work(group); done.append(contentsOf: group) }
                 catch {
-                    let error = jsErrorValue(error)
-                    if isStopCode(error) { throw JSError(error) }
+                    let error = errorObject(error)
+                    if isStopCode(error) { throw EngineError(error) }
                     try restoreItems(group)
                     receipt["failed"].push(Value.spread(["id": group[0]["id"], "title": group[0]["title"], "error": error["message"]], try failureIdentity(["members": retiringRows(group)])))
                 }
@@ -224,15 +221,15 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
             try park(Value(group), Value { args in
                 let item = args.first ?? .undefined
                 try check.call()
-                if !(try carrierSafe(item["by"], parkWorkers)) { throw JSError("destination changed during retirement: \(item["by"])") }
+                if !(try carrierSafe(item["by"], parkWorkers)) { throw EngineError("destination changed during retirement: \(item["by"])") }
                 let carrier = carriers.get(item["by"]), carrierId = carrier["targetId"] ?? carrier["id"]
                 if carrierId.truthy {
-                    guard let text = carrierId.asString else { throw JSError.type("carrierId.toLowerCase is not a function") }
-                    if parkWorkers.has(Value(text.lowercased())) { throw JSError("running worker changed during retirement: \(item["id"])") }
+                    guard let text = carrierId.asString else { throw EngineError.type("carrierId.toLowerCase is not a function") }
+                    if parkWorkers.has(Value(text.lowercased())) { throw EngineError("running worker changed during retirement: \(item["id"])") }
                 }
                 let row = (item["source"].truthy ? sourceRows : targetRows).get(item["moved"][0][0])
                 if try !row.truthy || !untouched(row, parkWorkers, Value(row["strategy"] !== "rehome")).truthy {
-                    throw JSError("\(item["source"].truthy ? "source" : "destination") changed during retirement: \(item["id"])")
+                    throw EngineError("\(item["source"].truthy ? "source" : "destination") changed during retirement: \(item["id"])")
                 }
                 return .undefined
             })
@@ -240,16 +237,16 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
         try check.call(true)
         let postWorkers = try workers()
         plan = try groups(parked) { group in
-            if !(try carrierSafe(group[0]["by"], postWorkers)) { throw JSError("destination changed after retirement: \(group[0]["by"])") }
+            if !(try carrierSafe(group[0]["by"], postWorkers)) { throw EngineError("destination changed after retirement: \(group[0]["by"])") }
             for item in group.filter({ $0["source"].truthy }) {
                 let row = sourceRows.get(item["moved"][0][0])
-                if try !row.truthy || !witnessed(row, postWorkers, Value(row["strategy"] !== "rehome")).truthy { throw JSError("source changed after retirement: \(item["id"])") }
+                if try !row.truthy || !witnessed(row, postWorkers, Value(row["strategy"] !== "rehome")).truthy { throw EngineError("source changed after retirement: \(item["id"])") }
             }
         }
         try checkParents(true)
     } catch {
-        let error = jsErrorValue(error)
-        if isStopCode(error) { throw JSError(error) }
+        let error = errorObject(error)
+        if isStopCode(error) { throw EngineError(error) }
         try restoreItems(plan)
         receipt["retiring"] = .null
         receipt["failed"].push(Value.spread(["id": .null, "title": "retirement", "error": error["message"]], try failureIdentity(["members": retiringRows(plan)])))
@@ -262,30 +259,25 @@ func retire(_ inv: Value = .undefined, _ to: Value = .undefined, _ receipt: Valu
     return retained
 }
 
-fileprivate extension JSMap {
+fileprivate extension ValueMap {
     func clearAll() { for k in keys { delete(k) } }
 }
 
-// L3709
 let REMOTE_OPEN: Set<String> = ["active", "paused"]
-// L3710
 let REMOTE_IDLE: Set<String> = [
     "WORKER_STATUS_UNSPECIFIED", "WORKER_STATUS_IDLE", "WORKER_STATUS_DISCONNECTED",
     "idle", "disconnected", "stopped",
 ]
 fileprivate func setHas(_ set: Set<String>, _ v: Value) -> Bool { v.asString.map { set.contains($0) } ?? false }
 
-// L3714
 func remoteOpen(_ session: Value = .undefined) throws -> Value {
     Value(session["connection_status"] === "connected" || session["client_presence"].isArray && session["client_presence"].length > 0)
 }
-// L3715
 func remoteBusy(_ session: Value = .undefined) throws -> Value {
     Value(session["connection_status"] !== "disconnected" ||
         !session["client_presence"].isArray || session["client_presence"].length > 0 ||
         !setHas(REMOTE_IDLE, session["worker_status"]))
 }
-// L3718
 func remoteStateSha(_ rows: Value = .undefined) throws -> Value {
     var text = "["
     var separator = ""
@@ -293,7 +285,7 @@ func remoteStateSha(_ rows: Value = .undefined) throws -> Value {
         let type = row["event_type"]
         let wanted: Bool
         if type === "user" || type === "assistant" { wanted = true } else {
-            guard let s = type.asString else { throw JSError.type("Cannot read properties of \(type.description) (reading 'startsWith')") }
+            guard let s = type.asString else { throw EngineError.type("Cannot read properties of \(type.description) (reading 'startsWith')") }
             wanted = s.hasPrefix("control_")
         }
         if wanted {
@@ -305,7 +297,6 @@ func remoteStateSha(_ rows: Value = .undefined) throws -> Value {
     return .string(sha(text))
 }
 
-// L3728
 func remoteActionsPending(_ session: Value = .undefined) throws -> Value {
     let metadata = session["external_metadata"]
     if !metadata.nullish && (!metadata.isObjectLike || metadata.isArray) { return true }
@@ -319,30 +310,27 @@ func remoteActionsPending(_ session: Value = .undefined) throws -> Value {
     return false
 }
 
-// L3737
 func assertRemoteIdle(_ session: Value = .undefined) throws -> Value {
-    if !setHas(REMOTE_OPEN, session["status"]) { throw JSError("Remote Control status changed to \(session["status"] ?? "unknown")") }
+    if !setHas(REMOTE_OPEN, session["status"]) { throw EngineError("Remote Control status changed to \(session["status"] ?? "unknown")") }
     if try remoteBusy(session).truthy {
-        throw jsThrow("Remote Control session is not proven disconnected and idle", code: try remoteOpen(session).truthy ? "REMOTE_OPEN" : "REMOTE_STATE_UNKNOWN")
+        throw makeError("Remote Control session is not proven disconnected and idle", code: try remoteOpen(session).truthy ? "REMOTE_OPEN" : "REMOTE_STATE_UNKNOWN")
     }
-    if try remoteActionsPending(session).truthy { throw JSError("Remote Control has pending actions or unreadable action state") }
+    if try remoteActionsPending(session).truthy { throw EngineError("Remote Control has pending actions or unreadable action state") }
     let type = session["last_event_at"].typeOf
-    if type != "string" && type != "number" { throw JSError("Remote Control event marker is missing") }
+    if type != "string" && type != "number" { throw EngineError("Remote Control event marker is missing") }
     return session["last_event_at"]
 }
 
-// L3745
 func stableRemoteRows(_ cloud: Value = .undefined, _ id: Value = .undefined) throws -> Value {
     let before = try cloud["session"].call(id)
     let marker = try assertRemoteIdle(before)
     let rows = try cloud["eventRows"].call(id)
     let after = try cloud["session"].call(id)
     _ = try assertRemoteIdle(after)
-    if after["last_event_at"] !== marker { throw JSError("Remote Control history changed while reading") }
+    if after["last_event_at"] !== marker { throw EngineError("Remote Control history changed while reading") }
     return ["rows": rows, "marker": marker, "stateSha": try remoteStateSha(rows), "session": after]
 }
 
-// L3755
 func waitRemote(_ cloud: Value = .undefined, _ id: Value = .undefined, _ statuses: Value = .undefined) throws -> Value {
     var current: Value = .null
     for _ in 0..<12 {
@@ -353,7 +341,6 @@ func waitRemote(_ cloud: Value = .undefined, _ id: Value = .undefined, _ statuse
     return current
 }
 
-// L3765
 func remoteReceipt(_ match: Value = .undefined) throws -> Value {
     let base: Value = [
         "id": match["session"]["id"],
@@ -370,16 +357,15 @@ func remoteReceipt(_ match: Value = .undefined) throws -> Value {
     return Value.spread(base, match["target"]["artifactCounts"].truthy ? ["artifactCounts": match["target"]["artifactCounts"]] : [:])
 }
 
-// L3779
 func targetActivation(_ row: Value = .undefined, _ keepArchived: Value = .undefined) throws -> Value {
     let keepArchived: Value = keepArchived.isUndefined ? false : keepArchived
     let candidate = row["record"] ?? ""
-    guard let candidatePath = candidate.asString else { throw JSError.type("The \"path\" argument must be of type string. Received \(candidate.typeOf)") }
+    guard let candidatePath = candidate.asString else { throw EngineError.type("The \"path\" argument must be of type string. Received \(candidate.typeOf)") }
     let record = path.isAbsolute(candidatePath) ? row["record"] : row["session"]["file"]
     let raw: Value = record.truthy ? orNull { try readFile(record, "utf8") } : .null
-    if !raw.truthy { throw JSError("local target record is missing") }
+    if !raw.truthy { throw EngineError("local target record is missing") }
     let current = try JSON.parse(raw.description)
-    if try recordSemantic(current) !== row["recordSemantic"] { throw JSError("local target record changed before Remote Control archival") }
+    if try recordSemantic(current) !== row["recordSemantic"] { throw EngineError("local target record changed before Remote Control archival") }
     if keepArchived.truthy || current["isArchived"] !== true { return .null }
     let after = Value.spread(current, ["isArchived": false])
     let afterText = jsonText(after)
@@ -389,12 +375,11 @@ func targetActivation(_ row: Value = .undefined, _ keepArchived: Value = .undefi
     ]
 }
 
-// L3791
 func applyActivation(_ activation: Value = .undefined, _ row: Value = .undefined) throws -> Value {
     if !activation.truthy { return .undefined }
-    if Value(sha(try readFile(activation["record"]))) !== activation["beforeSha"] { throw JSError("local target record changed before activation") }
+    if Value(sha(try readFile(activation["record"]))) !== activation["beforeSha"] { throw EngineError("local target record changed before activation") }
     try saveText(activation["record"], .string(jsonText(activation["after"])))
-    if Value(sha(try readFile(activation["record"]))) !== activation["afterSha"] { throw JSError("local target activation verification failed") }
+    if Value(sha(try readFile(activation["record"]))) !== activation["afterSha"] { throw EngineError("local target activation verification failed") }
     row["recordSha"] = activation["afterSha"]
     row["recordSnapshot"] = recordSnapshot(activation["after"])
     row["recordSemantic"] = activation["afterSemantic"]
@@ -407,7 +392,6 @@ func applyActivation(_ activation: Value = .undefined, _ row: Value = .undefined
     return .undefined
 }
 
-// L3807
 func activationProblems(_ receipt: Value = .undefined) throws -> Value {
     let problems = Value.newArray()
     for row in (try spreadable(receipt["remote"] ?? []) + [receipt["remotePending"]]).filter({ $0.truthy }) {
@@ -426,7 +410,6 @@ func activationProblems(_ receipt: Value = .undefined) throws -> Value {
     return problems
 }
 
-// L3822
 func restoreActivations(_ receipt: Value = .undefined) throws -> Value {
     for row in try spreadable(receipt["remote"] ?? []).reversed() {
         let activation = row["activation"]
@@ -434,13 +417,12 @@ func restoreActivations(_ receipt: Value = .undefined) throws -> Value {
         let current = try readJson(activation["record"])
         let semantic = try recordSemantic(current)
         if semantic === activation["beforeSemantic"] { continue }
-        if semantic !== activation["afterSemantic"] { throw JSError("activated target record changed during Undo") }
+        if semantic !== activation["afterSemantic"] { throw EngineError("activated target record changed during Undo") }
         try saveJson(activation["record"], Value.spread(current, ["isArchived": true]))
     }
     return .undefined
 }
 
-// L3834
 func rollbackActivation(_ activation: Value = .undefined, _ row: Value = .undefined) throws -> Value {
     let row: Value = row.isUndefined ? .null : row
     if !activation.truthy { return .undefined }
@@ -448,7 +430,7 @@ func rollbackActivation(_ activation: Value = .undefined, _ row: Value = .undefi
     var current: Value = .null
     do { if raw.truthy, let data = raw.asData { current = try JSON.parse(data) } } catch {}
     let semantic: Value = current.truthy ? try recordSemantic(current) : .null
-    if !(semantic === activation["beforeSemantic"] || semantic === activation["afterSemantic"]) { throw JSError("activated target record changed during recovery") }
+    if !(semantic === activation["beforeSemantic"] || semantic === activation["afterSemantic"]) { throw EngineError("activated target record changed during recovery") }
     let restored = semantic === activation["afterSemantic"] ? Value.spread(current, ["isArchived": true]) : current
     let text: Value = semantic === activation["afterSemantic"] ? .string(jsonText(restored)) : raw
     if semantic === activation["afterSemantic"] { try saveText(activation["record"], text) }
@@ -465,13 +447,11 @@ func rollbackActivation(_ activation: Value = .undefined, _ row: Value = .undefi
     return .undefined
 }
 
-// L3856
 func receiptCloudCheck(_ receipt: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
     for check in (receipt["cloudChecks"] ?? []).elements where try sameAccount(check, cloud).truthy { return check }
     return .null
 }
 
-// L3860
 func clearCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ retain: Value = .undefined) throws -> Value {
     let retain = retain.isUndefined ? Value { _ in false } : retain
     receipt["failed"] = Value(try (receipt["failed"] ?? []).elements.filter { failure in
@@ -494,7 +474,6 @@ func clearCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefine
     return check
 }
 
-// L3879
 func addCloudFailure(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ failure: Value = .undefined) throws -> Value {
     let check = try receiptCloudCheck(receipt, cloud)
     if failure["code"] === "REMOTE_OPEN" && check.truthy {
@@ -503,7 +482,6 @@ func addCloudFailure(_ receipt: Value = .undefined, _ cloud: Value = .undefined,
     return .undefined
 }
 
-// L3885
 func finishCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefined, _ later: Value = .undefined, _ waiting: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let later: Value = later.isUndefined ? [] : later
     let waiting: Value = waiting.isUndefined ? [] : waiting
@@ -525,9 +503,9 @@ func finishCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefin
     let open = try failures.filter { try !kept.call($0).truthy }
     check["attemptEngine"] = try artifactEngine()
     check["attemptBudget"] = budget
-    if !open.isEmpty && open.allSatisfy({ $0["code"] === "CLOUD_AUTH_PENDING" }) { check["authRetries"] = Value(jsNumber(check["authRetries"] ?? 0) + 1) }
+    if !open.isEmpty && open.allSatisfy({ $0["code"] === "CLOUD_AUTH_PENDING" }) { check["authRetries"] = Value(toNumber(check["authRetries"] ?? 0) + 1) }
     else { check.removeKey("authRetries") }
-    let byId = JSMap()
+    let byId = ValueMap()
     for row in try spreadable(check["waiting"] ?? []) + spreadable(waiting) { byId.set(row["id"], row) }
     check["waiting"] = Value(byId.values)
     if !open.isEmpty {
@@ -549,12 +527,10 @@ func finishCloudAttempt(_ receipt: Value = .undefined, _ cloud: Value = .undefin
     return check
 }
 
-// L3913
 func cloudProgress(_ receipt: Value = .undefined, _ cloud: Value = .undefined) throws -> Value {
     Value.spread(["moved": Value(receipt["sessions"].length)], try sourceProgress(cloud["source"]))
 }
 
-// L3915
 func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ save: Value = .undefined, _ report: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     let matches = (inv["cloud"]["matches"] ?? []).elements.filter { !$0["target"]["failed"].truthy }
@@ -601,9 +577,9 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
             lastEventAt = current["marker"]
             stateSha = current["stateSha"]
             let currentConversation = try conversationFromRows(current["rows"])
-            if Value(sha(stable(currentConversation))) !== match["conversationSha"] { throw JSError("Remote Control history changed since inventory") }
+            if Value(sha(stable(currentConversation))) !== match["conversationSha"] { throw EngineError("Remote Control history changed since inventory") }
         } catch {
-            let error = jsErrorValue(error)
+            let error = errorObject(error)
             try addCloudFailure(receipt, inv["cloud"], ["id": match["session"]["id"], "title": match["session"]["title"], "error": error["message"], "code": try memoryErrorCode(error), "localId": match["target"]["id"]])
             archived += 1
             try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
@@ -614,7 +590,7 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
             let keep = match["target"]["kind"] === "existing" && receipt["sessions"].elements.contains { $0["record"] === row["session"]["file"] && !$0["archived"].truthy }
             activation = try targetActivation(row, Value(keep))
         } catch {
-            let error = jsErrorValue(error)
+            let error = errorObject(error)
             try addCloudFailure(receipt, inv["cloud"], ["id": match["session"]["id"], "title": match["session"]["title"], "error": error["message"], "code": try memoryErrorCode(error), "localId": match["target"]["id"]])
             archived += 1
             try progress(report, "cloud", Value(archived), total, try cloudProgress(receipt, inv["cloud"]))
@@ -628,8 +604,8 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
             try applyActivation(pending["activation"], row)
             try save.call()
             let current = try stableRemoteRows(cloud, pending["id"])
-            if current["marker"] !== pending["lastEventAt"] { throw JSError("Remote Control history changed before archival") }
-            if current["stateSha"] !== pending["stateSha"] { throw JSError("Remote Control history or input changed before archival") }
+            if current["marker"] !== pending["lastEventAt"] { throw EngineError("Remote Control history changed before archival") }
+            if current["stateSha"] !== pending["stateSha"] { throw EngineError("Remote Control history or input changed before archival") }
             if retained.truthy {
                 var changed = !(try retainedUnchanged())
                 if !changed {
@@ -637,26 +613,26 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
                         ? try targetChanges(row, try workers(), true).length > 0
                         : !(try untouched(row, try workers())).truthy
                 }
-                if changed { throw JSError("Retained local history changed before Remote Control archival") }
+                if changed { throw EngineError("Retained local history changed before Remote Control archival") }
             }
             if match["target"]["matchMode"] === "artifacts" {
                 let events = try remoteEvents(current["rows"])
-                if Value(sha(stable(events))) !== match["target"]["artifactSignature"] { throw JSError(try artifactError("remote event identities changed before archival")) }
+                if Value(sha(stable(events))) !== match["target"]["artifactSignature"] { throw EngineError(try artifactError("remote event identities changed before archival")) }
                 let intact: Bool = row["targetId"].truthy ? try targetChanges(row, try workers(), true).length == 0 : try untouched(row, try workers()).truthy
-                if !intact { throw JSError(try artifactError("local target changed before archival")) }
+                if !intact { throw EngineError(try artifactError("local target changed before archival")) }
                 let proof = try supplementalCoverage(events, match["target"]["row"], inv["cloud"]["artifacts"])
-                if !proof.truthy || stable(proof["artifactCounts"]) != stable(match["target"]["artifactCounts"]) { throw JSError(try artifactError("the selected local artifacts no longer cover the remote history")) }
+                if !proof.truthy || stable(proof["artifactCounts"]) != stable(match["target"]["artifactCounts"]) { throw EngineError(try artifactError("the selected local artifacts no longer cover the remote history")) }
             }
             attempted = true
             try cloud["archive"].call(pending["id"])
             let after = try waitRemote(cloud, pending["id"], ["archived"])
-            if after["status"] !== "archived" { throw JSError("Remote Control archive verification returned \(after["status"] ?? "unknown")") }
+            if after["status"] !== "archived" { throw EngineError("Remote Control archive verification returned \(after["status"] ?? "unknown")") }
             if receipt["remote"].nullish { receipt["remote"] = [] }
             receipt["remote"].push(pending)
             receipt.removeKey("remotePending")
             try save.call()
         } catch {
-            let error = jsErrorValue(error)
+            let error = errorObject(error)
             var rolledBack = false
             if !attempted {
                 do {
@@ -681,39 +657,32 @@ func archiveCloud(_ inv: Value = .undefined, _ receipt: Value = .undefined, _ sa
     return .undefined
 }
 
-// L4016
 func cloudIdentity(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let active = try options["active"] ?? signedIn(paths, options["processes"])
     return !options["active"].truthy && active["state"] === "unknown" && options["cloud"].truthy && !options["cloud"].isFunction ? options["cloud"] : active
 }
-// L4020
 func cloudScope(_ supplied: Value = .undefined, _ source: Value = .undefined) throws -> Value {
     if !supplied.truthy || supplied.isFunction { return true }
     return try sameAccount(supplied, source)
 }
-// L4021
 func cloudAttemptAt(_ receipt: Value = .undefined, _ source: Value = .undefined) throws -> Value {
     let key = "\(source["account"])/\(source["org"])", at = receipt["cloudAttempts"][key] ?? 0
-    return isFiniteNumber(at) && jsNumber(at) >= 0 ? at : 0
+    return isFiniteNumber(at) && toNumber(at) >= 0 ? at : 0
 }
-// L4025
 func unchangedLimit(_ source: Value = .undefined, _ row: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
     guard try source["attemptEngine"] === artifactEngine(), try (row["limitEngine"] ?? source["attemptEngine"]) === artifactEngine() else { return false }
     if row["code"] === "CLOUD_HISTORY_LIMIT" { return true }
     return Value(try source["attemptBudget"] === memorySignature(memory) && (row["limitBudget"] ?? source["attemptBudget"]) === memorySignature(memory))
 }
-// L4027
 func limitedFailure(_ source: Value = .undefined, _ row: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
     let codes: [Value] = ["CLOUD_HISTORY_LIMIT", "CLOUD_BUDGET_LIMIT", "CLOUD_PARSER_LIMIT"]
     return Value(try codes.contains(row["code"]) && unchangedLimit(source, row, memory).truthy)
 }
-// L4028
 func budgetRetryRows(_ source: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
     let deferred = (source["waiting"] ?? []).elements.filter { $0["code"] === "CLOUD_MEMORY_DEFERRED" }
     let budget = try (source["failures"] ?? []).elements.filter { try $0["code"] === "CLOUD_MEMORY_BUDGET" && unchangedLimit(source, $0, memory).truthy }
     return Value(deferred + budget)
 }
-// L4032
 func historyLimited(_ source: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
     let memory = memory.isUndefined ? try operationMemory() : memory
     let first = Value(!source["waiting"]["length"].truthy)
@@ -722,36 +691,32 @@ func historyLimited(_ source: Value = .undefined, _ memory: Value = .undefined) 
     if !failuresLength.truthy { return failuresLength }
     return Value(try source["failures"].elements.allSatisfy { try limitedFailure(source, $0, memory).truthy })
 }
-// L4033
 func cloudRetryAt(_ receipt: Value = .undefined, _ source: Value = .undefined, _ active: Value = .undefined, _ now: Value = .undefined, _ memory: Value = .undefined) throws -> Value {
     let now: Value = now.isUndefined ? Value(dateNow()) : now
     let memory = memory.isUndefined ? try operationMemory() : memory
     if try historyLimited(source, memory).truthy { return .null }
     let last = try cloudAttemptAt(receipt, source)
     let auth = and(source["failures"]["length"], Value(source["failures"].elements.allSatisfy { $0["code"] === "CLOUD_AUTH_PENDING" }))
-    if !last.truthy || jsNumber(last) > jsNumber(now) { return now }
+    if !last.truthy || toNumber(last) > toNumber(now) { return now }
     if auth.truthy, try sameLogin(source, active).truthy, active["at"].truthy, source["loginAt"] !== active["at"] { return now }
-    let shortWait = auth.truthy && jsNumber(source["authRetries"] ?? 0) <= 2
-    return Value(jsNumber(last) + (shortWait ? 15_000 : 60_000))
+    let shortWait = auth.truthy && toNumber(source["authRetries"] ?? 0) <= 2
+    return Value(toNumber(last) + (shortWait ? 15_000 : 60_000))
 }
 
-// L4041
 func sourceCloud(_ paths: Value = .undefined, _ source: Value = .undefined, _ supplied: Value = .undefined) throws -> Value {
     let cloud = supplied.isFunction
         ? try supplied.call(Value.spread(try accountRef(source), ["label": try accountLabel(source)]))
         : try supplied ?? cloudClient(paths, source)
-    if !(try sameAccount(cloud, source)).truthy { throw JSError("Cloud client does not match the recorded source \(try accountLabel(source))") }
+    if !(try sameAccount(cloud, source)).truthy { throw EngineError("Cloud client does not match the recorded source \(try accountLabel(source))") }
     return cloud
 }
 
-// L4047
 func receiptCloud(_ receipt: Value = .undefined, _ paths: Value = .undefined, _ supplied: Value = .undefined) throws -> Value {
     let row = receipt["remotePending"] ?? receipt["remote"][0]
     if !row.truthy { return .null }
     return try sourceCloud(paths, row, supplied)
 }
 
-// L4053
 func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? [:] : options
     if !receipt["remoteUndoing"]["length"].truthy { return ["problems": [], "pending": []] }
@@ -759,25 +724,25 @@ func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ 
     var errorMessage: Value = .undefined
     let problems = Value.newArray()
     let active = try cloudIdentity(paths, options)
-    let bySource = JSMap()
+    let bySource = ValueMap()
     for row in receipt["remoteUndoing"].elements where try sameLogin(row, active).truthy && cloudScope(options["cloud"], row).truthy {
         bySource.set(.string("\(row["account"])/\(row["org"])"), row)
     }
     for source in bySource.values {
         let cloud: Value
         do { cloud = try sourceCloud(paths, source, options["cloud"]) }
-        catch { errorMessage = jsErrorValue(error)["message"]; continue }
+        catch { errorMessage = errorObject(error)["message"]; continue }
         for row in try receipt["remoteUndoing"].elements.filter({ try sameAccount($0, source).truthy }) {
             do {
                 let current = try cloud["session"].call(row["id"])
                 if current["status"] === "archived" { try cloud["unarchive"].call(row["id"]) }
                 let after = try waitRemote(cloud, row["id"], ["active", "paused"])
-                if !setHas(REMOTE_OPEN, after["status"]) { throw JSError("Remote Control unarchive verification returned \(after["status"] ?? "unknown")") }
+                if !setHas(REMOTE_OPEN, after["status"]) { throw EngineError("Remote Control unarchive verification returned \(after["status"] ?? "unknown")") }
                 receipt["remoteUndoing"] = Value(receipt["remoteUndoing"].elements.filter { $0 !== row })
                 restored += 1
                 try saveJson(file, receipt)
             } catch {
-                let caught = jsErrorValue(error)
+                let caught = errorObject(error)
                 problems.push(.string("\(row["title"]) | \(caught["message"])"))
             }
         }
@@ -794,15 +759,14 @@ func restoreRemote(_ receipt: Value = .undefined, _ file: Value = .undefined, _ 
     return Value.spread(result, errorMessage.truthy ? ["error": errorMessage] : [:])
 }
 
-// L4086
 func unitsOf(_ rows: Value = .undefined) throws -> Value {
-    let keys = JSMap()
+    let keys = ValueMap()
     for row in rows.elements {
         for member in (row["members"] ?? Value([row])).elements {
             keys.set(.string("\(member["account"]["account"])/\(member["account"]["org"])/\(member["record"]["sessionId"])"), row)
         }
     }
-    let root = JSMap(rows.elements.map { ($0, $0) })
+    let root = ValueMap(rows.elements.map { ($0, $0) })
     func findRoot(_ row: Value) -> Value { root.get(row) === row ? row : findRoot(root.get(row)) }
     for row in rows.elements {
         for member in (row["members"] ?? Value([row])).elements {

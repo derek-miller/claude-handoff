@@ -29,13 +29,13 @@ extension Engine.Receipts {
                 if b == target {
                     publications += 1
                     if scenario == "changed target" { try writeJSON(b, .spread(try readJSON(b), ["title": "Changed by another owner"])) }
-                    throw JSError("Synthetic interrupted publication")
+                    throw EngineError("Synthetic interrupted publication")
                 }
             }
             fs.rename = { a, b in
                 if scenario.contains("rollback") && a == target {
                     rollbacks += 1
-                    if !scenario.hasSuffix("after retry") || publications == 2 { throw JSError("Synthetic rollback failure") }
+                    if !scenario.hasSuffix("after retry") || publications == 2 { throw EngineError("Synthetic rollback failure") }
                 }
                 try rename(a, b)
             }
@@ -43,7 +43,7 @@ extension Engine.Receipts {
                 if Engine.Receipts.arg(args, 0) == "recovery" { attempts += 1 }
                 return .undefined
             }])
-            fs = NodeFS()
+            fs = FileSystem()
             let retried = scenario.hasSuffix("after retry")
             eq(attempts, retried ? 1 : 0, scenario)
             eq(publications, retried ? 2 : 1, scenario)
@@ -122,14 +122,14 @@ extension Engine.Receipts {
                 if file != h.targetFile || !scenario.hasPrefix("E") { return try original(file) }
                 removals += 1
                 if scenario == "ENOENT" { try original(file) }
-                throw jsThrow("fixture registry removal failure", code: scenario)
+                throw makeError("fixture registry removal failure", code: scenario)
             }
             if scenario == "EACCES" {
                 throwsError(where: ["code": Value(scenario), "message": "fixture registry removal failure"]) { try undo(h.paths, ["processes": []]) }
             } else {
                 undone = try undo(h.paths, ["processes": []])
             }
-            fs = NodeFS()
+            fs = FileSystem()
             if scenario.hasPrefix("E") { eq(removals, 1, scenario) }
             if scenario == "EACCES" {
                 eq(try readData(h.targetFile), target)
@@ -197,7 +197,7 @@ extension Engine.Receipts {
                 }
             }
             let result = phase == "publication" ? try executeMove([from], to, h.paths, ["processes": []]) : try undo(h.paths, ["processes": []])
-            fs = NodeFS()
+            fs = FileSystem()
             #expect(injected, "\(phase)")
             deq(try readJSON(h.targetFile).duringWrite, ["preserved": true], phase)
             if phase == "publication" {
@@ -324,7 +324,7 @@ extension Engine.Receipts {
                     else { try h.record("T", later, rehomeRecord(["isArchived": true, "forkedFromSessionId": Value("local_\(SOURCE)")])) }
                 }
                 let refused = try undo(h.paths)
-                fs = NodeFS()
+                fs = FileSystem()
                 #expect(injected, "\(label)")
                 eq(refused.dest, .undefined, label)
                 match(refused.restoreProblems[0], unreadable ? "unreadable Desktop record:" : "parent Desktop record would be removed by Undo")
@@ -383,11 +383,11 @@ extension Engine.Receipts {
                 foreignBytes = try readData(foreignFile)
             }
             let refused = try undo(h.paths)
-            fs = NodeFS()
+            fs = FileSystem()
             #expect(injected, "\(change)")
             eq(refused.dest, .undefined, change)
             match(refused.restoreProblems[0], "parent Desktop record would be removed by Undo")
-            if change != "source fork" { ok(refused.restoreProblems.some { JSRegExp.cached("restore path occupied|recovery artifact changed").test($0.str) }, change) }
+            if change != "source fork" { ok(refused.restoreProblems.some { TextPattern.cached("restore path occupied|recovery artifact changed").test($0.str) }, change) }
             eq(try readData(foreignFile), foreignBytes, "\(change)")
             for (file, bytes) in originals { eq(try readData(file), (file == foreignFile ? foreignBytes : bytes), "\(change) \(file)") }
             for (file, bytes) in destination { eq(try readData(file), (file == foreignFile ? foreignBytes : bytes), "\(change) \(file)") }
@@ -443,7 +443,7 @@ extension Engine.Receipts {
                 eq(kept.forkedFromSessionId, Value("local_\(SOURCE)"), label)
                 eq(kept.isArchived, true, label)
                 if location == "T" { ok(try undo(h.paths).dest, label) }
-                fs = NodeFS()
+                fs = FileSystem()
             }
         }
     }
@@ -618,7 +618,7 @@ extension Engine.Receipts {
             throwsError("fixture interrupted publication") {
                 try move(inv, to, h.paths, fn { args in
                     reported.append(["stage": Engine.Receipts.arg(args, 0), "text": Engine.Receipts.arg(args, 1), "progress": Engine.Receipts.arg(args, 2)])
-                    if Engine.Receipts.arg(args, 0) == "move" && Engine.Receipts.arg(args, 2).completed == 1 { throw JSError("fixture interrupted publication") }
+                    if Engine.Receipts.arg(args, 0) == "move" && Engine.Receipts.arg(args, 2).completed == 1 { throw EngineError("fixture interrupted publication") }
                     return .undefined
                 })
             }
@@ -762,8 +762,8 @@ extension Engine.Receipts {
                 links.append((file: file, destination: destination, inode: inode))
             }
         }
-        let physicalExternal = try NodeFS.nativeRealpath(external)
-        let physicalLinks = try links.map { path.join(try NodeFS.nativeRealpath(path.dirname($0.file)), path.basename($0.file)) }
+        let physicalExternal = try FileSystem.nativeRealpath(external)
+        let physicalLinks = try links.map { path.join(try FileSystem.nativeRealpath(path.dirname($0.file)), path.basename($0.file)) }
         let check = { (file: String, key: String) in
             ok(!file.hasPrefix(external), "external target \(key)")
             ok(!links.contains { $0.file == file } && !physicalLinks.contains(file), "link target \(key)")
@@ -778,9 +778,9 @@ extension Engine.Receipts {
         eq(moved.ok, true, JSON.text(moved.receipt.failed))
         deq(moved.receipt.sessions.map { $0.id }, [Value(SOURCE), Value(child)])
         ok(try undo(h.paths).dest)
-        fs = NodeFS()
+        fs = FileSystem()
         for link in links {
-            eq(String(decoding: try NodeFS.nativeReadlink(link.file), as: UTF8.self), link.destination)
+            eq(String(decoding: try FileSystem.nativeReadlink(link.file), as: UTF8.self), link.destination)
             eq(try lstat(link.file).ino, link.inode)
         }
     }
@@ -792,7 +792,7 @@ extension Engine.Receipts {
         try h.record("P", SOURCE, rehomeRecord())
         try mkdirp(dir)
         try writeData(file, data)
-        let detail = try NodeFS.nativeStat(file, true, follow: true)
+        let detail = try FileSystem.nativeStat(file, true, follow: true)
         let signature = [detail.dev, detail.ino, detail.size, detail.mtimeNs, detail.ctimeNs].map { $0.description }.joined(separator: ":")
         let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
         let inv = try inventory([from], to, h.paths, NOOP, ["processes": []])
@@ -817,7 +817,7 @@ extension Engine.Receipts {
             eq(moved.ok, true, JSON.text(moved.receipt.failed))
             eq(moved.receipt.sessions[0].targetTranscript, Value(transcript))
             eq(moved.receipt.sessions[0].record, Value(h.recordFile("Z", SOURCE)))
-            eq(moved.receipt.sessions[0].sidecars.canonicalRoot, Value(path.join(try NodeFS.nativeRealpath(physical), SOURCE)))
+            eq(moved.receipt.sessions[0].sidecars.canonicalRoot, Value(path.join(try FileSystem.nativeRealpath(physical), SOURCE)))
             if legacy {
                 moved.receipt.sessions[0].sidecars.removeKey("canonicalRoot")
                 try writeJSON(moved.file.str, moved.receipt)
@@ -825,7 +825,7 @@ extension Engine.Receipts {
             ok(try undo(h.paths, ["processes": []]).dest, "\(legacy)")
             eq(try readData(transcript), before)
             eq(try readData(path.join(h.project, SOURCE, "ordinary")), data)
-            eq(String(decoding: try NodeFS.nativeReadlink(path.join(h.project, SOURCE, "dangling")), as: UTF8.self), "absent")
+            eq(String(decoding: try FileSystem.nativeReadlink(path.join(h.project, SOURCE, "dangling")), as: UTF8.self), "absent")
         }
     }
 }

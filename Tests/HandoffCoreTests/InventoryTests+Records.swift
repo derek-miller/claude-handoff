@@ -205,7 +205,7 @@ extension Engine.Inventory {
             if scenario == "denied target" {
                 let target = h.dir("T")
                 fs.readdir = { dir in
-                    if dir == target { throw jsThrow("fixture target access denied", code: "EACCES") }
+                    if dir == target { throw makeError("fixture target access denied", code: "EACCES") }
                     return try original(dir)
                 }
             }
@@ -231,7 +231,7 @@ extension Engine.Inventory {
         ok(result.summary.notMoved.some { $0.sessionId.str == f.recordId })
         let (from, to) = try h.selection()
         let inv = try inventory([from], to, h.paths, NOOP, ["processes": []])
-        ok(inv.blocked.some { $0.id.str == f.investor && JSRegExp.cached("unparseable lines").test($0.error.str) })
+        ok(inv.blocked.some { $0.id.str == f.investor && TextPattern.cached("unparseable lines").test($0.error.str) })
         ok(!inv.move.some { $0.id.str == f.investor })
         #expect(try readData(transcript) == before)
         #expect(try readData(f.investorFile) == source)

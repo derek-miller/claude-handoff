@@ -5,7 +5,7 @@ import Testing
 extension Engine.Restarts {
     // The receipt in the state directory (the only one these fixtures write).
     static func receiptFile(_ h: Home) throws -> String {
-        let name = try readdir(h.paths.state.str).first { JSRegExp.cached(#"^\d.*\.json$"#).test($0) }!
+        let name = try readdir(h.paths.state.str).first { TextPattern.cached(#"^\d.*\.json$"#).test($0) }!
         return path.join(h.paths.state.str, name)
     }
 

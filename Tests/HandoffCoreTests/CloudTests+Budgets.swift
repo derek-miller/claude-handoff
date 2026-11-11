@@ -67,7 +67,7 @@ extension Engine.Cloud {
         var calls = 0, unavailable = false
         let fallback = try memoryBudget(.spread(io, ["pressure": fn { _ in
             calls += 1
-            if unavailable { throw JSError("sysctl unavailable") }
+            if unavailable { throw EngineError("sysctl unavailable") }
             return 2
         }]))
         try fallback.check.call(1024)
@@ -102,7 +102,7 @@ extension Engine.Cloud {
         ok(!refused.isUndefined, "the second read never ran while the first held its reservation")
         eq(first, Value(String(repeating: "x", count: 150)))
         usageCalls = 0
-        during = { throw JSError(Value.spread(jsErrorValue(JSError.range("synthetic string limit")), ["code": "ERR_STRING_TOO_LONG"])) }
+        during = { throw EngineError(Value.spread(errorObject(EngineError.range("synthetic string limit")), ["code": "ERR_STRING_TOO_LONG"])) }
         throwsError(where: ["code": "CLOUD_PARSER_LIMIT"]) {
             try budget.read.call(["body": [Value(Data(("\"" + String(repeating: "x", count: 150)).utf8)), Value(Data("\"".utf8))]])
         }
@@ -226,7 +226,7 @@ extension Engine.Cloud {
         let options = Value.spread(f.options, ["cloud": fn { args in
             if args[0].org.str == f.rows[0].org {
                 failures += 1
-                throw jsThrow("Synthetic budget exhausted", code: "CLOUD_MEMORY_BUDGET")
+                throw makeError("Synthetic budget exhausted", code: "CLOUD_MEMORY_BUDGET")
             }
             return try f.client.call(args[0])
         }])
@@ -276,7 +276,7 @@ extension Engine.Cloud {
             let id = args[0].str
             trace.append(id)
             if retrying && id == f.rows[0].id { competingHistory = true }
-            if retrying && id == f.rows[1].id && competingHistory { throw jsThrow("Synthetic earlier history used this operation budget", code: "CLOUD_MEMORY_BUDGET") }
+            if retrying && id == f.rows[1].id && competingHistory { throw makeError("Synthetic earlier history used this operation budget", code: "CLOUD_MEMORY_BUDGET") }
             return try read.call(args[0])
         }
         let first = try finishPending(f.h.paths, f.options), scope = first.receipt.cloudChecks[0].sessionIds
@@ -305,7 +305,7 @@ extension Engine.Cloud {
         f.cloud.eventRows = fn { args in
             let id = args[0].str
             if retrying && id == f.rows[0].id { spent = true }
-            if retrying && id == f.rows[1].id && spent { throw jsThrow("Synthetic budget was already consumed", code: "CLOUD_MEMORY_BUDGET") }
+            if retrying && id == f.rows[1].id && spent { throw makeError("Synthetic budget was already consumed", code: "CLOUD_MEMORY_BUDGET") }
             return try read.call(args[0])
         }
         _ = try finishPending(f.h.paths, f.options)
@@ -377,7 +377,7 @@ extension Engine.Cloud {
                 return try read.call(args[0])
             }
             f.memory.check = fn { () in
-                if exhausted { throw jsThrow("Synthetic post-analysis budget exhaustion", code: "CLOUD_MEMORY_BUDGET") }
+                if exhausted { throw makeError("Synthetic post-analysis budget exhaustion", code: "CLOUD_MEMORY_BUDGET") }
             }
             retrying = true; clock.now += 60000
             let limited = try finishPending(f.h.paths, f.options)
@@ -406,7 +406,7 @@ extension Engine.Cloud {
             let rows = try read.call(args[0])
             if ready && thrown == 0 && args[0].str == f.rows[0].id && f.rows[0].reads == 3 {
                 thrown += 1
-                let error = JSError.range("Invalid string length")
+                let error = EngineError.range("Invalid string length")
                 eq(error.code, .undefined)
                 throw error
             }

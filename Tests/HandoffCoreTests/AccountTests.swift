@@ -105,7 +105,7 @@ extension Engine {
         func identityOffline() throws {
             let h = try home(), f = try identityFixture(h)
             var calls = 0
-            cloudFetch = { _ in calls += 1; throw JSError("offline") }
+            cloudFetch = { _ in calls += 1; throw EngineError("offline") }
             let desktop = Value.newObject()
             desktop["lastKnownAccountUuid"] = Value(h.acct.P)
             desktop["dxt:allowlistLastUpdated:\(h.org.P)"] = Value(isoNow())

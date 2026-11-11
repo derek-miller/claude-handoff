@@ -1,6 +1,6 @@
 import Foundation
 
-// node:path (posix).
+// POSIX path joining, normalization and splitting.
 public enum path {
     public static let sep = "/"
 

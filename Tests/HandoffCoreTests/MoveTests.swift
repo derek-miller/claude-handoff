@@ -269,7 +269,7 @@ extension Engine {
             }
             let stale = try finishPending(f.h.paths, ["processes": f.identity.processes, "cloud": cloudFixture(f.h, ["account": Value(f.h.acct.T), "list": fn { _ in
                 Issue.record("stale client must not run")
-                throw JSError("stale client must not run")
+                throw EngineError("stale client must not run")
             }])])
             eq(stale.pending, true)
             #expect(try readData(f.moved.file.str) == before)

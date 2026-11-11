@@ -1,18 +1,15 @@
 import Foundation
 
-// engine.js lines 4097-4645: transfer, transferRecords, finishPending, keepLocal, move.
+// Transfers, record transfers, finishing pending work, Keep local and the move itself.
 
-// `f?.(...args)`: call when f is not null/undefined.
 @discardableResult
 fileprivate func optCall(_ f: Value, _ args: Value...) throws -> Value {
     if f.nullish { return .undefined }
     return try f.callArgs(args)
 }
 
-// Math.round
-fileprivate func jsRound(_ x: Double) -> Double { (x + 0.5).rounded(.down) }
+fileprivate func roundHalfUp(_ x: Double) -> Double { (x + 0.5).rounded(.down) }
 
-// L4097
 func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
     var context = context.isUndefined ? Value.newObject() : context
     context = Value.spread(context, [
@@ -22,8 +19,8 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
     ] as Value)
     let file: Value = context.existing["file"] ?? .string(path.join(paths.state.description, "\(context.at).json"))
     if context.restart.truthy {
-        let batches = JSMap(), grouped = JSMap()
-        for family in JSSet(inv.move.elements.map { $0.taskFamily }.filter { $0.truthy }).values {
+        let batches = ValueMap(), grouped = ValueMap()
+        for family in ValueSet(inv.move.elements.map { $0.taskFamily }.filter { $0.truthy }).values {
             let pair: Value = .string("\(family.sourceFile)\n\(family.targetFile)")
             var batch = batches.get(pair)
             if !batch.truthy {
@@ -33,9 +30,9 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
             for key in ["ids", "recordIds", "files", "links", "routes"] { batch[key].asArray?.items.append(contentsOf: family[key].elements) }
             grouped.set(family, batch)
         }
-        for row in JSSet(inv.move.elements + inv.sources.elements).values where grouped.has(row.taskFamily) { row.taskFamily = grouped.get(row.taskFamily) }
+        for row in ValueSet(inv.move.elements + inv.sources.elements).values where grouped.has(row.taskFamily) { row.taskFamily = grouped.get(row.taskFamily) }
     }
-    let families: [Value] = JSSet(inv.move.elements.map { $0.taskFamily }.filter { $0.truthy }).values
+    let families: [Value] = ValueSet(inv.move.elements.map { $0.taskFamily }.filter { $0.truthy }).values
     let firstCount: Value = context.existing["receipt"]["sessions"]["length"] ?? 0
     let firstSuperseded: Value = context.existing["receipt"]["superseded"]["length"] ?? 0
     let emptyCloud: Value = ["checked": false, "matches": [], "blocked": [], "waiting": [], "later": []]
@@ -50,15 +47,15 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
     let held = Value(heldItems)
     let totals: Value = ["move": Value(inv.move.length), "verify": Value(inv.move.length), "retire": Value(inv.sources.length)]
     let completed: Value = ["move": 0, "verify": 0, "retire": 0]
-    let details = JSMap()
+    let details = ValueMap()
     let unitReport: (Bool) -> Value = { final in
         let before = Value.spread(completed)
         return Value { args in
             let stage = args.count > 0 ? args[0] : .undefined, text = args.count > 1 ? args[1] : .undefined, extra = args.count > 2 ? args[2] : .undefined
             if !extra["live"].truthy { details.set(stage, text); return .undefined }
             if totals.hasOwn(stage.description) {
-                if jsNumber(extra.total) > 0 { completed[stage] = Value(jsNumber(before[stage]) + jsNumber(extra.completed)) }
-                if !extra.completed.isUndefined && (stage === "move" ? jsNumber(extra.total) > 0 : final) {
+                if toNumber(extra.total) > 0 { completed[stage] = Value(toNumber(before[stage]) + toNumber(extra.completed)) }
+                if !extra.completed.isUndefined && (stage === "move" ? toNumber(extra.total) > 0 : final) {
                     _ = try progress(report, stage, completed[stage], totals[stage], ["activity": stage, "sourceId": extra.sourceId, "sourceLabel": extra.sourceLabel, "moved": extra.moved])
                 }
             } else if final { try report.call(stage, text, extra) }
@@ -88,13 +85,13 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
             if !last { failed.append(contentsOf: (next["unwound"] ?? []).elements) }
             return next["deferred"].truthy || next["file"].truthy || !result["file"].truthy ? next : result
         } catch {
-            let error = jsErrorValue(error)
-            if error.code === "RESTART_REOPENED" || !context.restart.truthy && !family.truthy { throw JSError(error) }
+            let error = errorObject(error)
+            if error.code === "RESTART_REOPENED" || !context.restart.truthy && !family.truthy { throw EngineError(error) }
             try optCall(context.progress)
             var receipt: Value
             do { receipt = try readReceipt(file) } catch {
-                let e = jsErrorValue(error)
-                if e.code !== "ENOENT" { throw JSError(e) }
+                let e = errorObject(error)
+                if e.code !== "ENOENT" { throw EngineError(e) }
                 receipt = .null
             }
             if !last { failed.append(contentsOf: files) }
@@ -114,9 +111,9 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
                 _ = try saveJson(file, receipt)
                 var recovered: Value = .undefined
                 do { recovered = try reconcileFiles(paths, ["receiptFile": file, "inspect": inv.inspect, "check": context.check]) }
-                catch { return try blocked(jsErrorValue(error)["message"]) }
+                catch { return try blocked(errorObject(error)["message"]) }
                 after = try readReceipt(file)
-                if try needsRecovery(after).truthy || jsNumber(after.retained["length"] ?? 0) > jsNumber(receipt.retained["length"] ?? 0) {
+                if try needsRecovery(after).truthy || toNumber(after.retained["length"] ?? 0) > toNumber(receipt.retained["length"] ?? 0) {
                     return try blocked(or(and(try needsRecovery(after), recovered["error"]), "Unfinished work could not be restored consistently"))
                 }
                 if Value(after.sessions.length) !== checkpoint.sessions || Value(after.superseded.length) !== checkpoint.superseded { return try blocked("Unfinished placement was not fully restored") }
@@ -154,7 +151,7 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
         var target: Value = .undefined
         for row in all.elements where try sameAccount(row, to).truthy { target = row; break }
         if !target.truthy { return try blocked("The destination account disappeared during recovery") }
-        let retrying = JSSet(failed)
+        let retrying = ValueSet(failed)
         var sourcesList: [Value] = []
         for row in all.elements {
             var matched = false
@@ -166,13 +163,13 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
         let next = try inventory(Value(sourcesList), target, paths, report, ["inspect": inv.inspect, "processes": try inv.inspect.call(), "check": context.check])
         context = Value.spread(context, ["sources": next.sources] as Value)
         let coveredFiles = try (next.sources.elements + next.rejected.elements + next.unreadable.elements).map { try desktopFileOf($0) }.filter { retrying.has($0) }
-        let covered = JSSet(coveredFiles)
+        let covered = ValueSet(coveredFiles)
         let keptFailed = result.receipt.failed.elements.filter { row in
             row.cloudAccount.truthy || row.sources.length == 0 || row.sources.elements.contains { source in !covered.has(source.file) }
         }
         result.receipt.failed = Value(keptFailed + (try inventoryFailures(next)).elements)
         var units: [(Value, Value)] = try unitsOf(Value((next.move.elements + next.there.elements).filter { !$0.taskFamily.truthy })).elements.map { ($0, Value.null) }
-        for family in JSSet(next.move.elements.map { $0.taskFamily }.filter { $0.truthy }).values {
+        for family in ValueSet(next.move.elements.map { $0.taskFamily }.filter { $0.truthy }).values {
             units.append((Value(next.move.elements.filter { $0.taskFamily === family }), family))
         }
         for (rows, family) in units {
@@ -214,19 +211,18 @@ func transfer(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Valu
     let tail: Value = [
         "summary": try receiptSummary(receipt), "ok": try receiptOkay(receipt),
         "complete": Value(pendingCloud == 0 && !receipt.held["length"].truthy && !receipt.localStopped.truthy), "pendingCloud": Value(pendingCloud),
-        "pendingLabels": try cloudCheckLabels(receipt), "held": receipt.held, "added": Value(Double(receipt.sessions.length) - jsNumber(firstCount)),
-        "targetChanged": Value(Double(receipt.sessions.length) > jsNumber(firstCount) ||
-            jsArraySlice(receipt.superseded.elements, Int(jsNumber(firstSuperseded))).contains { !$0.source.truthy }),
+        "pendingLabels": try cloudCheckLabels(receipt), "held": receipt.held, "added": Value(Double(receipt.sessions.length) - toNumber(firstCount)),
+        "targetChanged": Value(Double(receipt.sessions.length) > toNumber(firstCount) ||
+            sliceArray(receipt.superseded.elements, Int(toNumber(firstSuperseded))).contains { !$0.source.truthy }),
         "problems": receipt.verification["problems"] ?? [],
     ]
     return Value.spread(result, tail)
 }
 
-// L4248
 func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ context: Value = .undefined) throws -> Value {
     let context = context.isUndefined ? Value.newObject() : context
     try optCall(context.check, true)
-    if context.restart.truthy && inv.cloud["checked"].truthy { throw JSError("Cloud work cannot run inside the restart window") }
+    if context.restart.truthy && inv.cloud["checked"].truthy { throw EngineError("Cloud work cannot run inside the restart window") }
     let deferred = try deferredWorkflow(paths)
     if deferred.truthy && context.existing["file"] !== deferred.file {
         return ["deferred": deferred, "ok": false, "complete": false, "pendingCloud": deferred.mode === "cloud" ? Value(deferred.sources.length) : 0]
@@ -235,7 +231,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     let startedAt: Value = inv.requestedAt ?? .string(isoString(started))
     let at: Value = context.existing["receipt"]["at"] ?? context.at ?? .string(stamp())
     let held: Value = inv.held ?? []
-    let heldFiles = JSSet(held.elements.flatMap { row in row.sources.elements.map { $0.file } })
+    let heldFiles = ValueSet(held.elements.flatMap { row in row.sources.elements.map { $0.file } })
     let unheldFailures: (Value) -> [Value] = { row in
         if row.cloudAccount.truthy || row.sources.length == 0 || ![WORKER_OWNS, PARENT_MISSING, SCHEDULER_OWNS].contains(where: { row.error === .string($0) }) { return [row] }
         let sources = row.sources.elements.filter { !heldFiles.has($0.file) }
@@ -249,7 +245,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
         var cloudChecks: Value = []
         if inv.cloudRequested.truthy {
             let accountsList = (inv.cloudCheckAccounts ?? inv.fromAccounts ?? []).elements + (inv.deferredCloudSources ?? []).elements
-            let map = JSMap(accountsList.map { account in (Value.string("\(account.account)/\(account.org)"), Value.spread(account, ["status": "pending"] as Value)) })
+            let map = ValueMap(accountsList.map { account in (Value.string("\(account.account)/\(account.org)"), Value.spread(account, ["status": "pending"] as Value)) })
             cloudChecks = Value(map.values)
         }
         let r: Value = [
@@ -276,7 +272,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     if context.existing.truthy {
         receipt.appendCheckpoint = ["sessions": Value(receipt.sessions.length), "superseded": Value(receipt.superseded.length),
                                     "taskTransfers": receipt.taskTransfers["length"] ?? 0, "verification": receipt.verification, "held": receipt.held]
-        let retryKeys = JSSet(try (inv.move.elements + inv.there.elements).flatMap { row in try failureIdentity(row).sources.elements.map { try localFailureKey($0) } })
+        let retryKeys = ValueSet(try (inv.move.elements + inv.there.elements).flatMap { row in try failureIdentity(row).sources.elements.map { try localFailureKey($0) } })
         receipt.failed = Value(try receipt.failed.elements.flatMap { row -> [Value] in
             if row.retained.truthy || row.cloudAccount.truthy || row.sources.length == 0 { return [row] }
             let sources = try row.sources.elements.filter { source in !retryKeys.has(try localFailureKey(source)) }
@@ -293,7 +289,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
                 let ids = try source.sessionIds ?? linkedCloudIds(links, source)
                 let prior = try check.sessionIds ?? linkedCloudIds(receipt.cloudLinks, source)
                 if check.status === "complete" && ids.elements.contains(where: { !prior.includes($0) }) { _ = try clearCloudAttempt(receipt, source) }
-                if check.sessionIds.truthy { check.sessionIds = Value(JSSet(check.sessionIds.elements + ids.elements).values) }
+                if check.sessionIds.truthy { check.sessionIds = Value(ValueSet(check.sessionIds.elements + ids.elements).values) }
             }
         }
         receipt.cloudLinks.asArray?.items.append(contentsOf: links.elements)
@@ -311,9 +307,9 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
         let target = try taskSessions(family.targetFile).registry
         let tasks = Value((source["scheduledTasks"] ?? []).elements.filter { task in family.ids.includes(task.id) })
         let routes = defaultSorted(tasks.elements.map { task in Value([task.id, task.notifySessionId ?? .null]) })
-        if stable(Value(routes)) != stable(Value(defaultSorted(family.routes.elements))) { throw JSError("scheduled task family changed since inventory") }
+        if stable(Value(routes)) != stable(Value(defaultSorted(family.routes.elements))) { throw EngineError("scheduled task family changed since inventory") }
         let state = try taskState(source, family.ids), targetState = try taskState(target, family.ids)
-        if try taskStateConflict(state, targetState).truthy { throw JSError("target scheduled task state collision") }
+        if try taskStateConflict(state, targetState).truthy { throw EngineError("target scheduled task state collision") }
         let targetOr: Value = target ?? [:]
         var replaced: [Value] = []
         for (index, task) in (target["scheduledTasks"] ?? []).elements.enumerated() where family.ids.includes(task.id) {
@@ -326,20 +322,20 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
         ]
         let transferRow = Value.spread(family, extra)
         let problems = try taskTransferProblems([transferRow], paths, inv.inspect, true, context.check, context.snapshots)
-        if problems.length > 0 { throw JSError(problems.join(", ")) }
+        if problems.length > 0 { throw EngineError(problems.join(", ")) }
         family.replaced = transferRow.replaced
         receipt.taskTransfers = Value((receipt.taskTransfers ?? []).elements + [transferRow])
         try save.call()
         _ = try writeTaskRegistrations([transferRow], "source", false, paths, inv.inspect, context.check, context.snapshots)
         for row in inv.sources.elements { row.taskOwned = false }
     }
-    let guardSources = JSSet((context.sources ?? inv.sources).elements + inv.move.elements + inv.move.elements.flatMap { s in (s.members ?? []).elements }).values
+    let guardSources = ValueSet((context.sources ?? inv.sources).elements + inv.move.elements + inv.move.elements.flatMap { s in (s.members ?? []).elements }).values
     let rehomeGuard: Value = ["workers": try workers(try inv.inspect.call()), "inspect": inv.inspect, "sources": Value(guardSources), "targets": inv.targets,
                               "taskSessions": Value.newMap(), "created": Value.newMap(), "check": context.check]
-    for taskFile in JSSet(inv.move.elements.map { $0.account.taskFile } + [to.taskFile]).values {
+    for taskFile in ValueSet(inv.move.elements.map { $0.account.taskFile } + [to.taskFile]).values {
         rehomeGuard.taskSessions.put(taskFile, try taskSessions(taskFile))
     }
-    let landedRecordIds = JSSet(to.sessions.elements.map { $0.record.sessionId }.filter { $0.truthy })
+    let landedRecordIds = ValueSet(to.sessions.elements.map { $0.record.sessionId }.filter { $0.truthy })
     _ = try progress(report, "move", 0, Value(inv.move.length))
     let journal: Value = inv.move.length > 0 ? try placementJournal(file, receipt, context.restart.truthy ? .undefined : context.check) : .null
     do {
@@ -350,7 +346,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
             receipt.pending = ["strategy": "rehome", "id": s.id, "title": s.title, "targetId": targetId, "made": .strings(made), "recordSha": .null, "creationRequired": true]
             try journal["save"].call()
             do {
-                if s.record.forkedFromSessionId.truthy && !landedRecordIds.has(s.record.forkedFromSessionId) { throw JSError("parent Desktop record did not move") }
+                if s.record.forkedFromSessionId.truthy && !landedRecordIds.has(s.record.forkedFromSessionId) { throw EngineError("parent Desktop record did not move") }
                 let row = try rehomeOne(s, to, Value { args in
                     let patch = args.count > 0 ? args[0] : .undefined, durable = args.count > 1 ? args[1] : .undefined
                     Value.assign(receipt.pending, patch)
@@ -359,17 +355,17 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
                 receipt.sessions.push(row)
                 if row.targetRecordId.truthy { landedRecordIds.add(row.targetRecordId) }
             } catch {
-                let error = jsErrorValue(error)
-                if error.code === "JOURNAL_WRITE" || error.code === "MOVE_STALLED" || error.code === "RESTART_REOPENED" { throw JSError(error) }
+                let error = errorObject(error)
+                if error.code === "JOURNAL_WRITE" || error.code === "MOVE_STALLED" || error.code === "RESTART_REOPENED" { throw EngineError(error) }
                 if receipt.pending.bridgeAppend.truthy {
                     do { _ = try restoreBridge(receipt.pending, Value { _ in try journal["save"].call(true) }, inv.inspect, false, false) }
-                    catch let recovery { throw JSError(try bridgeError(.string("\(error["message"]). \(jsErrorValue(recovery)["message"])"))) }
+                    catch let recovery { throw EngineError(try bridgeError(.string("\(error["message"]). \(errorObject(recovery)["message"])"))) }
                 }
                 let raw: Value = (try? readFile(.string(made[0]))) ?? .null
                 let created = rehomeGuard.created.get(.string(made[0]))
                 let found: Value = (try? fs.stat(made[0])) ?? .null
                 if raw.truthy && created.truthy && found["dev"] === created.dev && found["ino"] === created.ino {
-                    if Value.string(sha(raw)) !== receipt.pending.recordSha { throw JSError(error) }
+                    if Value.string(sha(raw)) !== receipt.pending.recordSha { throw EngineError(error) }
                     _ = try quarantine(.strings(made), .string(path.join(paths.state.description, "quarantine", at.description, "failed")))
                 }
                 receipt.failed.push(Value.spread(["id": s.id, "title": s.title, "error": error["message"]] as Value, try failureIdentity(s)))
@@ -385,7 +381,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     if !journal.nullish { try journal["close"].call() }
     if !journal.nullish { try journal["compact"].call() }
     try optCall(context.check, true)
-    let verified = try verify(Value(jsArraySlice(receipt.sessions.elements, previousCount)), report, context.check)
+    let verified = try verify(Value(sliceArray(receipt.sessions.elements, previousCount)), report, context.check)
     let ok = verified.ok, lines = verified.lines, problems = verified.problems
     let priorProblems: Value = context.existing.truthy ? receipt.appendCheckpoint.verification["problems"] ?? [] : []
     receipt.verification = [
@@ -395,13 +391,13 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     try save.call()
     if family.truthy {
         let problems = try taskTransferProblems(try recoveryFamilies(receipt), paths, inv.inspect, true, context.check, context.snapshots)
-        if problems.length > 0 { throw JSError(problems.join(", ")) }
+        if problems.length > 0 { throw EngineError(problems.join(", ")) }
     }
     let retained = try retire(inv, to, receipt, paths, at, problems, save, report, context.check, context.snapshots)
     var unwound: [Value] = []
     if family.truthy {
         let retired = try retiredFiles(receipt)
-        if !ok.truthy || inv.sources.elements.contains(where: { !retired.has($0.file) }) { throw JSError("scheduled task family did not move completely") }
+        if !ok.truthy || inv.sources.elements.contains(where: { !retired.has($0.file) }) { throw EngineError("scheduled task family did not move completely") }
         let transfers = Value(receipt.taskTransfers.elements.filter { $0.key === family.key })
         _ = try writeTaskRegistrations(transfers, "target", true, paths, inv.inspect, context.check, context.snapshots)
         let tasks = transfers[0].tasks
@@ -409,10 +405,10 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
         for row in receipt.sessions.elements.filter({ $0.taskFamily === family.key }) {
             row.taskOwned = Value(tasks.elements.contains { $0.notifySessionId === row.targetRecordId })
             try optCall(context.check)
-            if try targetChanges(row, liveWorkers, false).length > 0 { throw JSError("scheduled task family target changed during publication") }
+            if try targetChanges(row, liveWorkers, false).length > 0 { throw EngineError("scheduled task family target changed during publication") }
         }
         let taskProblems = try taskTransferProblems(transfers, paths, inv.inspect, false, context.check, context.snapshots)
-        if taskProblems.length > 0 { throw JSError(taskProblems.join(", ")) }
+        if taskProblems.length > 0 { throw EngineError(taskProblems.join(", ")) }
     } else {
         let retired = try retiredFiles(receipt), liveWorkers = try workers(try inv.inspect.call())
         let units = try unitsOf(Value(inv.move.elements + inv.there.elements)).elements.filter { rows in
@@ -427,14 +423,14 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
         }
         let failedDirectory = path.join(paths.state.description, "quarantine", at.description, "failed", (receipt.localRecovery["rollback"] ?? "").description)
         for rows in units {
-            let ids = JSSet(rows.elements.map { $0.id }), unitFiles = JSSet(rows.elements.flatMap { row in (row.members ?? [row]).elements }.map { $0.file })
-            let items = jsArraySlice(receipt.superseded.elements, previousSuperseded).filter { item in
+            let ids = ValueSet(rows.elements.map { $0.id }), unitFiles = ValueSet(rows.elements.flatMap { row in (row.members ?? [row]).elements }.map { $0.file })
+            let items = sliceArray(receipt.superseded.elements, previousSuperseded).filter { item in
                 item.source.truthy ? unitFiles.has(item.moved[0][0]) : ids.has(item.by)
             }
             _ = try restore(Value(items), .string(path.join(paths.state.description, "quarantine")))
             receipt.superseded = Value(receipt.superseded.elements.filter { !items.contains($0) })
-            let kept = JSSet()
-            for row in jsArraySlice(receipt.sessions.elements, previousCount).filter({ ids.has($0.id) }) {
+            let kept = ValueSet()
+            for row in sliceArray(receipt.sessions.elements, previousCount).filter({ ids.has($0.id) }) {
                 let changes = try rollbackTarget(row, .string(failedDirectory), liveWorkers, Value { _ in try restoreBridge(row, save, inv.inspect) })
                 if changes.length > 0 {
                     kept.add(row.id)
@@ -443,12 +439,12 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
                 try save.call()
             }
             let members = rows.elements.filter { !kept.has($0.id) }.flatMap { row in (row.members ?? [row]).elements }
-            let files = JSSet(members.map { $0.file })
+            let files = ValueSet(members.map { $0.file })
             let checks = receipt.verification.problems.elements.filter { ids.has($0.id) }.map { $0.check }
             receipt.verification.problems = Value(receipt.verification.problems.elements.filter { !ids.has($0.id) })
             let lastFailure = receipt.failed.elements.last { row in row.sources.elements.contains { files.has($0.file) } } ?? .undefined
             let error = lastFailure["error"] ?? .string(!checks.isEmpty ? "\(Value(checks).join(", ")) changed during the move" : "the move did not complete")
-            let covered = JSSet(receipt.failed.elements.flatMap { row in (row.sources ?? []).elements }.map { $0.file })
+            let covered = ValueSet(receipt.failed.elements.flatMap { row in (row.sources ?? []).elements }.map { $0.file })
             let rest = members.filter { !covered.has($0.file) }
             if !rest.isEmpty {
                 receipt.failed.push(Value.spread(["id": rest[0].id, "title": rest[0].title, "error": error] as Value, try failureIdentity(["members": Value(rest)])))
@@ -484,7 +480,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     try optCall(context.sessionProgress, receipt)
     if inv.move.length > 0 || context.wholeOperation.truthy {
         let rehomed = receipt.sessions.elements.filter { $0.strategy === "rehome" }.count
-        let events = receipt.sessions.elements.reduce(0.0) { n, row in n + jsNumber(row.events) }
+        let events = receipt.sessions.elements.reduce(0.0) { n, row in n + toNumber(row.events) }
         let parts: [String?] = [
             "\(count(done)) \(receipt.verification.ok.truthy ? "✓" : "need verification")",
             "\(count(events)) events",
@@ -493,7 +489,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
         ]
         try report.call("move", .string(parts.compactMap { $0 }.joined(separator: " | ")))
         if receipt.verification.ok.truthy {
-            let sidecars = receipt.sessions.elements.reduce(0.0) { n, r in n + jsNumber(r["sidecars"]["count"]) }
+            let sidecars = receipt.sessions.elements.reduce(0.0) { n, r in n + toNumber(r["sidecars"]["count"]) }
             try report.call("sidecars", .string("\(count(sidecars)) files | unchanged ✓"))
         }
     }
@@ -502,7 +498,7 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
     _ = try projectLocalFailures(receipt, paths)
     if inv.cloud["later"].length > 0 { try report.call("later", .string(inv.cloud.later.elements.map { $0.title.description }.joined(separator: "\n"))) }
     let retired = try retiredCount(receipt)
-    let superseded = Double(receipt.superseded.length) - jsNumber(retired)
+    let superseded = Double(receipt.superseded.length) - toNumber(retired)
     let pendingCloud = try openCloudChecks(receipt).length
     if pendingCloud > 0 { try report.call("pending", .string(quantity(pendingCloud, "source cloud check"))) }
     if done == 0 && unwound.isEmpty && receipt.superseded.length == 0 && receipt.remote.length == 0 && !receipt.remotePending.truthy && pendingCloud == 0 && !receipt.held["length"].truthy &&
@@ -522,24 +518,23 @@ func transferRecords(_ inv: Value = .undefined, _ to: Value = .undefined, _ path
             superseded != 0 && !superseded.isNaN ? "\(count(superseded)) superseded" : nil,
         ]
         try report.call("desktop", .string(parts.compactMap { $0 }.joined(separator: " | ")))
-        let seconds = jsRound((dateNow() - started) / 1000)
-        try report.call("verify", .string((lines.elements.map { $0.description } + ["\(jsNumberString(seconds))s"]).joined(separator: " | ")))
+        let seconds = roundHalfUp((dateNow() - started) / 1000)
+        try report.call("verify", .string((lines.elements.map { $0.description } + ["\(numberString(seconds))s"]).joined(separator: " | ")))
     }
     if retired.truthy { try report.call("retired", .string("\(count(retired)) source records → quarantine | chat messages unchanged")) }
     let resultOkay = try receiptOkay(receipt)
-    let newerCloud = receipt.cloudChecks.elements.reduce(0.0) { total, check in total + jsNumber(check.later["length"] ?? 0) }
+    let newerCloud = receipt.cloudChecks.elements.reduce(0.0) { total, check in total + toNumber(check.later["length"] ?? 0) }
     let out: Value = [
         "file": file, "receipt": receipt, "unwound": Value(unwound), "summary": try receiptSummary(receipt), "checks": lines, "problems": receipt.verification.problems,
         "ok": resultOkay, "complete": Value(pendingCloud == 0 && receipt.held.length == 0 && !receipt.localStopped.truthy),
         "added": Value(receipt.sessions.length - previousCount),
-        "targetChanged": Value(receipt.sessions.length > previousCount || jsArraySlice(receipt.superseded.elements, previousSuperseded).contains { !$0.source.truthy }),
+        "targetChanged": Value(receipt.sessions.length > previousCount || sliceArray(receipt.superseded.elements, previousSuperseded).contains { !$0.source.truthy }),
         "held": receipt.held, "pendingCloud": Value(pendingCloud), "pendingLabels": try cloudCheckLabels(receipt), "newerCloud": Value(newerCloud),
         "cloudChecked": inv.cloud["checked"].truthy ? 1 : 0,
     ]
     return out
 }
 
-// L4484
 public func finishPending(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
     return try locked(paths, Value { _ in
@@ -578,13 +573,13 @@ public func finishPending(_ paths: Value = .undefined, _ options: Value = .undef
             if !options.automatic.truthy { return true }
             guard try options.automatic.typeOf != "object" || sameAccount(source, options.automatic).truthy else { return false }
             guard try cloudRetryAt(receipt, source, active, Value(now), memory) !== .null else { return false }
-            guard now >= jsNumber(try cloudRetryAt(receipt, source, active, Value(now), memory)) else { return false }
+            guard now >= toNumber(try cloudRetryAt(receipt, source, active, Value(now), memory)) else { return false }
             return try !canRestartWaiting(["cloudChecks": [source]], table).truthy || budgetRetryRows(source, memory).length > 0
         }
-        let check = try jsSorted(candidates) { a, b in jsNumber(try cloudAttemptAt(receipt, a)) - jsNumber(try cloudAttemptAt(receipt, b)) }.first ?? .undefined
+        let check = try stableSorted(candidates) { a, b in toNumber(try cloudAttemptAt(receipt, a)) - toNumber(try cloudAttemptAt(receipt, b)) }.first ?? .undefined
         if !check.truthy {
             if try options.automatic.truthy || !eligible.isEmpty || outstanding.elements.contains(where: { try sameLogin($0, active).truthy }) { return ["pending": true, "ok": true, "complete": false] }
-            throw JSError("sign Claude Desktop into \(Value(JSSet(try outstanding.elements.map { try loginLabel($0) }).values).join(" or "))")
+            throw EngineError("sign Claude Desktop into \(Value(ValueSet(try outstanding.elements.map { try loginLabel($0) }).values).join(" or "))")
         }
         let report = Value { args in
             let stage = args.count > 0 ? args[0] : .undefined, text = args.count > 1 ? args[1] : .undefined
@@ -593,10 +588,10 @@ public func finishPending(_ paths: Value = .undefined, _ options: Value = .undef
             return try options.report.call(stage, text, Value.spread(try sourceProgress(check), extra))
         }
         let retryRows: Value = options.automatic.truthy ? try budgetRetryRows(check, memory) : []
-        let budgetRetry: Value = retryRows.length > 0 ? Value(JSSet(try retryRows.elements.map { try remoteId($0.id) }.filter { $0.truthy }).values) : .null
+        let budgetRetry: Value = retryRows.length > 0 ? Value(ValueSet(try retryRows.elements.map { try remoteId($0.id) }.filter { $0.truthy }).values) : .null
         let serial = Value(budgetRetry.truthy)
         let kept = try keptCopy(receipt)
-        let preserved = JSSet(try receipt.failed.elements.filter { row in
+        let preserved = ValueSet(try receipt.failed.elements.filter { row in
             try cloudTagged(row, check).truthy && (try kept.call(row).truthy || options.automatic.truthy && (try limitedFailure(check, row, memory)).truthy)
         })
         if active.at.truthy && check.loginAt !== active.at { check.authRetries = 0 }
@@ -613,15 +608,15 @@ public func finishPending(_ paths: Value = .undefined, _ options: Value = .undef
             var source: Value = .undefined
             for account in all.elements where try sameAccount(account, check).truthy { source = account; break }
             for account in all.elements where try sameAccount(account, receipt.toAccount).truthy { to = account; break }
-            if !source.truthy { throw JSError("\(check.label) is no longer available") }
-            if !to.truthy { throw JSError("\(receipt.to) is no longer available") }
+            if !source.truthy { throw EngineError("\(check.label) is no longer available") }
+            if !to.truthy { throw EngineError("\(receipt.to) is no longer available") }
             let cloudSource = Value.spread(source, ["sessions": [], "unreadable": []] as Value)
-            let cloudBridgeIds = JSMap()
+            let cloudBridgeIds = ValueMap()
             let links = try (receipt.cloudLinks ?? []).elements.filter { row in try sameAccount(row, cloud).truthy }
             for row in links {
-                cloudBridgeIds.set(row.targetId, Value(JSSet((cloudBridgeIds.get(row.targetId) ?? []).elements + row.bridgeIds.elements).values))
+                cloudBridgeIds.set(row.targetId, Value(ValueSet((cloudBridgeIds.get(row.targetId) ?? []).elements + row.bridgeIds.elements).values))
             }
-            let cloudExcludedIds = JSSet(try receipt.failed.elements.filter { row in
+            let cloudExcludedIds = ValueSet(try receipt.failed.elements.filter { row in
                 try cloudTagged(row, cloud).truthy && (row.blockedByLocal["length"].truthy || preserved.has(row))
             }.map { try remoteId($0.id) }.filter { $0.truthy })
             let invOptions: Value = [
@@ -632,7 +627,7 @@ public func finishPending(_ paths: Value = .undefined, _ options: Value = .undef
             ]
             inv = try inventory([cloudSource], to, paths, report, invOptions)
         } catch {
-            let error = jsErrorValue(error)
+            let error = errorObject(error)
             _ = try addCloudFailure(receipt, check, ["id": error.budgetWork["id"] ?? .null, "title": check.label, "error": error["message"], "code": try memoryErrorCode(error)])
             _ = try finishCloudAttempt(receipt, check, [], error.budgetWork["waiting"] ?? [],
                                        ["memory": memory, "isolatedId": error.budgetWork["id"] ?? (budgetRetry.truthy ? .null : .undefined)])
@@ -649,7 +644,7 @@ public func finishPending(_ paths: Value = .undefined, _ options: Value = .undef
         _ = try finishCloudAttempt(receipt, cloud, inv.cloud.later, inv.cloud.waiting, ["memory": memory, "isolatedId": inv.cloud.isolatedId])
         _ = try projectLocalFailures(receipt, paths)
         try save.call()
-        let completedRemote = jsArraySlice(receipt.remote.elements, beforeRemote)
+        let completedRemote = sliceArray(receipt.remote.elements, beforeRemote)
         let pendingCloud = try openCloudChecks(receipt).length
         let failed = try receipt.failed.elements.filter { try actionableCloudFailure(receipt, $0).truthy }
         let ok = try finishOkay(receipt)
@@ -676,7 +671,6 @@ public func finishPending(_ paths: Value = .undefined, _ options: Value = .undef
     })
 }
 
-// L4587
 public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
     return try locked(paths, Value { _ in
@@ -690,7 +684,7 @@ public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined
         let checks: [Value] = optionChecks["length"].truthy
             ? try available.elements.filter { check in optionChecks.includes(try cloudCancelToken(file, check)) }
             : available.elements
-        if optionChecks["length"].truthy && checks.count != JSSet(optionChecks.elements).size {
+        if optionChecks["length"].truthy && checks.count != ValueSet(optionChecks.elements).size {
             return ["refused": [], "code": "PENDING_CHANGED", "reason": "The pending source checks changed. Review them again."]
         }
         let heldCancelled: Value = optionChecks["length"].truthy ? 0 : try heldCount(receipt.held)
@@ -718,10 +712,10 @@ public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined
                                       "taskFile": .string(path.join(paths.state.description, "keep-local-audit-tasks.json")), "taskSessions": Value.newSet(), "taskError": .null]
             do {
                 let audit = try inventory([auditSource], to, paths)
-                let covered = JSSet(audit.there.elements.flatMap { source in (source.members ?? [source]).elements.map { $0.file } })
+                let covered = ValueSet(audit.there.elements.flatMap { source in (source.members ?? [source]).elements.map { $0.file } })
                 for source in sourceSessions where !covered.has(source.file) { refused.append(.string("\(source.title) | destination no longer contains source history")) }
             } catch {
-                refused.append(.string("destination verification failed | \(jsErrorValue(error)["message"])"))
+                refused.append(.string("destination verification failed | \(errorObject(error)["message"])"))
             }
         }
         if !sourceSessions.isEmpty && !to.truthy { refused.append(.string("\(receipt.to) | destination account missing")) }
@@ -747,7 +741,6 @@ public func keepLocal(_ paths: Value = .undefined, _ options: Value = .undefined
     })
 }
 
-// L4641
 public func move(_ inv: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined) throws -> Value {
     let report = fnOr(report)
     return try locked(paths, Value { _ in

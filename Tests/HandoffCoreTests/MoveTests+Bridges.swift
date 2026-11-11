@@ -25,7 +25,7 @@ extension Engine.Moves {
         fs.handleWrite = { handle, data in
             if let partial, handle === partial {
                 try realWrite(handle, data.prefix(25))
-                throw jsThrow("Synthetic partial append", code: "ENOSPC")
+                throw makeError("Synthetic partial append", code: "ENOSPC")
             }
             try realWrite(handle, data)
         }
@@ -62,7 +62,7 @@ extension Engine.Moves {
             let actual = path.join(h.root, "actual-project")
             try rename(h.project, actual)
             try symlink(actual, h.project)
-            transcript = try NodeFS.nativeRealpath(h.transcript(SOURCE))
+            transcript = try FileSystem.nativeRealpath(h.transcript(SOURCE))
         }
         let sidecar = path.join(h.project, SOURCE, "agent.jsonl")
         try mkdirp(path.dirname(sidecar))
@@ -211,7 +211,7 @@ extension Engine.Moves {
             if target == h.targetFile && !injected {
                 injected = true
                 if later { try appendText(transcript, "\(JSON.text(entry("user", 900, 80, SOURCE)))\n") }
-                throw JSError("Synthetic task publication failure")
+                throw EngineError("Synthetic task publication failure")
             }
             try realRename(source, target)
         }

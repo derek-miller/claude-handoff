@@ -240,7 +240,7 @@ final class BridgeHome: Home {
         let all = try accounts(paths, [])
         from = all.find { $0.account.str == acct.P }
         to = all.find { $0.account.str == acct.Z }
-        transcriptPath = try NodeFS.nativeRealpath(transcript(SOURCE))
+        transcriptPath = try FileSystem.nativeRealpath(transcript(SOURCE))
         before = try readData(transcriptPath)
     }
 }
@@ -315,7 +315,7 @@ func pendingOrganizations(orgs: [String] = ["P", "T"], to targetOrg: String? = n
             return .undefined
         }
         calls.value.append(source.org.str)
-        if row.mode == "transient" { throw jsThrow("Fixture source unavailable", code: "FIXTURE_UNAVAILABLE") }
+        if row.mode == "transient" { throw makeError("Fixture source unavailable", code: "FIXTURE_UNAVAILABLE") }
         let check = { (id: Value) in eq(id, Value(row.remote)); requested.value.append((source.org.str, id.str)) }
         let index = rows.firstIndex { $0 === row }!
         return cloudFixture(h, [
