@@ -62,7 +62,14 @@ extension Engine {
             for pipe in ready { _ = pipe.fileHandleForReading.readData(ofLength: 1) }
             let listing = ChildProcess.nativeSpawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,command="], SpawnOptions(timeout: 2000, maxBuffer: 16 * 1024 * 1024))
             eq(listing.status.map { Value(Int($0)) } ?? nil, 0)
-            ok(listing.stdout.utf8.count > 1024 * 1024)
+            let size = listing.stdout.utf8.count
+            ok(size > 1024 * 1024, size > 1024 * 1024 ? nil : {
+                let marker = String(repeating: "x", count: 1024)
+                let argv = listing.stdout.split(separator: "\n").filter { $0.contains(marker) }.map { $0.utf8.count }
+                usleep(1_000_000)
+                let again = ChildProcess.nativeSpawnSync("/bin/ps", ["-axo", "pid=,ppid=,lstart=,command="], SpawnOptions(timeout: 2000, maxBuffer: 16 * 1024 * 1024)).stdout.utf8.count
+                return "ps listed \(size) bytes, argv lines \(argv), \(children.filter(\.isRunning).count)/9 children running, \(again) bytes a second later"
+            }())
             let to = try h.account("T")
             eq(try inventory([], to, h.paths).move.length, 0)
         }
