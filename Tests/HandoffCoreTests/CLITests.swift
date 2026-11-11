@@ -210,7 +210,6 @@ extension Engine {
             eq(single.done, true)
         }
 
-        // The menu bar app ships as a DMG, so `menubar --snapshot` refuses and installs nothing.
         @Test("menubar snapshot renders live accounts without installing")
         func menubarSnapshot() throws {
             let h = try home()
@@ -474,7 +473,6 @@ extension Engine {
         @Test("CLI JSON forwards validated whole-move session counters")
         func sessionCounters() throws { _ = try CLI.cliProgressFixture() }
 
-        // The menu bar app ships as a DMG, so `menubar` refuses without any app action.
         @Test("synthetic menubar installation reports the package version without invoking app actions")
         func syntheticMenubarInstallation() throws {
             let h = try home()
