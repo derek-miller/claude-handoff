@@ -314,7 +314,6 @@ func prepareUndo(_ receipt: Receipt, _ paths: DataLayout) throws -> Value {
         let files: [Value] = row.strategy === "rehome" ? [] : [row.targetTranscript].filter { $0.truthy }
         let trees: [Value] = row.strategy === "rehome" ? [] : [row.targetDir].filter { $0.truthy }
         let items = try artifacts(row.raw)
-
         let item: Value = [
             "id": row.targetId,
             "title": row.title,
@@ -458,7 +457,6 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
                 let problems = try taskTransferProblems([family.raw], paths, inspect, true, check, snapshots)
                 if problems.length != 0 { throw EngineError(problems.join(", ")) }
                 try check.call(true)
-
                 if try stable(taskRegistry(file).data) != stable(registry) { throw EngineError("scheduled task registry changed before publication") }
                 if try schedulerBusy(paths, [family.from, family.to], optCall(inspect)).truthy { throw EngineError(SCHEDULER_OWNS) }
                 return .undefined
@@ -588,7 +586,6 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
     if try ownsWorker(liveWorkers, row.targetId, row.targetRecordId).truthy { changes.append("running worker") }
     if try !transcript.error.truthy && changed(transcript.file, row.targetId, knownOf(row.raw)).truthy { changes.append("transcript changed") }
     let present = [transcript, sidecarArtifact, record].filter { $0.isPresent }
-
     if !changes.isEmpty {
         for artifact in present {
             if artifact.error.truthy || artifact.move.truthy || exists(artifact.original) || !exists(artifact.parked) { continue }
@@ -649,8 +646,7 @@ func reconcile(_ paths: DataLayout, _ options: Value = .undefined) throws -> Val
     }
     if let thrown { throw thrown }
     if interrupted && restart.outcome === "reopen-failed" {
-        let message = [RecoveryNote(result).error, "Reopen Claude Desktop manually, then retry"]
-.filter { $0.truthy }.map { $0.description }.joined(separator: ". ")
+        let message = [RecoveryNote(result).error, "Reopen Claude Desktop manually, then retry"].filter { $0.truthy }.map { $0.description }.joined(separator: ". ")
         throw makeError(message, code: "REOPEN_FAILED")
     }
     return result ?? (interrupted ? ["title": "Interrupted restart", "error": "Desktop is running. Retry the requested operation."] : .null)
@@ -827,7 +823,6 @@ func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -
     return [
         "title": Value(recovered.map { RecoveryNote($0).title.description }.joined(separator: " + ")),
         "error": Value(recovered.map { RecoveryNote($0).error.description }.joined(separator: ", ")),
-
     ]
 }
 
@@ -907,7 +902,6 @@ func parentReferences(_ directories: Value = .undefined, _ snapshots: Value = .u
 
 func undoParentProblems(_ receipt: Receipt) throws -> Value {
     let removing = Value.newSet(receipt.sessions.elements.map { PlacedSession($0).record })
-
     do {
         let parents = try parentReferences(Value.newSet(removing.elements.map { Value(path.dirname($0.description)) }))
         return Value(parents.asMap!.entries.filter { file, parent in !removing.has(file) && removing.has(parent) }
