@@ -17,7 +17,10 @@ struct TaskFamily {
     var targetFile: Value { raw["targetFile"] }
     var sourceOrder: Value { raw["sourceOrder"] }
     var tasks: Value { raw["tasks"] }
-    var replaced: Value { raw["replaced"] }
+    var replaced: Value {
+        get { raw["replaced"] }
+        nonmutating set { raw["replaced"] = newValue }
+    }
     var state: Value { raw["state"] }
     var targetState: Value { raw["targetState"] }
     var targetStateFields: Value { raw["targetStateFields"] }
@@ -235,7 +238,10 @@ extension MoveSource {
     var sidecars: Value { raw["sidecars"] }
     var snapshot: Value { raw["snapshot"] }
     // taskOwned as stored, which Bool-valued MoveSource.taskOwned flattens.
-    var taskOwnedValue: Value { raw["taskOwned"] }
+    var taskOwnedValue: Value {
+        get { raw["taskOwned"] }
+        nonmutating set { raw["taskOwned"] = newValue }
+    }
 }
 
 extension MoveTarget {
