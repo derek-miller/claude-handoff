@@ -21,7 +21,8 @@ func transfer(_ inv: MovePlan, _ to: Value = .undefined, _ paths: DataLayout, _ 
     if context.restart.truthy {
         let batches = ValueMap(), grouped = ValueMap()
         for family in ValueSet(inv.move.elements.map { MoveSource($0).taskFamily }.filter { $0.truthy }).values {
-            let pair: Value = .string("\(TaskFamily(family).sourceFile)\n\(TaskFamily(family).targetFile)")
+            let typed = TaskFamily(family)
+            let pair: Value = .string("\(typed.sourceFile)\n\(typed.targetFile)")
             var batch = batches.get(pair)
             if !batch.truthy {
                 batch = Value.spread(family, ["ids": [], "recordIds": [], "files": [], "links": [], "routes": []] as Value)
@@ -194,7 +195,8 @@ func transfer(_ inv: MovePlan, _ to: Value = .undefined, _ paths: DataLayout, _ 
     if receipt.isPresent && !context.existing.truthy && receipt.sessions.length == 0 && receipt.superseded.length == 0 && receipt.remote.length == 0 && !receipt.held["length"].truthy,
        try openCloudChecks(receipt).length == 0,
        !exists(.string(path.join(paths.state, "quarantine", context.at.description, "failed"))) {
-        if WorkflowResult(result).file.truthy { try fs.rm(WorkflowResult(result).file.description, recursive: false, force: true) }
+        let empty = WorkflowResult(result).file
+        if empty.truthy { try fs.rm(empty.description, recursive: false, force: true) }
         return ["file": .null, "receipt": receipt.raw, "summary": try receiptSummary(receipt), "ok": try receiptOkay(receipt), "validationOnly": true]
     }
     if !result["file"].truthy {
@@ -454,8 +456,9 @@ func transferRecords(_ inv: MovePlan, _ to: Value = .undefined, _ paths: DataLay
             }
             let members = rows.elements.filter { !kept.has(MoveSource($0).id) }.flatMap { row in (MoveTarget(row).members ?? [row]).elements }
             let files = ValueSet(members.map { MoveSource($0).file })
-            let checks = ReceiptVerification(receipt.verification).problems.elements.map(ProblemRow.init).filter { ids.has($0.id) }.map { $0.check }
-            ReceiptVerification(receipt.verification).problems = Value(ReceiptVerification(receipt.verification).problems.elements.filter { !ids.has(ProblemRow($0).id) })
+            let verification = ReceiptVerification(receipt.verification)
+            let checks = verification.problems.elements.map(ProblemRow.init).filter { ids.has($0.id) }.map { $0.check }
+            verification.problems = Value(verification.problems.elements.filter { !ids.has(ProblemRow($0).id) })
             let lastFailure = receipt.failed.elements.last { row in FailedSession(row).sources.elements.contains { files.has(FailureSource($0).file) } } ?? .undefined
             let error = lastFailure["error"] ?? .string(!checks.isEmpty ? "\(Value(checks).join(", ")) changed during the move" : "the move did not complete")
             let covered = ValueSet(receipt.failed.elements.flatMap { row in (FailedSession(row).sources ?? []).elements }.map { FailureSource($0).file })
