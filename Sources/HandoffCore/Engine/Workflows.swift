@@ -146,7 +146,7 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
             ]
             let inv = try inventory(Value(sources), target, paths, preparatory.truthy ? prepareReport : report, inventoryOptions)
             let failedFiles = try receiptSummary(["failed": try inventoryFailures(inv)])["notMoved"].elements.map { $0["file"] }
-            for file in inv.sources.elements.map({ $0["file"] }) + failedFiles { sessionFiles.add(file) }
+            for file in MovePlan(inv).sources.elements.map({ $0["file"] }) + failedFiles { sessionFiles.add(file) }
             _ = try sessionProgress.call(existing["receipt"])
             return ["inv": inv, "target": target]
         }
