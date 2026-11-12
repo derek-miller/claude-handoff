@@ -35,7 +35,7 @@ func lstat(_ file: String) throws -> Value { try FileSystem.nativeStat(file, fal
 
 // Receipts in the state directory, oldest first.
 func receiptFiles(_ h: Home) -> [String] {
-    readdirOrEmpty(h.paths.state.str).filter { TextPattern.cached(#"^\d.*\.json$"#).test($0) }.sorted().map { path.join(h.paths.state.str, $0) }
+    readdirOrEmpty(h.paths["state"].str).filter { TextPattern.cached(#"^\d.*\.json$"#).test($0) }.sorted().map { path.join(h.paths["state"].str, $0) }
 }
 
 // MARK: - CLI
@@ -77,7 +77,7 @@ func processSetup(list: String, commands: String) {
 // A fetch mock: `handle(url, request)` returns a body value (encoded as JSON), or a full response from response().
 func mockFetch(_ handle: @escaping (URL, Value) throws -> Value) {
     cloudFetch = { request in
-        let url = URL(string: request.url.str)!
+        let url = URL(string: request["url"].str)!
         let answer = try handle(url, request)
         if answer.isPlainObject, answer.hasOwn("$response") { return answer["$response"] }
         return response(answer)

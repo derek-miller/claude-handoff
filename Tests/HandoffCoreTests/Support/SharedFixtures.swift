@@ -18,7 +18,7 @@ class TaskHome: Home {
 
     func selection() throws -> (from: Value, to: Value) {
         let all = try accounts(paths, [])
-        return (all.find { $0.account.str == acct.P }, all.find { $0.account.str == acct.T })
+        return (all.find { $0["account"].str == acct.P }, all.find { $0["account"].str == acct.T })
     }
 }
 
@@ -40,14 +40,14 @@ final class TaskFamily: TaskHome {
              "lastRunAt": "2026-09-01T00:00:00Z", "lastScheduledFor": "2026-09-01T00:00:00Z"]
         })
         for task in tasks.elements {
-            try mkdirp(path.dirname(task.filePath.str))
-            try writeText(task.filePath.str, "---\nname: \(task.id)\n---\nSynthetic reminder prompt\n")
+            try mkdirp(path.dirname(task["filePath"].str))
+            try writeText(task["filePath"].str, "---\nname: \(task["id"])\n---\nSynthetic reminder prompt\n")
         }
         for (index, sid) in ([SOURCE] + runs + [cold]).enumerated() {
             try write(sid, branchEntries(eventCount, sid, 80 + index * eventCount))
-            try record("P", sid, rehomeRecord(runs.contains(sid) ? ["scheduledTaskId": tasks[index - 1].id, "notifySessionId": Value("local_\(SOURCE)")] : [:]))
+            try record("P", sid, rehomeRecord(runs.contains(sid) ? ["scheduledTaskId": tasks[index - 1]["id"], "notifySessionId": Value("local_\(SOURCE)")] : [:]))
         }
-        let skips = Value.fromEntries(tasks.elements.map { ($0.id.str, Value([["at": "2026-09-02T00:00:00Z", "reason": "app_closed"]])) })
+        let skips = Value.fromEntries(tasks.elements.map { ($0["id"].str, Value([["at": "2026-09-02T00:00:00Z", "reason": "app_closed"]])) })
         let retries: Value = ["task_0": ["slot": "2026-09-02T00:00:00Z", "attempts": 2, "notBefore": "2026-09-02T00:05:00Z"]]
         let unrelatedSkips: Value = ["unrelated_task": [["at": "2026-09-01T01:00:00Z", "reason": "missed"]]]
         let unrelatedRetries: Value = ["unrelated_task": ["slot": "2026-09-01T01:00:00Z", "attempts": 1, "notBefore": "2026-09-01T01:05:00Z"]]
@@ -59,13 +59,13 @@ final class TaskFamily: TaskHome {
                           "future": ["preserved": "target"]]
         sourceAfter = .spread(sourceRegistry, ["scheduledTasks": [], "recordedSkips": unrelatedSkips, "runRetries": unrelatedRetries])
         targetAfter = .spread(targetRegistry, [
-            "scheduledTasks": targetRegistry.scheduledTasks.concat(tasks),
-            "recordedSkips": .spread(targetRegistry.recordedSkips, skips),
-            "runRetries": .spread(targetRegistry.runRetries, retries),
+            "scheduledTasks": targetRegistry["scheduledTasks"].concat(tasks),
+            "recordedSkips": .spread(targetRegistry["recordedSkips"], skips),
+            "runRetries": .spread(targetRegistry["runRetries"], retries),
         ])
         if twins {
             let stale = tasks.map { .spread($0, ["enabled": false, "notifySessionId": Value("local_\(id(799))"), "lastRunAt": "2026-08-24T00:00:00Z"]) }
-            targetRegistry.scheduledTasks.asArray!.items.insert(contentsOf: stale.elements, at: 0)
+            targetRegistry["scheduledTasks"].asArray!.items.insert(contentsOf: stale.elements, at: 0)
         }
         try writeJSON(sourceFile, sourceRegistry)
         try writeJSON(targetFile, targetRegistry)
@@ -109,10 +109,10 @@ final class TaskCheckpoint: TaskHome {
         })
         sourceRegistry = [
             "scheduledTasks": tasks,
-            "recordedSkips": .fromEntries(tasks.elements.map { ($0.id.str, Value([["at": "2026-09-02T00:00:00Z", "reason": "app_closed"]])) }),
+            "recordedSkips": .fromEntries(tasks.elements.map { ($0["id"].str, Value([["at": "2026-09-02T00:00:00Z", "reason": "app_closed"]])) }),
             "runRetries": .fromEntries(tasks.elements.map { (task: Value) -> (String, Value) in
                 let retry: Value = ["slot": "2026-09-02T00:00:00Z", "attempts": 2, "notBefore": "2026-09-02T00:05:00Z"]
-                return (task.id.str, retry)
+                return (task["id"].str, retry)
             }),
         ]
         for (index, sid) in sessions.enumerated() {
@@ -157,14 +157,14 @@ func taskHarness(_ rows: Value = [desktopFixture()[0]], _ reopened: Value? = nil
 func interruptTaskFamily(_ h: TaskHome, _ operation: String, _ stage: String, interruptAfter: Int? = nil, sourceLocation: SourceLocation = #_sourceLocation) throws {
     let hook: CrashHook = stage == "record" ? .link : .rename
     let destination = stage == "record" ? path.join(h.dir("T"), "local_\(h.notificationId ?? SOURCE).json") : stage == "source" ? h.sourceFile : h.targetFile
-    let state = h.paths.state.str, limit = interruptAfter ?? h.interruptAfter
+    let state = h.paths["state"].str, limit = interruptAfter ?? h.interruptAfter
     var mutations = 0
     let crashed = try crashing(on: hook, when: { args in
         let matches: Bool
         if stage == "receipt" || stage == "retiring" {
             guard args[1].hasPrefix(state + "/") else { return false }
             let receipt = try readJSON(args[1])
-            matches = stage == "retiring" ? receipt.retiring.truthy : receipt.taskTransfers.length > 0
+            matches = stage == "retiring" ? receipt["retiring"].truthy : receipt["taskTransfers"].length > 0
         } else {
             matches = args[1] == destination
         }
@@ -174,13 +174,13 @@ func interruptTaskFamily(_ h: TaskHome, _ operation: String, _ stage: String, in
         let paths = try layout(Value(h.root))
         let all = try accounts(paths, [])
         if operation == "undo" { _ = try undo(paths, ["processes": []]); return }
-        let from = Value((h.sourceAccounts ?? [h.acct.P]).map { account in all.find { $0.account.str == account } })
-        let to = all.find { $0.account.str == h.acct.T }
+        let from = Value((h.sourceAccounts ?? [h.acct.P]).map { account in all.find { $0["account"].str == account } })
+        let to = all.find { $0["account"].str == h.acct.T }
         if h.restart {
             var rows: Value = [desktopFixture()[0]]
             let io: Value = ["inspect": fn { _ in rows }, "command": fn { args in rows = args[0].str.hasSuffix("osascript") ? [] : [desktopFixture()[0]]; return ["status": 0] }]
             let planned = try executeMove(from, to, paths, ["io": io])
-            _ = try executeMove(from, to, paths, ["io": io, "approve": planned.plan.token])
+            _ = try executeMove(from, to, paths, ["io": io, "approve": planned["plan"]["token"]])
         } else {
             _ = try executeMove(from, to, paths, ["processes": []])
         }
@@ -202,7 +202,7 @@ struct Refusal {
 
 func refusalFixture(_ mixed: Bool = false) throws -> Refusal {
     let h = try taskFamilyFixture(true, 2, 1, true), investor = id(750), recordId = "local_\(id(751))"
-    h.targetRegistry.scheduledTasks[0].enabled = true
+    h.targetRegistry["scheduledTasks"][0]["enabled"] = true
     try writeJSON(h.targetFile, h.targetRegistry)
     let rich = entry("user", 750, nil, investor, ["toolUseResult": ["invented": "first"]])
     try h.write(investor, [rich, .spread(rich, ["toolUseResult": ["invented": "different"]])])
@@ -238,8 +238,8 @@ final class BridgeHome: Home {
         try write(SOURCE, branchEntries(2, SOURCE, 1).concat([["type": "history-suppression", "sessionId": Value(SOURCE)], bridge]))
         try record("P", SOURCE, rehomeRecord(["bridgeSessionIds": ["session_prior"]]))
         let all = try accounts(paths, [])
-        from = all.find { $0.account.str == acct.P }
-        to = all.find { $0.account.str == acct.Z }
+        from = all.find { $0["account"].str == acct.P }
+        to = all.find { $0["account"].str == acct.Z }
         transcriptPath = try FileSystem.nativeRealpath(transcript(SOURCE))
         before = try readData(transcriptPath)
     }
@@ -253,9 +253,9 @@ func assertBridgeRestored(_ before: Data, _ after: Data, _ bridge: Value, source
         String(decoding: bytes, as: UTF8.self).split(separator: "\n").map(String.init).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.map { ($0, (try? JSON.parse($0)) ?? .undefined) }
     }
     let original = parse(before), current = parse(after)
-    let messages = { (rows: [(String, Value)]) in Value.strings(rows.filter { MESSAGES.contains($0.1.type.str) }.map(\.0)) }
+    let messages = { (rows: [(String, Value)]) in Value.strings(rows.filter { MESSAGES.contains($0.1["type"].str) }.map(\.0)) }
     deq(messages(current), messages(original), sourceLocation: sourceLocation)
-    deq(current.filter { $0.1.type == "bridge-session" && $0.1.sessionId === bridge.sessionId }.last?.1 ?? .undefined, bridge, sourceLocation: sourceLocation)
+    deq(current.filter { $0.1["type"] == "bridge-session" && $0.1["sessionId"] === bridge["sessionId"] }.last?.1 ?? .undefined, bridge, sourceLocation: sourceLocation)
 }
 
 // MARK: - Pending cloud checks across organizations
@@ -292,7 +292,7 @@ func pendingOrganizations(orgs: [String] = ["P", "T"], to targetOrg: String? = n
     let h = try home(), identity = try identityFixture(h)
     var rows: [PendingRow] = []
     for (index, name) in orgs.enumerated() {
-        let sid = id(9200 + index), org = h.org[name], directory = path.join(h.paths.records.str, h.acct.P, org)
+        let sid = id(9200 + index), org = h.org[name], directory = path.join(h.paths["records"].str, h.acct.P, org)
         let entries = branchEntries(4, sid, 9300 + index * 10)
         try mkdirp(directory)
         try h.write(sid, entries)
@@ -300,23 +300,23 @@ func pendingOrganizations(orgs: [String] = ["P", "T"], to targetOrg: String? = n
         if directory != h.dir("P") { try rename(h.recordFile("P", sid), path.join(directory, "local_\(sid).json")) }
         rows.append(PendingRow(sid: sid, org: org, entries: entries, remote: "cse_org\(index)"))
     }
-    if let targetOrg { try mkdirp(path.join(h.paths.records.str, h.acct.P, h.org[targetOrg])) }
+    if let targetOrg { try mkdirp(path.join(h.paths["records"].str, h.acct.P, h.org[targetOrg])) }
     let all = try accounts(h.paths, identity.processes)
-    let from = Value(rows.map { row in all.find { $0.account.str == h.acct.P && $0.org.str == row.org } })
-    let to = all.find { $0.account.str == (targetOrg != nil ? h.acct.P : h.acct.Z) && $0.org.str == (targetOrg.map { h.org[$0] } ?? h.org.Z) }
-    let before = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
+    let from = Value(rows.map { row in all.find { $0["account"].str == h.acct.P && $0["org"].str == row.org } })
+    let to = all.find { $0["account"].str == (targetOrg != nil ? h.acct.P : h.acct.Z) && $0["org"].str == (targetOrg.map { h.org[$0] } ?? h.org.Z) }
+    let before = try fixtureSnapshot(h, [h.paths["records"].str, h.paths["pool"].str])
     let moved = try move(try inventory(from, to, h.paths, NOOP, ["cloudRequested": true, "processes": []]), to, h.paths)
     let calls = Box<[String]>([]), requested = Box<[(String, String)]>([])
     let client = fn { args in
         let source = args[0]
-        eq(source.account, Value(h.acct.P))
-        guard let row = rows.first(where: { $0.org == source.org.str }) else {
-            Issue.record("no pending row for organization \(source.org)")
+        eq(source["account"], Value(h.acct.P))
+        guard let row = rows.first(where: { $0.org == source["org"].str }) else {
+            Issue.record("no pending row for organization \(source["org"])")
             return .undefined
         }
-        calls.value.append(source.org.str)
+        calls.value.append(source["org"].str)
         if row.mode == "transient" { throw makeError("Fixture source unavailable", code: "FIXTURE_UNAVAILABLE") }
-        let check = { (id: Value) in eq(id, Value(row.remote)); requested.value.append((source.org.str, id.str)) }
+        let check = { (id: Value) in eq(id, Value(row.remote)); requested.value.append((source["org"].str, id.str)) }
         let index = rows.firstIndex { $0 === row }!
         return cloudFixture(h, [
             "org": Value(row.org),

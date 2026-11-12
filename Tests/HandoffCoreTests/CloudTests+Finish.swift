@@ -3,7 +3,7 @@ import Testing
 @testable import HandoffCore
 
 extension Engine.Cloud {
-    static func receiptNames(_ h: Home) throws -> [String] { try readdir(h.paths.state.str).filter { re(#"^\d.*\.json$"#).test($0) } }
+    static func receiptNames(_ h: Home) throws -> [String] { try readdir(h.paths["state"].str).filter { re(#"^\d.*\.json$"#).test($0) } }
 
     @Test("Finish cloud success retains historical local refusals as information")
     func finishRetainsHistoricalRefusals() throws {
@@ -11,21 +11,21 @@ extension Engine.Cloud {
             let h = try home()
             try h.write(SOURCE, [entry("user", 1, nil, SOURCE)])
             try h.record("T", SOURCE, rehomeRecord())
-            let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.T }, to = all.find { $0.account.str == h.acct.Z }
+            let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.T }, to = all.find { $0["account"].str == h.acct.Z }
             let moved = try moveWithPending(h, [from], to)
-            let receipt = try readJSON(moved.file.str)
-            receipt.failed.push(["id": Value(id(998)), "title": "Unmoved task", "error": "scheduled task family missing"])
-            if failure.hasPrefix("verification") { receipt.verification = ["ok": false, "problems": failure == "verification" ? [["id": Value(SOURCE), "check": "transcript"]] : []] }
-            try writeJSON(moved.file.str, receipt)
-            let cloud = cloudFixture(h, ["account": from.account, "org": from.org, "list": fn { _ in
+            let receipt = try readJSON(moved["file"].str)
+            receipt["failed"].push(["id": Value(id(998)), "title": "Unmoved task", "error": "scheduled task family missing"])
+            if failure.hasPrefix("verification") { receipt["verification"] = ["ok": false, "problems": failure == "verification" ? [["id": Value(SOURCE), "check": "transcript"]] : []] }
+            try writeJSON(moved["file"].str, receipt)
+            let cloud = cloudFixture(h, ["account": from["account"], "org": from["org"], "list": fn { _ in
                 if failure == "cloud" { throw EngineError("fixture offline") }
                 return []
             }])
             let result = try finishPending(h.paths, ["cloud": cloud])
-            eq(result.ok, Value(failure == "none"), failure)
-            eq(result.complete, Value(failure != "cloud"), failure)
-            ok(result.receipt.failed.some { $0.title == "Unmoved task" })
-            eq(result.failed.length, failure == "cloud" ? 1 : 0)
+            eq(result["ok"], Value(failure == "none"), failure)
+            eq(result["complete"], Value(failure != "cloud"), failure)
+            ok(result["receipt"]["failed"].some { $0["title"] == "Unmoved task" })
+            eq(result["failed"].length, failure == "cloud" ? 1 : 0)
             if failure != "cloud" { eq(cli(h.root, ["finish", "--json"]).code, failure == "none" ? 0 : 1, failure) }
         }
     }
@@ -37,14 +37,14 @@ extension Engine.Cloud {
         try h.record("P", SOURCE, rehomeRecord(["title": "Cloud outage source"]))
         let cloud = cloudFixture(h, ["list": fn { _ in throw EngineError("service unavailable") }])
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.P && $0.org.str == h.org.P }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.P && $0["org"].str == h.org.P }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud, "cloudRequested": true])
         let result = try move(inv, to, h.paths)
-        eq(result.ok, false)
-        eq(result.pendingCloud, 1)
-        eq(result.receipt.cloudChecks[0].status, "failed")
-        match(result.receipt.failed[0].error, "service unavailable")
+        eq(result["ok"], false)
+        eq(result["pendingCloud"], 1)
+        eq(result["receipt"]["cloudChecks"][0]["status"], "failed")
+        match(result["receipt"]["failed"][0]["error"], "service unavailable")
         deq(.strings(try readdir(h.dir("P"))), [])
         deq(.strings(try readdir(h.dir("Z"))), [Value("local_\(SOURCE).json")])
     }
@@ -61,8 +61,8 @@ extension Engine.Cloud {
         try h.record("T", second, rehomeRecord(["title": "Second deferred source", "isArchived": true]))
         let emptyCloud = cloudFixture(h)
         let all = try accounts(h.paths)
-        let from: Value = [all.find { $0.account.str == h.acct.P && $0.org.str == h.org.P }, all.find { $0.account.str == h.acct.T && $0.org.str == h.org.T }]
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from: Value = [all.find { $0["account"].str == h.acct.P && $0["org"].str == h.org.P }, all.find { $0["account"].str == h.acct.T && $0["org"].str == h.org.T }]
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         let moved = try moveWithPending(h, from, to, emptyCloud)
         var status = "active"
         let deferredCloud = cloudFixture(h, [
@@ -74,16 +74,16 @@ extension Engine.Cloud {
             "unarchive": fn { () in status = "active" },
         ])
         let finished = try finishPending(h.paths, ["cloud": deferredCloud])
-        eq(finished.file, moved.file)
-        eq(finished.ok, true)
-        eq(finished.complete, true)
-        eq(finished.pendingCloud, 0)
-        ok(finished.receipt.cloudChecks.every { $0.status == "complete" })
-        eq(finished.receipt.remote.length, 1)
-        eq(finished.restart, true)
-        eq(try readJSON(h.recordFile("Z", second)).isArchived, false)
+        eq(finished["file"], moved["file"])
+        eq(finished["ok"], true)
+        eq(finished["complete"], true)
+        eq(finished["pendingCloud"], 0)
+        ok(finished["receipt"]["cloudChecks"].every { $0["status"] == "complete" })
+        eq(finished["receipt"]["remote"].length, 1)
+        eq(finished["restart"], true)
+        eq(try readJSON(h.recordFile("Z", second))["isArchived"], false)
         eq(status, "archived")
-        #expect(try Self.receiptNames(h) == [path.basename(moved.file.str)])
+        #expect(try Self.receiptNames(h) == [path.basename(moved["file"].str)])
     }
 
     @Test("automatic cloud follow-up waits for its named source login and completes the same receipt")
@@ -93,7 +93,7 @@ extension Engine.Cloud {
         try h.write(SOURCE, entries)
         try h.record("T", SOURCE, rehomeRecord(["title": "Automatic source"]))
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.T }, to = all.find { $0.account.str == h.acct.Z }
+        let from = all.find { $0["account"].str == h.acct.T }, to = all.find { $0["account"].str == h.acct.Z }
         let moved = try moveWithPending(h, [from], to)
         var reads = 0, status = "active"
         let cloud = cloudFixture(h, [
@@ -104,18 +104,18 @@ extension Engine.Cloud {
         ])
         _ = try sweep(h.paths, ["processes": f.processes, "cloud": cloud])
         eq(reads, 0)
-        try writeJSON(h.paths.desktop.str, ["lastKnownAccountUuid": from.account])
-        try f.write(f.`init`() + f.event(1, "[account] Login-state transition (loggedOut: false \u{2192} false, uuid: \(h.acct.P) \u{2192} \(from.account)), clearing oauth cache"))
+        try writeJSON(h.paths["desktop"].str, ["lastKnownAccountUuid": from["account"]])
+        try f.write(f.`init`() + f.event(1, "[account] Login-state transition (loggedOut: false \u{2192} false, uuid: \(h.acct.P) \u{2192} \(from["account"])), clearing oauth cache"))
         _ = try sweep(h.paths, ["processes": f.processes, "cloud": cloud])
         eq(reads, 0)
-        try appendText(path.join(h.paths.logs.str, "main.log"), f.`init`(2, from.account.str, from.org.str))
+        try appendText(path.join(h.paths["logs"].str, "main.log"), f.`init`(2, from["account"].str, from["org"].str))
         let finished = try sweep(h.paths, ["processes": f.processes, "cloud": cloud])
         eq(status, "archived")
-        eq(finished.result.file, moved.file)
-        eq(finished.result.complete, true)
-        eq(finished.result.receipt.remote.length, 1)
-        eq(readOrNil(path.join(h.paths.state.str, "restart-plan.json")), nil)
-        deq(try verifyPlaced(h.paths).changed, [])
+        eq(finished["result"]["file"], moved["file"])
+        eq(finished["result"]["complete"], true)
+        eq(finished["result"]["receipt"]["remote"].length, 1)
+        eq(readOrNil(path.join(h.paths["state"].str, "restart-plan.json")), nil)
+        deq(try verifyPlaced(h.paths)["changed"], [])
     }
 
     @Test("automatic cloud retries bind their receipt and claim backoff under the mutation lock")
@@ -123,20 +123,20 @@ extension Engine.Cloud {
         let h = try home()
         try h.write(SOURCE, [entry("user", 1, nil, SOURCE)])
         try h.record("T", SOURCE)
-        let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.T }, to = all.find { $0.account.str == h.acct.Z }
+        let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.T }, to = all.find { $0["account"].str == h.acct.Z }
         let first = try moveWithPending(h, [from], to)
         var calls = 0
         let cloud = cloudFixture(h, ["account": Value(h.acct.T), "org": Value(h.org.T), "list": fn { _ in calls += 1; throw EngineError("fixture offline") }])
-        let stale = try finishPending(h.paths, ["cloud": cloud, "receiptFile": Value(first.file.str + ".old"), "automatic": from])
-        eq(stale.nothing, true)
+        let stale = try finishPending(h.paths, ["cloud": cloud, "receiptFile": Value(first["file"].str + ".old"), "automatic": from])
+        eq(stale["nothing"], true)
         eq(calls, 0)
         _ = try sweep(h.paths, ["active": from, "cloud": cloud])
         eq(calls, 1)
         _ = try sweep(h.paths, ["active": from, "cloud": cloud])
         eq(calls, 1)
-        let receipt = try readJSON(first.file.str)
-        eq(receipt.cloudChecks[0].status, "failed")
-        ok((receipt.cloudAttempts["\(from.account)/\(from.org)"].asNumber ?? 0) > 0)
+        let receipt = try readJSON(first["file"].str)
+        eq(receipt["cloudChecks"][0]["status"], "failed")
+        ok((receipt["cloudAttempts"]["\(from["account"])/\(from["org"])"].asNumber ?? 0) > 0)
     }
 
     @Test("a successful cloud phase preserves an earlier local verification failure")
@@ -145,7 +145,7 @@ extension Engine.Cloud {
         try h.write(SOURCE, [entry("user", 1, nil, SOURCE)])
         try h.record("T", SOURCE)
         try h.record("T", id(997))
-        let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.T }, to = all.find { $0.account.str == h.acct.Z }
+        let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.T }, to = all.find { $0["account"].str == h.acct.Z }
         let link = fs.link
         touchPlaced(h.recordFile("Z", SOURCE))
         let first: Value
@@ -153,10 +153,10 @@ extension Engine.Cloud {
             defer { fs.link = link }
             first = try move(try inventory([from], to, h.paths, NOOP, ["cloudRequested": true]), to, h.paths)
         }
-        ok(first.summary.notMoved.some { $0.id == Value(SOURCE) })
-        let result = try finishPending(h.paths, ["cloud": cloudFixture(h, ["account": from.account, "org": from.org])])
-        ok(result.summary.notMoved.some { $0.id == Value(SOURCE) })
-        eq(result.receipt.sessions.length, 0)
+        ok(first["summary"]["notMoved"].some { $0["id"] == Value(SOURCE) })
+        let result = try finishPending(h.paths, ["cloud": cloudFixture(h, ["account": from["account"], "org": from["org"]])])
+        ok(result["summary"]["notMoved"].some { $0["id"] == Value(SOURCE) })
+        eq(result["receipt"]["sessions"].length, 0)
     }
 
     @Test("Finish pending preserves a record-only bridge identity after local rehome")
@@ -168,8 +168,8 @@ extension Engine.Cloud {
         try h.write(session, local)
         try h.record("T", session, rehomeRecord(["title": "Original local title", "bridgeSessionIds": ["session_record_only"]]))
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.T && $0.org.str == h.org.T }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.T && $0["org"].str == h.org.T }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         let moved = try moveWithPending(h, [from], to)
         var status = "active"
         let cloud = cloudFixture(h, [
@@ -181,10 +181,10 @@ extension Engine.Cloud {
             "unarchive": fn { () in status = "active" },
         ])
         let finished = try finishPending(h.paths, ["cloud": cloud])
-        ok(moved.receipt.cloudLinks[0].bridgeIds.includes("session_record_only"))
-        eq(finished.ok, true)
-        deq(finished.failed, [])
-        deq(finished.summary.kept.map { $0.code }, ["CLOUD_UNPROVEN"])
+        ok(moved["receipt"]["cloudLinks"][0]["bridgeIds"].includes("session_record_only"))
+        eq(finished["ok"], true)
+        deq(finished["failed"], [])
+        deq(finished["summary"]["kept"].map { $0["code"] }, ["CLOUD_UNPROVEN"])
         eq(status, "active")
     }
 
@@ -197,10 +197,10 @@ extension Engine.Cloud {
         try h.record("T", SOURCE, rehomeRecord(["title": "Already there source", "bridgeSessionIds": ["session_existing_record_only"]]))
         try h.record("Z", SOURCE, rehomeRecord(["title": "Already there target"]))
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.T && $0.org.str == h.org.T }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.T && $0["org"].str == h.org.T }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         let moved = try moveWithPending(h, [from], to)
-        eq(moved.receipt.sessions.length, 0)
+        eq(moved["receipt"]["sessions"].length, 0)
         var status = "active"
         let cloud = cloudFixture(h, [
             "account": Value(h.acct.T), "org": Value(h.org.T),
@@ -211,9 +211,9 @@ extension Engine.Cloud {
             "unarchive": fn { () in status = "active" },
         ])
         let finished = try finishPending(h.paths, ["cloud": cloud])
-        eq(finished.ok, true)
-        deq(finished.failed, [])
-        deq(finished.summary.kept.map { $0.code }, ["CLOUD_UNPROVEN"])
+        eq(finished["ok"], true)
+        deq(finished["failed"], [])
+        deq(finished["summary"]["kept"].map { $0["code"] }, ["CLOUD_UNPROVEN"])
         eq(status, "active")
     }
 
@@ -225,11 +225,11 @@ extension Engine.Cloud {
         try h.write(session, entries)
         try h.record("T", session, rehomeRecord(["title": "Later remote source"]))
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.T && $0.org.str == h.org.T }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.T && $0["org"].str == h.org.T }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         let moved = try moveWithPending(h, [from], to)
         var archived = false
-        let createdAt = isoString(dateParse(moved.receipt.startedAt.str) + 60_000)
+        let createdAt = isoString(dateParse(moved["receipt"]["startedAt"].str) + 60_000)
         let cloud = cloudFixture(h, [
             "account": Value(h.acct.T), "org": Value(h.org.T),
             "list": fn { _ in [remoteSession(["id": "cse_created_later", "title": "Later remote source", "created_at": Value(createdAt)])] },
@@ -239,12 +239,12 @@ extension Engine.Cloud {
             "unarchive": NOOP,
         ])
         let finished = try finishPending(h.paths, ["cloud": cloud])
-        eq(finished.ok, true)
-        eq(finished.complete, true)
-        eq(finished.pendingCloud, 0)
-        eq(finished.receipt.remote.length, 0)
-        eq(finished.newerCloud, 1)
-        eq(finished.receipt.cloudChecks[0].later[0].title, "Later remote source")
+        eq(finished["ok"], true)
+        eq(finished["complete"], true)
+        eq(finished["pendingCloud"], 0)
+        eq(finished["receipt"]["remote"].length, 0)
+        eq(finished["newerCloud"], 1)
+        eq(finished["receipt"]["cloudChecks"][0]["later"][0]["title"], "Later remote source")
         #expect(archived == false)
     }
 
@@ -254,8 +254,8 @@ extension Engine.Cloud {
         try h.write(SOURCE, [entry("user", 39, nil, SOURCE)])
         try h.record("P", SOURCE, rehomeRecord(["title": "Cutoff source"]))
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.P && $0.org.str == h.org.P }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.P && $0["org"].str == h.org.P }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         var archived = false
         let requestedAt = isoNow()
         let cloud = cloudFixture(h, [
@@ -266,10 +266,10 @@ extension Engine.Cloud {
             "unarchive": NOOP,
         ])
         let result = try move(try inventory([from], to, h.paths, NOOP, ["cloud": cloud, "cloudRequested": true, "requestedAt": Value(requestedAt)]), to, h.paths)
-        eq(result.ok, true)
-        eq(result.pendingCloud, 0)
-        eq(result.receipt.remote.length, 0)
-        eq(result.newerCloud, 1)
+        eq(result["ok"], true)
+        eq(result["pendingCloud"], 0)
+        eq(result["receipt"]["remote"].length, 0)
+        eq(result["newerCloud"], 1)
         #expect(archived == false)
     }
 
@@ -277,8 +277,8 @@ extension Engine.Cloud {
     func refusesUndatedRemoteRow() throws {
         let h = try home()
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.T && $0.org.str == h.org.T }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.T && $0["org"].str == h.org.T }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         _ = try moveWithPending(h, [from], to)
         var archived = false
         let cloud = cloudFixture(h, [
@@ -290,9 +290,9 @@ extension Engine.Cloud {
             "unarchive": NOOP,
         ])
         let result = try finishPending(h.paths, ["cloud": cloud])
-        eq(result.ok, false)
-        eq(result.pendingCloud, 1)
-        match(result.receipt.failed[0].error, "creation time is missing")
+        eq(result["ok"], false)
+        eq(result["pendingCloud"], 1)
+        match(result["receipt"]["failed"][0]["error"], "creation time is missing")
         #expect(archived == false)
     }
 
@@ -305,8 +305,8 @@ extension Engine.Cloud {
         try h.write(session, local)
         try h.record("T", session, rehomeRecord(["title": "Retryable cloud source"]))
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.T && $0.org.str == h.org.T }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.T && $0["org"].str == h.org.T }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         let moved = try moveWithPending(h, [from], to)
         var supported = false, status = "active"
         let cloud = cloudFixture(h, [
@@ -321,18 +321,18 @@ extension Engine.Cloud {
             "unarchive": fn { () in status = "active" },
         ])
         let failed = try finishPending(h.paths, ["cloud": cloud])
-        eq(failed.file, moved.file)
-        eq(failed.ok, false)
-        eq(failed.pendingCloud, 1)
-        eq(failed.receipt.cloudChecks[0].status, "failed")
-        match(failed.receipt.failed.at(-1).error, "unsupported content block")
+        eq(failed["file"], moved["file"])
+        eq(failed["ok"], false)
+        eq(failed["pendingCloud"], 1)
+        eq(failed["receipt"]["cloudChecks"][0]["status"], "failed")
+        match(failed["receipt"]["failed"].at(-1)["error"], "unsupported content block")
         eq(status, "active")
         supported = true
         let retried = try finishPending(h.paths, ["cloud": cloud])
-        eq(retried.ok, true)
-        eq(retried.complete, true)
-        eq(retried.pendingCloud, 0)
-        eq(retried.receipt.failed.length, 0)
+        eq(retried["ok"], true)
+        eq(retried["complete"], true)
+        eq(retried["pendingCloud"], 0)
+        eq(retried["receipt"]["failed"].length, 0)
         eq(status, "archived")
     }
 
@@ -360,20 +360,20 @@ extension Engine.Cloud {
         let firstCloud = makeCloud(h.acct.P, h.org.P, "first", "cse_first_undo", "First undo source", firstEntries)
         let secondCloud = makeCloud(h.acct.T, h.org.T, "second", "cse_second_undo", "Second undo source", secondEntries)
         let all = try accounts(h.paths)
-        let from: Value = [all.find { $0.account.str == h.acct.P && $0.org.str == h.org.P }, all.find { $0.account.str == h.acct.T && $0.org.str == h.org.T }]
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from: Value = [all.find { $0["account"].str == h.acct.P && $0["org"].str == h.org.P }, all.find { $0["account"].str == h.acct.T && $0["org"].str == h.org.T }]
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         _ = try moveWithPending(h, from, to, firstCloud)
         _ = try finishPending(h.paths, ["cloud": secondCloud])
         deq(states, ["first": "archived", "second": "archived"])
         let staged = try undo(h.paths, ["cloud": firstCloud])
         deq(states, ["first": "active", "second": "archived"])
-        deq(staged.pendingUndo, [from[1].email])
-        eq(staged.dest, .undefined)
-        ok(staged.receipt.cloudChecks.every { $0.status == "cancelled" || $0.status == "complete" })
+        deq(staged["pendingUndo"], [from[1]["email"]])
+        eq(staged["dest"], .undefined)
+        ok(staged["receipt"]["cloudChecks"].every { $0["status"] == "cancelled" || $0["status"] == "complete" })
         #expect(try readdir(h.dir("Z")).sorted() == ["local_\(first).json", "local_\(second).json"].sorted())
         let finished = try finishPending(h.paths, ["cloud": secondCloud])
         deq(states, ["first": "active", "second": "active"])
-        ok(finished.dest)
+        ok(finished["dest"])
         #expect(try readdir(h.dir("P")) == ["local_\(first).json"])
         #expect(try readdir(h.dir("T")) == ["local_\(second).json"])
         #expect(try readdir(h.dir("Z")) == [])
@@ -387,9 +387,9 @@ extension Engine.Cloud {
         try h.record("Z", SOURCE, rehomeRecord(["isArchived": true]))
         var status = "active", calls: [String] = []
         let remoteEntries = entries.map { row -> Value in
-            let uuid = Int(String(row.uuid.str.suffix(12)))! + 100
-            return ["type": row.type, "uuid": Value(id(uuid)), "session_id": "cse_fixture",
-                    "message": row.type == "assistant" ? .spread(row.message, ["usage": ["output_tokens": 999], "stop_reason": nil]) : row.message]
+            let uuid = Int(String(row["uuid"].str.suffix(12)))! + 100
+            return ["type": row["type"], "uuid": Value(id(uuid)), "session_id": "cse_fixture",
+                    "message": row["type"] == "assistant" ? .spread(row["message"], ["usage": ["output_tokens": 999], "stop_reason": nil]) : row["message"]]
         }
         let cloud = cloudFixture(h, [
             "list": fn { _ in [remoteSession(["id": "cse_fixture", "title": Value("Session \(SOURCE.suffix(3))"), "status": Value(status)])] },
@@ -399,30 +399,30 @@ extension Engine.Cloud {
             "unarchive": fn { () in calls.append("unarchive"); status = "active" },
         ])
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.P && $0.org.str == h.org.P }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.P && $0["org"].str == h.org.P }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        eq(inv.move.length, 0)
-        eq(inv.cloud.matches.length, 1)
-        eq(inv.cloud.blocked.length, 0)
+        eq(inv["move"].length, 0)
+        eq(inv["cloud"]["matches"].length, 1)
+        eq(inv["cloud"]["blocked"].length, 0)
         let result = try move(inv, to, h.paths)
-        eq(result.ok, true, JSON.text(result.receipt.failed))
+        eq(result["ok"], true, JSON.text(result["receipt"]["failed"]))
         #expect(calls == ["archive"])
-        eq(result.receipt.remote.length, 1)
+        eq(result["receipt"]["remote"].length, 1)
         eq(status, "archived")
         let targetFile = h.recordFile("Z", SOURCE)
         let activated = try readJSON(targetFile)
-        eq(activated.isArchived, false)
-        activated.lastFocusedAt = Value(dateNow())
-        activated.promptAppendSnapshot = ["append": "current Desktop prompt", "cliVersion": "fixture"]
+        eq(activated["isArchived"], false)
+        activated["lastFocusedAt"] = Value(dateNow())
+        activated["promptAppendSnapshot"] = ["append": "current Desktop prompt", "cliVersion": "fixture"]
         try writeJSON(targetFile, activated)
         let undone = try undo(h.paths, ["cloud": cloud])
-        ok(undone.dest)
+        ok(undone["dest"])
         #expect(calls == ["archive", "unarchive"])
         eq(status, "active")
         let restored = try readJSON(targetFile)
-        eq(restored.isArchived, true)
-        deq(restored.promptAppendSnapshot, activated.promptAppendSnapshot)
+        eq(restored["isArchived"], true)
+        deq(restored["promptAppendSnapshot"], activated["promptAppendSnapshot"])
     }
 
     @Test("attachment prompts and tiny ordering drift prove semantic Remote Control containment")
@@ -430,7 +430,7 @@ extension Engine.Cloud {
         let h = try home()
         let remote = Value((0..<100).map { index in entry(index % 2 == 1 ? "assistant" : "user", index + 100, index > 0 ? index + 99 : nil, SOURCE) })
         var local = remote.deepClone().elements
-        let prompt = local[80].message.content
+        let prompt = local[80]["message"]["content"]
         local[80] = ["type": "attachment", "uuid": Value(id(800)), "sessionId": Value(SOURCE), "attachment": ["prompt": prompt]]
         local.swapAt(20, 21)
         try h.write(SOURCE, Value(local))
@@ -442,11 +442,11 @@ extension Engine.Cloud {
             "archive": NOOP, "unarchive": NOOP,
         ])
         let all = try accounts(h.paths)
-        let from = all.find { $0.account.str == h.acct.P && $0.org.str == h.org.P }
-        let to = all.find { $0.account.str == h.acct.Z && $0.org.str == h.org.Z }
+        let from = all.find { $0["account"].str == h.acct.P && $0["org"].str == h.org.P }
+        let to = all.find { $0["account"].str == h.acct.Z && $0["org"].str == h.org.Z }
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        eq(inv.cloud.matches.length, 1)
-        eq(inv.cloud.matches[0].target.kind, "existing")
-        eq(inv.cloud.matches[0].target.matchMode, "equivalent")
+        eq(inv["cloud"]["matches"].length, 1)
+        eq(inv["cloud"]["matches"][0]["target"]["kind"], "existing")
+        eq(inv["cloud"]["matches"][0]["target"]["matchMode"], "equivalent")
     }
 }

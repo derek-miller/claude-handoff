@@ -16,17 +16,17 @@ extension Engine.Restarts {
             if !edited && p.hasPrefix(h.targetFile + ".") {
                 edited = true
                 let file = h.recordFile("T", foreign), record = try readJSON(file)
-                record.forkedFromSessionId = Value("local_\(h.sessions[0])")
+                record["forkedFromSessionId"] = Value("local_\(h.sessions[0])")
                 try writeJSON(file, record)
             }
         }
-        let result = try executeMove([from], to, h.paths, ["io": mock.io, "approve": plan.plan.token])
+        let result = try executeMove([from], to, h.paths, ["io": mock.io, "approve": plan["plan"]["token"]])
         fs.writeFile = write
         #expect(edited)
-        eq(result.ok, false)
-        eq(result.recoveryRequired, true)
+        eq(result["ok"], false)
+        eq(result["recoveryRequired"], true)
         ok(!exists(h.targetFile))
-        eq(try readJSON(h.recordFile("T", foreign)).forkedFromSessionId, Value("local_\(h.sessions[0])"))
+        eq(try readJSON(h.recordFile("T", foreign))["forkedFromSessionId"], Value("local_\(h.sessions[0])"))
         try h.record("T", foreign, rehomeRecord())
         mock.rows = []
         _ = try finishWorkflow(h.paths, ["io": mock.io, "processes": []])
@@ -38,20 +38,20 @@ extension Engine.Restarts {
         let h = try home(), mock = taskHarness(desktopFixture())
         let plan = try restartPlan(nil, h.paths, mock.rows)
         var settled = false
-        let command = mock.io.command
-        mock.io.command = fn { args in
+        let command = mock.io["command"]
+        mock.io["command"] = fn { args in
             if args[0].str.hasSuffix("/open") { #expect(settled) }
             return try command.callArgs(args)
         }
         let result = try withDesktopRestart(plan, h.paths, fn { args in
             mock.time += 61_000
             settled = true
-            try args[0].check.call()
+            try args[0]["check"].call()
             return .undefined
         }, NOOP, mock.io)
-        eq(result.ok, false)
-        eq(result.code, "MOVE_STALLED")
-        eq(result.restart.outcome, "reopened")
+        eq(result["ok"], false)
+        eq(result["code"], "MOVE_STALLED")
+        eq(result["restart"]["outcome"], "reopened")
         #expect(mock.calls == ["/usr/bin/osascript", "/usr/bin/open"])
     }
 
@@ -68,12 +68,12 @@ extension Engine.Restarts {
             return ["status": 0]
         }]
         let planned = try executeMove([from], to, h.paths, ["io": io])
-        let result = try executeMove([from], to, h.paths, ["io": io, "approve": planned.plan.token, "report": fn { args in
-            if args[0] == "verify" && Self.arg(args, 2).completed == 1 { rows = Self.reopened() }
+        let result = try executeMove([from], to, h.paths, ["io": io, "approve": planned["plan"]["token"], "report": fn { args in
+            if args[0] == "verify" && Self.arg(args, 2)["completed"] == 1 { rows = Self.reopened() }
             return .undefined
         }])
-        eq(result.ok, false)
-        match(result.reason, "reopened before")
+        eq(result["ok"], false)
+        match(result["reason"], "reopened before")
         eq(opens, 0)
         ok(exists(h.recordFile("P", SOURCE)))
     }
@@ -92,11 +92,11 @@ extension Engine.Restarts {
             ["pid": 504, "ppid": 503, "started": "child two", "executable": "/tmp/claude", "worker": true, "desktopPid": 500, "ids": [Value(other)]],
         ]
         let plan = try restartPlan(nil, h.paths, rows)
-        eq(plan.affected.length, 2)
-        deq(plan.affected.map { $0.title }, ["First session", "Second session"])
-        deq(plan.affected.map { $0.pids }, [[501, 502], [503, 504]])
-        eq(plan.members.length, 5)
+        eq(plan["affected"].length, 2)
+        deq(plan["affected"].map { $0["title"] }, ["First session", "Second session"])
+        deq(plan["affected"].map { $0["pids"] }, [[501, 502], [503, 504]])
+        eq(plan["members"].length, 5)
         let unknown = try restartPlan(nil, h.paths, rows.map { .spread($0, ["ids": []]) })
-        eq(unknown.affected.length, 2)
+        eq(unknown["affected"].length, 2)
     }
 }

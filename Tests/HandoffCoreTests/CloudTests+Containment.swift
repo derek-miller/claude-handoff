@@ -5,28 +5,28 @@ import Testing
 extension Engine.Cloud {
     // The accounts() row for a fixture account in its own organization.
     static func pick(_ all: Value, _ h: Home, _ a: String) -> Value {
-        all.find { $0.account.str == h.acct[a] && $0.org.str == h.org[a] }
+        all.find { $0["account"].str == h.acct[a] && $0["org"].str == h.org[a] }
     }
 
     @Test("artifact indexes reparse identical bytes on a new inode before archival")
     func artifactNewInode() throws {
-        let f = try artifactFixture(), inv = try f.inventory(), before = inv.cloud.artifacts.used.asNumber ?? 0
+        let f = try artifactFixture(), inv = try f.inventory(), before = inv["cloud"]["artifacts"]["used"].asNumber ?? 0
         let file = path.join(f.directory, "agent-a0.jsonl"), raw = try readData(file)
         try unlink(file)
         try writeData(file, raw)
         let result = try move(inv, f.to, f.h.paths)
-        eq(result.ok, true)
+        eq(result["ok"], true)
         eq(f.calls, 1)
-        ok((inv.cloud.artifacts.used.asNumber ?? 0) > before)
+        ok((inv["cloud"]["artifacts"]["used"].asNumber ?? 0) > before)
     }
 
     @Test("artifact ownership rejects symlink entries introduced after the ordinary sidecar scan")
     func artifactSymlinkEntries() throws {
         for kind in ["file", "root", "subagents"] {
-            let f = try artifactFixture(), original = f.cloud.list, outside = path.join(f.h.root, "unrelated-artifacts")
+            let f = try artifactFixture(), original = f.cloud["list"], outside = path.join(f.h.root, "unrelated-artifacts")
             try mkdirp(outside)
             try writeText(path.join(outside, "agent-a0.jsonl"), f.agents[0].elements.map { JSON.text($0) }.joined(separator: "\n") + "\n")
-            f.cloud.list = fn { _ in
+            f.cloud["list"] = fn { _ in
                 if kind == "file" {
                     try symlink(path.join(outside, "agent-a0.jsonl"), path.join(f.directory, "agent-escape.jsonl"))
                 } else {
@@ -37,8 +37,8 @@ extension Engine.Cloud {
                 return try original.call()
             }
             let inv = try f.inventory()
-            deq(inv.cloud.matches, [], kind)
-            eq(inv.cloud.blocked[0].code, "CLOUD_ARTIFACT_UNCERTAIN", kind)
+            deq(inv["cloud"]["matches"], [], kind)
+            eq(inv["cloud"]["blocked"][0]["code"], "CLOUD_ARTIFACT_UNCERTAIN", kind)
         }
     }
 
@@ -49,14 +49,14 @@ extension Engine.Cloud {
         try unlink(h.recordFile("Z", SOURCE))
         try h.record("P", SOURCE, rehomeRecord(["bridgeSessionIds": ["session_artifacts"]]))
         let all = try accounts(h.paths, [])
-        f.from = all.find { $0.account.str == h.acct.P }
-        f.to = all.find { $0.account.str == h.acct.Z }
-        let before = try fixtureSnapshot(h, [h.paths.pool.str])
+        f.from = all.find { $0["account"].str == h.acct.P }
+        f.to = all.find { $0["account"].str == h.acct.Z }
+        let before = try fixtureSnapshot(h, [h.paths["pool"].str])
         let moved = try move(try f.inventory(), f.to, h.paths)
-        eq(moved.ok, true)
-        deq(moved.receipt.sessions.map { $0.strategy }, ["rehome"])
-        eq(moved.receipt.remote[0].matchMode, "artifacts")
-        deq(try fixtureSnapshot(h, [h.paths.pool.str]), before)
+        eq(moved["ok"], true)
+        deq(moved["receipt"]["sessions"].map { $0["strategy"] }, ["rehome"])
+        eq(moved["receipt"]["remote"][0]["matchMode"], "artifacts")
+        deq(try fixtureSnapshot(h, [h.paths["pool"].str]), before)
     }
 
     @Test("uncertain owned artifacts never authorize a source archive")
@@ -65,19 +65,19 @@ extension Engine.Cloud {
             let f = try artifactFixture(), h = f.h
             f.remote.push(entry("assistant", 8900, nil, SOURCE))
             if change == "unreadable" { try appendText(path.join(f.directory, "agent-a0.jsonl"), "{\"type\":\"assistant\",broken\n") }
-            if change == "ownership" { f.agents[0][0].sessionId = Value(id(9999)); try f.write() }
-            let before = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
+            if change == "ownership" { f.agents[0][0]["sessionId"] = Value(id(9999)); try f.write() }
+            let before = try fixtureSnapshot(h, [h.paths["records"].str, h.paths["pool"].str])
             let inv = try f.inventory(change == "budget" ? ["artifactLimit": 100] : [:])
-            deq(inv.cloud.matches, [], change)
-            eq(inv.cloud.blocked[0].code, Value(change == "budget" ? "CLOUD_ARTIFACT_BUDGET" : "CLOUD_ARTIFACT_UNCERTAIN"), change)
-            noMatch(inv.cloud.blocked[0].error, "unsupported")
+            deq(inv["cloud"]["matches"], [], change)
+            eq(inv["cloud"]["blocked"][0]["code"], Value(change == "budget" ? "CLOUD_ARTIFACT_BUDGET" : "CLOUD_ARTIFACT_UNCERTAIN"), change)
+            noMatch(inv["cloud"]["blocked"][0]["error"], "unsupported")
             let moved = try move(inv, f.to, h.paths)
-            eq(moved.ok, false, change)
-            eq(moved.receipt.sessions.length, 0)
-            eq(moved.receipt.remote.length, 0)
+            eq(moved["ok"], false, change)
+            eq(moved["receipt"]["sessions"].length, 0)
+            eq(moved["receipt"]["remote"].length, 0)
             eq(f.calls, 0)
             eq(f.status, "active")
-            deq(try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str]), before, change)
+            deq(try fixtureSnapshot(h, [h.paths["records"].str, h.paths["pool"].str]), before, change)
         }
     }
 
@@ -98,12 +98,12 @@ extension Engine.Cloud {
         let all = try accounts(h.paths)
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        deq(inv.cloud.matches, [])
-        eq(inv.cloud.blocked[0].code, "CLOUD_UNPROVEN")
+        deq(inv["cloud"]["matches"], [])
+        eq(inv["cloud"]["blocked"][0]["code"], "CLOUD_UNPROVEN")
         let alone = try move(inv, to, h.paths)
-        deq([alone.ok, alone.file], [true, nil])
-        deq(alone.summary.kept.map { [$0.id, $0.error] }, [["cse_divergent", Value("not proven to be on this Mac, kept in \(from.label)")]])
-        deq(alone.summary.attention, [])
+        deq([alone["ok"], alone["file"]], [true, nil])
+        deq(alone["summary"]["kept"].map { [$0["id"], $0["error"]] }, [["cse_divergent", Value("not proven to be on this Mac, kept in \(from["label"])")]])
+        deq(alone["summary"]["attention"], [])
         let selection = { () throws -> (Value, Value) in
             let current = try accounts(h.paths)
             return (Engine.Cloud.pick(current, h, "P"), Engine.Cloud.pick(current, h, "Z"))
@@ -113,17 +113,17 @@ extension Engine.Cloud {
         try h.record("P", local, rehomeRecord())
         let (source, target) = try selection()
         let result = try move(try inventory([source], target, h.paths, NOOP, ["cloud": cloud]), target, h.paths)
-        deq([result.ok, result.complete], [true, true])
-        deq(result.receipt.sessions.map { $0.id }, [Value(local)])
+        deq([result["ok"], result["complete"]], [true, true])
+        deq(result["receipt"]["sessions"].map { $0["id"] }, [Value(local)])
         eq(status, "active")
-        deq(result.receipt.failed.filter { $0.cloudAccount.truthy }.map { $0.id }, ["cse_divergent"])
-        deq(result.summary.kept.map { $0.id }, ["cse_divergent"])
-        eq(result.receipt.cloudChecks[0].status, "complete")
+        deq(result["receipt"]["failed"].filter { $0["cloudAccount"].truthy }.map { $0["id"] }, ["cse_divergent"])
+        deq(result["summary"]["kept"].map { $0["id"] }, ["cse_divergent"])
+        eq(result["receipt"]["cloudChecks"][0]["status"], "complete")
         let active: Value = ["account": Value(h.acct.P), "org": Value(h.org.P), "state": "known"]
         let before = listed
         try appendText(h.transcript(SOURCE), "\(JSON.text(entry("assistant", 29, 28, SOURCE)))\n")
         for automatic in [true, false] {
-            ne(try finishPending(h.paths, ["cloud": cloud, "automatic": Value(automatic), "active": active]).pending, true)
+            ne(try finishPending(h.paths, ["cloud": cloud, "automatic": Value(automatic), "active": active])["pending"], true)
         }
         eq(listed, before)
         eq(status, "active")
@@ -132,7 +132,7 @@ extension Engine.Cloud {
         try h.record("P", next, rehomeRecord())
         let (laterSource, laterTarget) = try selection()
         let later = try move(try inventory([laterSource], laterTarget, h.paths), try selection().1, h.paths)
-        deq(later.receipt.sessions.map { $0.id }, [Value(next)])
+        deq(later["receipt"]["sessions"].map { $0["id"] }, [Value(next)])
     }
 
     @Test("an unrelated same-title local session cannot prove a remote copy")
@@ -156,11 +156,11 @@ extension Engine.Cloud {
         let all = try accounts(h.paths)
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        eq(inv.cloud.matches.length, 0)
-        eq(inv.cloud.blocked[0].code, "CLOUD_UNPROVEN")
+        eq(inv["cloud"]["matches"].length, 0)
+        eq(inv["cloud"]["blocked"][0]["code"], "CLOUD_UNPROVEN")
         let result = try move(inv, to, h.paths)
-        eq(result.ok, true)
-        deq(result.summary.kept.map { $0.id }, ["cse_unrelated"])
+        eq(result["ok"], true)
+        deq(result["summary"]["kept"].map { $0["id"] }, ["cse_unrelated"])
         eq(archived, false)
     }
 
@@ -185,8 +185,8 @@ extension Engine.Cloud {
         let all = try accounts(h.paths)
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        deq(inv.cloud.matches, [])
-        eq(inv.cloud.blocked[0].code, "CLOUD_UNPROVEN")
+        deq(inv["cloud"]["matches"], [])
+        eq(inv["cloud"]["blocked"][0]["code"], "CLOUD_UNPROVEN")
         _ = try move(inv, to, h.paths)
         eq(status, "active")
     }
@@ -207,8 +207,8 @@ extension Engine.Cloud {
         let all = try accounts(h.paths)
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        eq(inv.cloud.matches.length, 0)
-        eq(inv.cloud.blocked[0].code, "CLOUD_UNPROVEN")
+        eq(inv["cloud"]["matches"].length, 0)
+        eq(inv["cloud"]["blocked"][0]["code"], "CLOUD_UNPROVEN")
     }
 
     @Test("an unreadable assistant payload cannot disappear from remote containment checks")
@@ -223,11 +223,11 @@ extension Engine.Cloud {
             "session": fn { _ in remoteState("active") },
             "archive": fn { () in archived = true },
         ])
-        let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
+        let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.Z }
         let result = try move(try inventory([from], to, h.paths, NOOP, ["cloud": cloud]), to, h.paths)
         eq(archived, false)
-        eq(result.ok, false)
-        ok(result.receipt.failed.some { $0.error.str.contains("payload is unreadable") })
+        eq(result["ok"], false)
+        ok(result["receipt"]["failed"].some { $0["error"].str.contains("payload is unreadable") })
     }
 
     @Test("pending remote actions are refused even when worker status says idle")
@@ -248,11 +248,11 @@ extension Engine.Cloud {
                 "session": fn { _ in remoteState("active", extra) },
                 "archive": fn { () in archived = true },
             ])
-            let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
+            let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.Z }
             let result = try move(try inventory([from], to, h.paths, NOOP, ["cloud": cloud]), to, h.paths)
             eq(archived, false)
-            eq(result.ok, false)
-            ok(result.receipt.failed.some { $0.error.str.contains("pending actions") }, JSON.text(extra))
+            eq(result["ok"], false)
+            ok(result["receipt"]["failed"].some { $0["error"].str.contains("pending actions") }, JSON.text(extra))
         }
     }
 
@@ -273,11 +273,11 @@ extension Engine.Cloud {
                 "session": fn { _ in remoteState("active") },
                 "archive": fn { () in archived = true },
             ])
-            let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
+            let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.Z }
             let result = try move(try inventory([from], to, h.paths, NOOP, ["cloud": cloud]), to, h.paths)
             eq(archived, false)
-            eq(result.ok, false)
-            ok(result.receipt.failed.some { $0.error.str.contains("history or input changed") }, added.event_type.str)
+            eq(result["ok"], false)
+            ok(result["receipt"]["failed"].some { $0["error"].str.contains("history or input changed") }, added["event_type"].str)
         }
     }
 
@@ -299,12 +299,12 @@ extension Engine.Cloud {
         let all = try accounts(h.paths)
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        eq(inv.cloud.matches.length, 0)
-        match(inv.cloud.blocked[0].error, "not proven disconnected and idle")
+        eq(inv["cloud"]["matches"].length, 0)
+        match(inv["cloud"]["blocked"][0]["error"], "not proven disconnected and idle")
         let result = try move(inv, to, h.paths)
-        eq(result.ok, false)
+        eq(result["ok"], false)
         eq(archived, false)
-        match(result.receipt.failed[0].error, "not proven disconnected and idle")
+        match(result["receipt"]["failed"][0]["error"], "not proven disconnected and idle")
     }
 
     @Test("a Remote Control mirror stays active when no local target shares its title")
@@ -324,12 +324,12 @@ extension Engine.Cloud {
         let all = try accounts(h.paths)
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        eq(inv.cloud.matches.length, 0)
-        eq(inv.cloud.blocked.length, 1)
-        eq(inv.cloud.blocked[0].error, Value("not proven to be on this Mac, kept in \(from.label)"))
+        eq(inv["cloud"]["matches"].length, 0)
+        eq(inv["cloud"]["blocked"].length, 1)
+        eq(inv["cloud"]["blocked"][0]["error"], Value("not proven to be on this Mac, kept in \(from["label"])"))
         let result = try move(inv, to, h.paths)
-        deq([result.ok, result.file], [true, nil])
-        eq(result.receipt.cloudChecks[0].status, "complete")
+        deq([result["ok"], result["file"]], [true, nil])
+        eq(result["receipt"]["cloudChecks"][0]["status"], "complete")
         eq(archived, false)
     }
 
@@ -352,17 +352,17 @@ extension Engine.Cloud {
         let all = try accounts(h.paths)
         let from = Engine.Cloud.pick(all, h, "P"), to = Engine.Cloud.pick(all, h, "Z")
         let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-        eq(inv.move.length, 1)
-        eq(inv.cloud.matches[0].target.kind, "move")
+        eq(inv["move"].length, 1)
+        eq(inv["cloud"]["matches"][0]["target"]["kind"], "move")
         let result = try move(inv, to, h.paths)
-        eq(result.ok, true)
-        eq(result.receipt.remote.length, 1)
+        eq(result["ok"], true)
+        eq(result["receipt"]["remote"].length, 1)
         eq(status, "archived")
         deq(.strings(try readdir(h.dir("P"))), [])
-        eq(try readJSON(targetRecord).isArchived, false)
-        ok(try undo(h.paths, ["cloud": cloud]).dest)
+        eq(try readJSON(targetRecord)["isArchived"], false)
+        ok(try undo(h.paths, ["cloud": cloud])["dest"])
         eq(status, "active")
-        eq(try readJSON(h.recordFile("P", SOURCE)).isArchived, true)
+        eq(try readJSON(h.recordFile("P", SOURCE))["isArchived"], true)
     }
 
     @Test("Keep local accepts a rehome target activated by cloud archival")
@@ -383,8 +383,8 @@ extension Engine.Cloud {
         let from: Value = [Engine.Cloud.pick(all, h, "P"), Engine.Cloud.pick(all, h, "T")]
         let to = Engine.Cloud.pick(all, h, "Z")
         let moved = try moveWithPending(h, from, to, cloud)
-        eq(moved.pendingCloud, 1)
-        eq(try readJSON(h.recordFile("Z", SOURCE)).isArchived, false)
-        eq(try keepLocal(h.paths).ok, true)
+        eq(moved["pendingCloud"], 1)
+        eq(try readJSON(h.recordFile("Z", SOURCE))["isArchived"], false)
+        eq(try keepLocal(h.paths)["ok"], true)
     }
 }

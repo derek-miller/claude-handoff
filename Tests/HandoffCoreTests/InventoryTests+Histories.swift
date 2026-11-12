@@ -11,14 +11,14 @@ extension Engine.Inventory {
         try writeText(file, "{broken")
         try writeText(target, "{broken")
         let by = try Self.byAccount(h)
-        deq(by[h.acct.P]!.unreadable, [Value(file)])
-        match(by[h.acct.P]!.stats, "1 unreadable")
+        deq(by[h.acct.P]!["unreadable"], [Value(file)])
+        match(by[h.acct.P]!["stats"], "1 unreadable")
         let inv = try inventory([by[h.acct.P]!], by[h.acct.Z]!, h.paths)
-        eq(inv.total, 1)
-        eq(inv.unreadable.length, 2)
+        eq(inv["total"], 1)
+        eq(inv["unreadable"].length, 2)
         let result = try move(inv, by[h.acct.Z]!, h.paths)
-        eq(result.ok, false)
-        deq(result.receipt.failed.map { $0.error }, ["unreadable Desktop record", "unreadable Desktop record"])
+        eq(result["ok"], false)
+        deq(result["receipt"]["failed"].map { $0["error"] }, ["unreadable Desktop record", "unreadable Desktop record"])
     }
 
     @Test("an invalid duplicate is refused, never hidden behind a valid twin")
@@ -32,12 +32,12 @@ extension Engine.Inventory {
         try h.record("T", id(960))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        deq(inv.move.map { $0.id }, [Value(id(950))])
-        deq(inv.blocked.map { $0.id }, [Value(id(960))])
-        match(inv.blocked[0].error, "1 unparseable lines")
+        deq(inv["move"].map { $0["id"] }, [Value(id(950))])
+        deq(inv["blocked"].map { $0["id"] }, [Value(id(960))])
+        match(inv["blocked"][0]["error"], "1 unparseable lines")
         let result = try move(inv, by[h.acct.Z]!, h.paths)
-        deq(result.receipt.failed.map { $0.error }, ["1 unparseable lines"])
-        eq(result.receipt.sessions.length, 1)
+        deq(result["receipt"]["failed"].map { $0["error"] }, ["1 unparseable lines"])
+        eq(result["receipt"]["sessions"].length, 1)
     }
 
     @Test("same-root histories with different content are never folded together")
@@ -53,9 +53,9 @@ extension Engine.Inventory {
         try h.record("T", id(945))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        eq(inv.twice, 0)
-        eq(inv.apart, 2)
-        deq(inv.move.map { $0.id }.sorted(), [Value(id(940)), Value(id(945))])
+        eq(inv["twice"], 0)
+        eq(inv["apart"], 2)
+        deq(inv["move"].map { $0["id"] }.sorted(), [Value(id(940)), Value(id(945))])
     }
 
     @Test("compatible source versions that need merging are blocked")
@@ -65,15 +65,15 @@ extension Engine.Inventory {
         try h.write(id(942), source)
         try h.record("P", id(942))
         let richer = fork(source, id(942), id(943), "Richer")
-        richer[0].toolUseResult = ["stdout": "finished", "stderr": ""]
+        richer[0]["toolUseResult"] = ["stdout": "finished", "stderr": ""]
         try h.write(id(943), richer)
         try h.record("T", id(943))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        deq(inv.move, [])
-        eq(inv.blocked.length, 1)
-        match(inv.blocked[0].error, "multiple compatible source versions require merging")
-        eq(inv.twice, 1)
+        deq(inv["move"], [])
+        eq(inv["blocked"].length, 1)
+        match(inv["blocked"][0]["error"], "multiple compatible source versions require merging")
+        eq(inv["twice"], 1)
     }
 
     @Test("runtime latch drift remains one blocked history")
@@ -87,9 +87,9 @@ extension Engine.Inventory {
         try h.record("T", id(947))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        eq(inv.move.length, 0)
-        eq(inv.blocked.length, 1)
-        eq(inv.twice, 1)
+        eq(inv["move"].length, 0)
+        eq(inv["blocked"].length, 1)
+        eq(inv["twice"], 1)
     }
 
     @Test("different relocation state keeps both histories")
@@ -103,7 +103,7 @@ extension Engine.Inventory {
         try h.record("T", id(949))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        deq(inv.move.map { $0.id }.sorted(), [Value(id(948)), Value(id(949))])
+        deq(inv["move"].map { $0["id"] }.sorted(), [Value(id(948)), Value(id(949))])
     }
 
     @Test("a conflicting same-root history is refused instead of hidden")
@@ -113,16 +113,16 @@ extension Engine.Inventory {
         try h.write(id(935), source)
         try h.record("P", id(935))
         let conflict = fork(source, id(935), id(937), "Conflict")
-        let repeated = conflict.find { $0.type == "assistant" }
+        let repeated = conflict.find { $0["type"] == "assistant" }
         conflict.push(.spread(repeated, ["message": ["role": "assistant", "content": "different"]]))
         try h.write(id(937), conflict)
         try h.record("T", id(937))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        deq(inv.move.map { $0.id }, [Value(id(935))])
-        deq(inv.blocked.map { $0.id }, [Value(id(937))])
+        deq(inv["move"].map { $0["id"] }, [Value(id(935))])
+        deq(inv["blocked"].map { $0["id"] }, [Value(id(937))])
         let result = try move(inv, by[h.acct.Z]!, h.paths)
-        match(result.receipt.failed[0].error, "conflicting duplicate uuids")
+        match(result["receipt"]["failed"][0]["error"], "conflicting duplicate uuids")
     }
 
     @Test("new sidecars remain visible through a shared transcript")
@@ -134,17 +134,17 @@ extension Engine.Inventory {
         let pick = { () throws -> (from: Value, to: Value) in let by = try Self.byAccount(h); return ([by[h.acct.P]!], by[h.acct.Z]!) }
         var p = try pick()
         let first = try move(try inventory(p.from, p.to, h.paths), p.to, h.paths)
-        let older = first.receipt.sessions[0].targetId
+        let older = first["receipt"]["sessions"][0]["targetId"]
         try mkdirp(path.join(h.project, id(985), "subagents"))
         try writeText(path.join(h.project, id(985), "subagents", "agent-n.jsonl"), "{\"agent\":\"n\"}\n")
         try h.record("P", id(985))
         p = try pick()
         let inv = try inventory(p.from, p.to, h.paths)
-        eq(inv.there.length, 1)
-        deq(inv.move, [])
+        eq(inv["there"].length, 1)
+        deq(inv["move"], [])
         let second = try move(inv, p.to, h.paths)
-        eq(second.ok, true)
-        eq(second.receipt.sessions.length, 0)
+        eq(second["ok"], true)
+        eq(second["receipt"]["sessions"].length, 0)
         deq(try Self.names(h.dir("P")), [])
         deq(Value(try readdir(h.dir("Z")).map { Value(sliceString($0, 6, $0.utf16.count - 5)) }), [older])
     }
@@ -163,10 +163,10 @@ extension Engine.Inventory {
         try writeText(path.join(h.project, id(870), "subagents", "new.jsonl"), "{\"new\":true}\n")
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        eq(inv.twice, 1)
-        deq(inv.move, [])
-        eq(inv.blocked.length, 1)
-        match(inv.blocked[0].error, "multiple compatible source versions require merging")
+        eq(inv["twice"], 1)
+        deq(inv["move"], [])
+        eq(inv["blocked"].length, 1)
+        match(inv["blocked"][0]["error"], "multiple compatible source versions require merging")
         eq(try readdir(h.dir("P")).count, 1)
         eq(try readdir(h.dir("T")).count, 1)
     }
@@ -185,8 +185,8 @@ extension Engine.Inventory {
         try writeText(path.join(h.project, id(890), "subagents", "agent.jsonl"), "{\"version\":2}\n")
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        eq(inv.twice, 0)
-        deq(inv.move.map { $0.id }.sorted(), Value([Value(id(880)), Value(id(890))]).sorted())
+        eq(inv["twice"], 0)
+        deq(inv["move"].map { $0["id"] }.sorted(), Value([Value(id(880)), Value(id(890))]).sorted())
     }
 
     @Test("target sidecar drift after inventory keeps the source record")
@@ -201,16 +201,16 @@ extension Engine.Inventory {
         let pick = { () throws -> (from: Value, to: Value) in let by = try Self.byAccount(h); return ([by[h.acct.P]!], by[h.acct.Z]!) }
         var p = try pick()
         let first = try move(try inventory(p.from, p.to, h.paths), p.to, h.paths)
-        let older = first.receipt.sessions[0].targetId
+        let older = first["receipt"]["sessions"][0]["targetId"]
         try appendText(h.transcript(id(987)), JSON.text(entry("user", 989, 988, id(987))) + "\n")
         try h.record("P", id(987))
         p = try pick()
         let inv = try inventory(p.from, p.to, h.paths)
         try unlink(sidecar)
         let second = try move(inv, p.to, h.paths)
-        eq(second.ok, false)
-        match(second.receipt.failed[0].error, "destination changed since inventory")
-        deq(second.receipt.superseded, [])
+        eq(second["ok"], false)
+        match(second["receipt"]["failed"][0]["error"], "destination changed since inventory")
+        deq(second["receipt"]["superseded"], [])
         ok(try readdir(h.dir("Z")).contains("local_\(older.str).json"))
     }
 }
