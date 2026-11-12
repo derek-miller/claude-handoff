@@ -93,6 +93,7 @@ func memoryErrorCode(_ error: Value = .undefined) throws -> Value {
 }
 
 public func memoryBudget(_ io: Value = .undefined) throws -> Value {
+    let io = MemoryIO(io)
     let limitValue = try memoryTarget(io.total ?? Value(process.totalmem()))
     let limit = toNumber(limitValue)
     // There is no separate heap limit: it equals the memory target.
@@ -127,7 +128,7 @@ public func memoryBudget(_ io: Value = .undefined) throws -> Value {
     }
     var reserved = 0.0
     func remaining() throws -> Double {
-        let used = try usage()
+        let used = MemoryUsage(try usage())
         let rss = toNumber(used.rss), heapUsed = toNumber(used.heapUsed)
         return nanMax(0, nanMin(limit - rss, heap - heapUsed) * 0.8 - reserved)
     }
@@ -145,7 +146,7 @@ public func memoryBudget(_ io: Value = .undefined) throws -> Value {
         return .undefined
     }
     let parallel = Value { _ in
-        let used = try usage()
+        let used = MemoryUsage(try usage())
         let rss = toNumber(used.rss), heapUsed = toNumber(used.heapUsed)
         let level = try pressure(), fraction = nanMax((rss + reserved) / limit, (heapUsed + reserved) / heap)
         if level === 2 || level === 4 || platform === "darwin" && level.isNull { return 1 }
@@ -194,14 +195,16 @@ func operationMemory() throws -> Value {
     return sharedMemory
 }
 func selectedMemory(_ options: Value = .undefined) throws -> Value {
+    let options = MemoryOwner(options)
     if !options.memory.nullish { return options.memory }
     if !options.cloud.memory.nullish { return options.cloud.memory }
     return try operationMemory()
 }
 func memorySignature(_ memory: Value = .undefined) throws -> Value {
+    let memory = MemoryBudget(memory)
     if !memory.signature.nullish { return memory.signature }
-    let limit = memory.limit.nullish ? try operationMemory().limit : memory.limit
-    let heap = memory.heap.nullish ? try operationMemory().heap : memory.heap
+    let limit = memory.limit.nullish ? MemoryBudget(try operationMemory()).limit : memory.limit
+    let heap = memory.heap.nullish ? MemoryBudget(try operationMemory()).heap : memory.heap
     return Value("\(limit):\(heap):native")
 }
 var artifactEngineHash: Value = .undefined
@@ -216,20 +219,24 @@ func artifactEngine() throws -> Value {
 
 func accountRef(_ arg0: Value = .undefined) throws -> Value {
     if arg0.nullish { throw EngineError.type("Cannot destructure '\(arg0)' as it is \(arg0).") }
-    return ["account": arg0.account, "org": arg0.org, "label": arg0.label]
+    let ref = AccountRef(arg0)
+    return ["account": ref.accountId, "org": ref.orgId, "label": ref.label]
 }
 public func sameAccount(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value { Value(AccountPair(a).same(AccountPair(b))) }
 func sameLogin(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value { Value(Identity(b).isLogin(of: AccountPair(a))) }
 func localCloudPending(_ account: Value = .undefined, _ retiring: Value = .undefined) throws -> Value {
     let retiring = retiring.isUndefined ? Value.newSet() : retiring
-    return Value(account.truthy && (account.unreadable["length"].truthy ||
-        account.sessions.elements.contains { session in !session.archived.truthy && !retiring.has(session.file) }))
+    let owner = Account(account)
+    return Value(account.truthy && (owner.raw["unreadable"]["length"].truthy ||
+        owner.sessions.contains { session in !session.archived.truthy && !retiring.has(session.raw["file"]) }))
 }
 func accountLabel(_ row: Value = .undefined) throws -> Value {
-    row.accountLabel ?? row.label ?? Value("\(short(row.account)) · \(short(row.org))")
+    let row = AccountRef(row)
+    return row.accountLabel ?? row.label ?? Value("\(short(row.accountId)) · \(short(row.orgId))")
 }
 func sourceProgress(_ source: Value = .undefined) throws -> Value {
-    source.truthy ? ["sourceId": Value("\(source.account)/\(source.org)"), "sourceLabel": try accountLabel(source)] : Value.newObject()
+    let ref = AccountRef(source)
+    return source.truthy ? ["sourceId": Value("\(ref.accountId)/\(ref.orgId)"), "sourceLabel": try accountLabel(source)] : Value.newObject()
 }
 public func retryableCode(_ code: Value = .undefined) throws -> Value {
     Value((["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED", "QUIT_UNCONFIRMED", "REOPEN_FAILED"] as [Value]).contains(code))
@@ -238,42 +245,46 @@ func loginLabel(_ row: Value = .undefined) throws -> Value {
     Value(try accountLabel(row).description.components(separatedBy: " · ")[0])
 }
 func openCloudChecks(_ receipt: Receipt) throws -> Value {
-    (receipt.cloudChecks ?? []).elements.filter { check in !(["complete", "cancelled", "blocked-local"] as [Value]).contains(check.status) }.value
+    (receipt.cloudChecks ?? []).elements.filter { check in !(["complete", "cancelled", "blocked-local"] as [Value]).contains(CloudCheck(check).status) }.value
 }
-func actionableCloudFailure(_ receipt: Receipt, _ row: Value = .undefined) throws -> Value {
+func actionableCloudFailure(_ receipt: Receipt, _ value: Value = .undefined) throws -> Value {
+    let row = FailedSession(value)
     if !row.cloudAccount.truthy { return row.cloudAccount }
-    if try keptCopy(receipt).call(row).truthy { return false }
+    if try keptCopy(receipt).call(value).truthy { return false }
     if optLength(row.blockedByLocal).truthy { return false }
     return Value(try receiptCloudCheck(receipt, ["account": row.cloudAccount, "org": row.cloudOrg])["status"] !== "cancelled")
 }
 func cloudCheckLabels(_ receipt: Receipt) throws -> Value {
-    unique(try openCloudChecks(receipt).elements.map { $0.label }).value
+    unique(try openCloudChecks(receipt).elements.map { CloudCheck($0).label }).value
 }
 public func waitingSessions(_ receipt: Value = .undefined) throws -> Value { try waitingSessions(Receipt(receipt)) }
 func waitingSessions(_ receipt: Receipt) throws -> Value {
-    var rows: [Value] = (receipt.held ?? []).elements.map { row in
-        ["id": row.id, "title": row.title, "localId": row.id, "recordId": row.recordId]
+    var rows: [Value] = (receipt.held ?? []).elements.map { value in
+        let row = HeldRow(value)
+        return ["id": row.id, "title": row.title, "localId": row.id, "recordId": row.recordId]
     }
-    rows += try openCloudChecks(receipt).elements.flatMap { check in (check.waiting ?? []).elements }
+    rows += try openCloudChecks(receipt).elements.flatMap { check in (CloudCheck(check).waiting ?? []).elements }
     let map = ValueMap()
-    for row in rows {
+    for value in rows {
+        let row = WaitingRow(value)
         let key = row.localId.nullish ? (try remoteId(row.id) ?? row.id) : row.localId
-        map.set(key, row)
+        map.set(key, value)
     }
     return map.values.value
 }
 public func heldCount(_ held: Value = .undefined) throws -> Value {
     let held = held.isUndefined ? [] : held
     let set = ValueSet()
-    for row in held.elements {
-        if row.sources.nullish { set.add(row.id); continue }
-        for source in row.sources.elements { set.add(source.file ?? Value("\(source.account)/\(source.org)/\(source.id)")) }
+    for row in held.elements.map(HeldRow.init) {
+        if row.raw["sources"].nullish { set.add(row.id); continue }
+        for source in row.heldSources { set.add(source.file ?? Value("\(source.accountId)/\(source.orgId)/\(source.id)")) }
     }
     return Value(set.size)
 }
 public func cloudCancelToken(_ file: Value = .undefined, _ check: Value = .undefined) throws -> Value {
+    let check = CloudCheck(check)
     let sessionIds: Value = check.sessionIds.truthy ? defaultSorted(unique(check.sessionIds.elements)).value : .null
-    return Value(sha(stable(["file": file, "account": check.account, "org": check.org, "sessionIds": sessionIds])))
+    return Value(sha(stable(["file": file, "account": check.accountId, "org": check.orgId, "sessionIds": sessionIds])))
 }
 
 public func pendingPresentation(_ receipt: Value = .undefined, _ source: Value = .undefined, _ account: Value = .undefined, _ mode: Value = .undefined, _ table: Value = .undefined, _ scheduler: Value = .undefined, _ timeouts: Value = .undefined, _ identity: Value = .undefined) throws -> Value { try pendingPresentation(Receipt(receipt), source, account, mode, table, scheduler, timeouts, identity) }
@@ -282,10 +293,11 @@ func pendingPresentation(_ receipt: Receipt, _ source: Value = .undefined, _ acc
     let scheduler = scheduler.isUndefined ? false : scheduler
     let timeouts = timeouts.isUndefined ? Value.newMap() : timeouts
     let identity = identity.isUndefined ? .null : identity
+    let signedIn = Account(account).signedIn
     let empty: Value = ["pendingState": .null, "pendingAction": .null, "pendingCount": .null, "pendingAutomatic": false]
     if !source.truthy { return empty }
     if mode === "partial" {
-        let notMoved = try receiptSummary(receipt).notMoved.elements.filter { row in try sameAccount(row, source).truthy }
+        let notMoved = try ReceiptSummary(receiptSummary(receipt)).notMoved.elements.filter { row in try sameAccount(row, source).truthy }
         return Value.spread(empty, ["pendingState": "partial", "pendingAction": "blocked", "pendingCount": Value(notMoved.count)])
     }
     if mode === "recovery" { return Value.spread(empty, ["pendingState": "interrupted", "pendingAction": "finish"]) }
@@ -293,11 +305,11 @@ func pendingPresentation(_ receipt: Receipt, _ source: Value = .undefined, _ acc
         let undoing = optLength(receipt.remoteUndoing)
         let partial = toNumber(undoing ?? 0) < toNumber(optLength(receipt.remote) ?? 0)
         return Value.spread(empty, ["pendingState": undoing.truthy ? "undo-login" : "undo",
-                                    "pendingAction": undoing.truthy && !account.signedIn.truthy ? "sign-in" : "finish",
+                                    "pendingAction": undoing.truthy && !signedIn.truthy ? "sign-in" : "finish",
                                     "pendingPartial": Value(partial)])
     }
     if mode === "local" {
-        let held = try (receipt.held ?? []).elements.filter { row in try row.sources.elements.contains { member in try sameAccount(member, source).truthy } }
+        let held = try (receipt.held ?? []).elements.map(HeldRow.init).filter { row in try row.heldSources.contains { member in try sameAccount(member.raw, source).truthy } }
         let owned = try processRows(table).filter { worker in
             try worker.isSeparateWorker && held.contains { row in try ownsWorker(Value.newSet(worker.ids), row.id, row.recordId).truthy }
         }
@@ -307,38 +319,39 @@ func pendingPresentation(_ receipt: Receipt, _ source: Value = .undefined, _ acc
         let seconds = ValueSet(open.map { row in timeouts.get(lowerOpt(row.recordId)) })
         let openIds = ValueSet(open.map { $0.id })
         let pendingState: Value = external ? "external" : automatic && owned.count > 0 ? "open" : "held"
-        let pendingCount: Value = held.count > 0 ? try heldCount(held.value) : .null
+        let pendingCount: Value = held.count > 0 ? try heldCount(held.map(\.raw).value) : .null
         let pendingIdleSeconds: Value = automatic && open.count == held.count && seconds.size == 1 ? (seconds.values[0] ?? .null) : .null
         let pendingAction: Value = external ? "wait" : owned.count > 0 || scheduler.truthy ? "restart" : "finish"
         return Value.spread(empty, ["pendingState": pendingState, "pendingCount": pendingCount, "pendingAutomatic": Value(automatic),
                                     "pendingOpenCount": Value(openIds.size), "pendingIdleSeconds": pendingIdleSeconds, "pendingAction": pendingAction])
     }
-    let failures = source.failures ?? [], waiting = source.waiting ?? []
-    let pending = failures.elements + waiting.elements
-    let ids = unique(pending.map { $0.id }.filter { $0.truthy })
-    let archived = ValueSet(try (receipt.remote ?? []).elements.filter { row in try sameAccount(row, source).truthy }.map { row in try remoteId(row.id) })
+    let pendingSource = PendingSource(source)
+    let failures = pendingSource.failures ?? [], waiting = pendingSource.waiting ?? []
+    let failureRows = failures.elements.map(WaitingRow.init), waitingRows = waiting.elements.map(WaitingRow.init)
+    let ids = unique((failureRows + waitingRows).map(\.id).filter { $0.truthy })
+    let archived = ValueSet(try (receipt.remote ?? []).elements.filter { row in try sameAccount(row, source).truthy }.map { row in try remoteId(RemoteSession(row).id) })
     let countValue: Value
-    if failures.elements.contains(where: { !$0.id.truthy }) {
+    if failureRows.contains(where: { !$0.id.truthy }) {
         countValue = .null
     } else if !ids.isEmpty {
         countValue = Value(ids.count)
     } else {
-        countValue = source.sessionIds.truthy ? Value(try source.sessionIds.elements.filter { id in !archived.has(try remoteId(id)) }.count) : .null
+        countValue = pendingSource.sessionIds.truthy ? Value(try pendingSource.sessionIds.elements.filter { id in !archived.has(try remoteId(id)) }.count) : .null
     }
     let blocked = try historyLimited(source)
     let state: Value
     if blocked.truthy {
-        state = failures.elements.contains { $0.code === "CLOUD_BUDGET_LIMIT" } ? "budget-limit" : failures.elements.contains { $0.code === "CLOUD_PARSER_LIMIT" } ? "parser-limit" : "limit"
-    } else if failures.length > 0 && failures.elements.allSatisfy({ $0.code === "CLOUD_AUTH_PENDING" }) {
+        state = failureRows.contains { $0.code === "CLOUD_BUDGET_LIMIT" } ? "budget-limit" : failureRows.contains { $0.code === "CLOUD_PARSER_LIMIT" } ? "parser-limit" : "limit"
+    } else if failures.length > 0 && failureRows.allSatisfy({ $0.code === "CLOUD_AUTH_PENDING" }) {
         state = "login"
-    } else if failures.length > 0 && failures.elements.allSatisfy({ $0.code === "CLOUD_MEMORY_PRESSURE" }) {
+    } else if failures.length > 0 && failureRows.allSatisfy({ $0.code === "CLOUD_MEMORY_PRESSURE" }) {
         state = "memory"
     } else {
-        state = failures.length > 0 || waiting.elements.contains { $0.code === "CLOUD_MEMORY_DEFERRED" } ? "waiting" : waiting.length > 0 ? "cloud-open" : "cleanup"
+        state = failures.length > 0 || waitingRows.contains { $0.code === "CLOUD_MEMORY_DEFERRED" } ? "waiting" : waiting.length > 0 ? "cloud-open" : "cleanup"
     }
     let action: Value
-    if blocked.truthy { action = "blocked" } else if !account.signedIn.truthy { action = "sign-in" } else if try waiting.length > 0 && canRestartWaiting(Receipt(["cloudChecks": [source]]), table).truthy { action = "restart" } else { action = "wait" }
-    let retryAt: Value = account.signedIn.truthy && !blocked.truthy && state !== "cloud-open" ? try cloudRetryAt(receipt, source, identity) : .null
+    if blocked.truthy { action = "blocked" } else if !signedIn.truthy { action = "sign-in" } else if try waiting.length > 0 && canRestartWaiting(Receipt(["cloudChecks": [source]]), table).truthy { action = "restart" } else { action = "wait" }
+    let retryAt: Value = signedIn.truthy && !blocked.truthy && state !== "cloud-open" ? try cloudRetryAt(receipt, source, identity) : .null
     return ["pendingState": state, "pendingAction": action, "pendingCount": countValue, "pendingAutomatic": Value(!blocked.truthy), "pendingRetryAt": retryAt]
 }
 
@@ -348,57 +361,61 @@ func needsRecovery(_ receipt: Receipt) throws -> Value {
 }
 
 func recoveryFamilies(_ receipt: Receipt) throws -> Value {
-    let transfers = receipt.taskTransfers ?? [], checkpoint = receipt.appendCheckpoint
-    if !checkpoint.truthy { return transfers }
+    let transfers = receipt.taskTransfers ?? [], checkpoint = AppendCheckpoint(receipt.appendCheckpoint)
+    if !checkpoint.isPresent { return transfers }
     if ["sessions", "superseded"].contains(where: { key in
-        !isSafeInteger(checkpoint[key]) || toNumber(checkpoint[key]) < 0 || toNumber(checkpoint[key]) > toNumber(optLength(receipt.raw[key]) ?? 0)
+        !isSafeInteger(checkpoint.raw[key]) || toNumber(checkpoint.raw[key]) < 0 || toNumber(checkpoint.raw[key]) > toNumber(optLength(receipt.raw[key]) ?? 0)
     }) || !checkpoint.held.isArray { throw EngineError("invalid append checkpoint") }
     if receipt.undoing.truthy { return transfers }
     let offset = checkpoint.taskTransfers
     if !isSafeInteger(offset) || toNumber(offset) < 0 || toNumber(offset) > Double(transfers.length) { throw EngineError("invalid append checkpoint") }
     let offsetInt = offset.asInt!
     let committed: [Value] = sliceArray((receipt.sessions ?? []).elements, 0, checkpoint.sessions.asInt!)
-        .filter { $0.taskFamily.truthy }.map { row in [row.taskFamily, row.targetRecordId] }
-    let expected: [Value] = sliceArray(transfers.elements, 0, offsetInt).flatMap { family in family.recordIds.elements.map { id in [family.key, id] as Value } }
-    let retired = ValueSet(sliceArray((receipt.superseded ?? []).elements, 0, checkpoint.superseded.asInt!).filter { $0.source.truthy }
+        .map(PlacedSession.init).filter { $0.taskFamily.truthy }.map { row in [row.taskFamily, row.targetRecordId] }
+    let expected: [Value] = sliceArray(transfers.elements, 0, offsetInt).map(TaskFamily.init).flatMap { family in family.recordIds.elements.map { id in [family.key, id] as Value } }
+    let retired = ValueSet(sliceArray((receipt.superseded ?? []).elements, 0, checkpoint.superseded.asInt!).map(RetirementItem.init).filter { $0.source.truthy }
         .flatMap { row in row.moved.elements.map { $0[0] } })
     if stable(defaultSorted(committed).value) != stable(defaultSorted(expected).value) ||
-        transfers.elements.enumerated().contains(where: { index, family in family.files.elements.contains { file in retired.has(file) != (index < offsetInt) } }) {
+        transfers.elements.map(TaskFamily.init).enumerated().contains(where: { index, family in family.files.elements.contains { file in retired.has(file) != (index < offsetInt) } }) {
         throw EngineError("invalid append checkpoint")
     }
     return sliceArray(transfers.elements, offsetInt).value
 }
 
 func inspector(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
-    options.inspect ?? options.io.inspect ?? Value { _ in try options.processes ?? processTable(Value(paths.claudeApp)) }
+    let options = RecoveryOptions(options)
+    return options.inspect ?? RestartIO(options.io).inspect ?? Value { _ in try options.processes ?? processTable(Value(paths.claudeApp)) }
 }
 public func keptCopy(_ receipt: Value = .undefined) throws -> Value { try keptCopy(Receipt(receipt)) }
 func keptCopy(_ receipt: Receipt) throws -> Value {
-    let linked = ValueSet(try (receipt.failed ?? []).elements.filter { !$0.cloudAccount.truthy }
-        .flatMap { row in (row.sources ?? []).elements.flatMap { source in (source.remoteIds ?? []).elements } })
+    let linked = ValueSet(try (receipt.failed ?? []).elements.map(FailedSession.init).filter { !$0.cloudAccount.truthy }
+        .flatMap { row in (row.sources ?? []).elements.flatMap { source in (FailureSource(source).remoteIds ?? []).elements } })
     return Value { args in
-        let row = arg(args, 0)
+        let row = FailedSession(arg(args, 0))
         return Value(try row.code === "CLOUD_UNPROVEN" && !optLength(row.blockedByLocal).truthy && !linked.has(remoteId(row.id)))
     }
 }
 func receiptOkay(_ receipt: Receipt) throws -> Value {
     let kept = try keptCopy(receipt)
-    return Value(try receipt.verification.ok !== false && (receipt.failed ?? []).elements.allSatisfy { try kept.call($0).truthy })
+    return Value(try ReceiptVerification(receipt.verification).ok !== false && (receipt.failed ?? []).elements.allSatisfy { try kept.call($0).truthy })
 }
 public func finishOkay(_ receipt: Value = .undefined) throws -> Value { try finishOkay(Receipt(receipt)) }
 func finishOkay(_ receipt: Receipt) throws -> Value {
-    Value(try receipt.verification.ok !== false && !optLength(receipt.verification.problems).truthy &&
+    let verification = ReceiptVerification(receipt.verification)
+    return Value(try verification.ok !== false && !optLength(verification.problems).truthy &&
         !(receipt.failed ?? []).elements.contains { row in try actionableCloudFailure(receipt, row).truthy } &&
         !(receipt.cloudError.truthy && openCloudChecks(receipt).length > 0))
 }
 public func problemText(_ problem: Value = .undefined) throws -> Value {
-    Value("\(problem.title ?? problem.id) | \(problem.check) verification failed")
+    let problem = ProblemRow(problem)
+    return Value("\(problem.title ?? problem.id) | \(problem.check) verification failed")
 }
 func cancelCloudChecks(_ receipt: Receipt, _ checks: Value = .undefined) throws -> Value {
     let checks = checks.isUndefined ? try openCloudChecks(receipt) : checks
-    for check in checks.elements {
-        check.status = try (receipt.failed ?? []).elements.contains { row in try cloudTagged(row, check).truthy && optLength(row.blockedByLocal).truthy } ? "blocked-local" : "cancelled"
-        if check.status === "blocked-local" && optLength(check.waiting).truthy { check.cancelledWaiting = check.waiting; check.removeKey("waiting") }
+    for value in checks.elements {
+        let check = CloudCheck(value)
+        check.status = try (receipt.failed ?? []).elements.contains { row in try cloudTagged(row, value).truthy && optLength(FailedSession(row).blockedByLocal).truthy } ? "blocked-local" : "cancelled"
+        if check.status === "blocked-local" && optLength(check.waiting).truthy { check.cancelledWaiting = check.waiting; check.raw.removeKey("waiting") }
         check.cancelledAt = Value(isoNow())
     }
     return .undefined
@@ -409,10 +426,11 @@ func milliseconds(_ value: Value = .undefined) throws -> Value {
 }
 func typed(_ e: Value = .undefined) throws -> Value {
     if !e.truthy { return e }
-    return Value(e.typeOf == "object" && TYPES.contains(e.type.asString ?? "\u{0}") && e.uuid.isString && !e.isSidechain.truthy)
+    let entry = TranscriptEntry(e)
+    return Value(e.typeOf == "object" && TYPES.contains(entry.type.asString ?? "\u{0}") && entry.uuid.isString && !entry.isSidechain.truthy)
 }
 func message(_ e: Value = .undefined) throws -> Value {
-    and(try typed(e), Value(e.type !== "progress"))
+    and(try typed(e), Value(TranscriptEntry(e).type !== "progress"))
 }
 
 // MARK: - Processes
@@ -435,27 +453,27 @@ public func parseProcesses(_ processes: Value = .undefined, _ commands: Value = 
         rows.append(["pid": Value(toNumber(.string(match[1]!))), "ppid": Value(toNumber(.string(match[2]!))), "started": Value(match[3]!),
                      "executable": Value(executable), "worker": Value(worker), "ids": (identities["\(match[1]!)/\(match[3]!)"] ?? []).value])
     }
-    for row in rows where !registrations.elements.isEmpty {
+    for row in rows.map(ProcessRow.init) where !registrations.elements.isEmpty {
         let started = dateParse(row.started.description)
-        let registered = registrations.elements.first { item in
-            item.pid === row.pid && item.pidDomain === "darwin" && started.isFinite &&
+        let registered = registrations.elements.map(SessionRegistration.init).first { item in
+            item.pid === row.raw["pid"] && item.pidDomain === "darwin" && started.isFinite &&
                 parseUTC("\(item.procStart) UTC") == started && UUID.test((item.sessionId ?? "").description)
         }
-        if let registered, row.worker.truthy {
-            row.ids = unique(row.ids.elements + [.string(registered.sessionId.description.lowercased())]).value
-            row.cwd = registered.cwd.isString ? registered.cwd : .null
-            row.sessionName = registered.name.isString ? registered.name : .null
+        if let registered, row.isWorker {
+            row.raw["ids"] = unique(row.ids + [.string(registered.sessionId.description.lowercased())]).value
+            row.raw["cwd"] = registered.cwd.isString ? registered.cwd : .null
+            row.raw["sessionName"] = registered.name.isString ? registered.name : .null
         }
     }
-    let byPid = ValueMap(rows.map { ($0.pid, $0) })
+    let byPid = ValueMap(rows.map { ($0["pid"], $0) })
     for row in rows {
         let visited = ValueSet()
         var parent = row
-        row.desktopPid = .null
-        while parent.truthy && !visited.has(parent.pid) {
-            visited.add(parent.pid)
-            if desktopExecutable(parent.executable).truthy || parent.executable === Value(path.join(app, "Contents/MacOS/Claude")) { row.desktopPid = parent.pid; break }
-            parent = byPid.get(parent.ppid)
+        row["desktopPid"] = .null
+        while parent.truthy && !visited.has(parent["pid"]) {
+            visited.add(parent["pid"])
+            if desktopExecutable(parent["executable"]).truthy || parent["executable"] === Value(path.join(app, "Contents/MacOS/Claude")) { row["desktopPid"] = parent["pid"]; break }
+            parent = byPid.get(parent["ppid"])
         }
     }
     return rows.value
@@ -474,7 +492,7 @@ public func processTable(_ app: Value = .undefined) throws -> Value {
         registrations = try fs.names(directory).filter { re(#"^\d+\.json$"#).test($0) }.flatMap { name -> [Value] in
             do {
                 let row = try JSON.parse(fs.readText(path.join(directory, name)))
-                return row.pid === Value(toNumber(.string(sliceString(name, 0, -5)))) ? [row] : []
+                return SessionRegistration(row).pid === Value(toNumber(.string(sliceString(name, 0, -5)))) ? [row] : []
             } catch { return [] }
         }
     } catch {}
@@ -519,15 +537,15 @@ func ownsWorker(_ live: Value = .undefined, _ id: Value = .undefined, _ recordId
 }
 func processIdentity(_ row: Value = .undefined) throws -> Value { ProcessRow(row).identity }
 func restartFingerprint(_ desktop: Value = .undefined, _ rows: Value = .undefined) throws -> Value {
-    let desktopPid = ProcessRow(desktop).pid
+    let desktop = ProcessRow(desktop), desktopPid = desktop.pid
     let workers: [Value] = processRows(rows).filter { $0.isWorker && $0.desktopPid == desktopPid && $0.pid != desktopPid }
-        .map { ["pid": $0.raw["pid"], "started": $0.raw["started"], "ids": $0.raw["ids"]] }
-    let sorted = stableSorted(workers) { a, b in toNumber(a.pid) - toNumber(b.pid) }
-    return Value(sha(stable(["desktop": ["pid": desktop.pid, "started": desktop.started], "workers": sorted.value])))
+        .map { ["pid": $0.raw["pid"], "started": $0.started, "ids": $0.raw["ids"]] }
+    let sorted = stableSorted(workers) { a, b in toNumber(a["pid"]) - toNumber(b["pid"]) }
+    return Value(sha(stable(["desktop": ["pid": desktop.raw["pid"], "started": desktop.started], "workers": sorted.value])))
 }
 func processOwns(_ ids: [Value], _ row: Value = .undefined) throws -> Value {
-    let record = try desktopRecordOf(row)
-    return try ownsWorker(Value.newSet(ids), row.id, record.sessionId)
+    let source = MoveSource(row)
+    return try ownsWorker(Value.newSet(ids), source.id, source.desktopRecord.sessionId)
 }
 
 func workerGroups(_ table: Value = .undefined) throws -> [WorkerGroup] {
@@ -553,7 +571,7 @@ func workerGroups(_ table: Value = .undefined) throws -> [WorkerGroup] {
 }
 
 func canRestartWaiting(_ receipt: Receipt, _ table: Value = .undefined) throws -> Value {
-    Value(try waitingSessions(receipt).elements.contains { row in
+    Value(try waitingSessions(receipt).elements.map(WaitingRow.init).contains { row in
         let owns = { (ids: [Value]) throws -> Bool in try ownsWorker(Value.newSet(ids), row.localId, row.recordId).truthy }
         return try workerGroups(table).contains { try owns($0.ids) } && !processRows(table).contains { worker in try worker.isWorker && !worker.hasDesktop && owns(worker.ids) }
     })
@@ -565,61 +583,63 @@ func restartPlan(_ inv: MovePlan, _ paths: DataLayout, _ table: Value = .undefin
     let app = path.join(paths.claudeApp, "Contents/MacOS/Claude")
     let apps = processRows(table).filter { $0.isDesktop || $0.executable == app }.map(\.raw)
     if apps.count != 1 { return .null }
-    let desktop = apps[0], desktopPid = ProcessRow(desktop).pid
+    let desktop = ProcessRow(apps[0]), desktopPid = desktop.pid
     let all = try accounts(paths)
     let owned = try workerGroups(table).filter { $0.root.desktopPid == desktopPid }
     func matching(_ row: Value) throws -> [Value] {
         try processRows(table).filter { worker in
-            try worker.isWorker && worker.pid != desktopPid && (row.members ?? [row]).elements.contains { member in try processOwns(worker.ids, member).truthy }
+            try worker.isWorker && worker.pid != desktopPid && MoveSource(row).members.contains { member in try processOwns(worker.ids, member.raw).truthy }
         }.map(\.raw)
     }
     func stoppable(_ rows: [Value]) -> Bool { rows.count > 0 && rows.allSatisfy { ProcessRow($0).desktopPid == desktopPid } }
     func release(_ row: Value) throws -> Value {
-        let worker: Value = try stoppable(matching(row)) ? false : row.worker
+        let source = MoveSource(row)
+        let worker: Value = try stoppable(matching(row)) ? false : source.worker
         var extra: [(String, Value)] = [("schedulerBusy", false), ("worker", worker)]
-        if row.members.truthy {
-            let members: [Value] = try row.members.elements.map { member in
-                let memberWorker: Value = try stoppable(matching(member)) ? false : member.worker
-                return Value.spread(member, ["worker": memberWorker])
+        if source.raw["members"].truthy {
+            let members: [Value] = try source.members.map { member in
+                let memberWorker: Value = try stoppable(matching(member.raw)) ? false : member.worker
+                return Value.spread(member.raw, ["worker": memberWorker])
             }
             extra.append(("members", members.value))
         }
         return Value.spread(row, Value(extra))
     }
     let target: Value = inv.isPresent ? (try all.elements.first { account in try sameAccount(account, inv.toAccount).truthy } ?? .undefined) : inv.raw
-    let released: [Value] = target.truthy ? try localPlan(try (inv.move.elements + inv.blocked.elements).map(release).value, target).move.elements : []
+    let released: [Value] = target.truthy ? MovePlan(try localPlan(try (inv.move.elements + inv.blocked.elements).map(release).value, target)).move.elements : []
     var candidates: [(row: Value, source: Value)] = []
     if inv.isPresent {
-        candidates += released.filter { row in inv.blocked.elements.contains { source in source.file === row.file } }.map { (row: $0, source: $0) }
+        candidates += released.filter { row in inv.blocked.elements.contains { source in MoveSource(source).file === MoveSource(row).file } }.map { (row: $0, source: $0) }
         for source in inv.there.elements {
-            let target = inv.targets.elements.first { row in row.id === source.cloudTargetId }
+            let target = inv.targets.elements.first { row in MoveTarget(row).id === MoveSource(source).cloudTargetId }
             if let target, !(try retirementOwnership(inv, release(source), ["history": target]).truthy) {
-                for row in (source.members ?? [source]).elements + [target] where try row.worker.truthy && !rehomeOwnership(release(row)).truthy {
+                for row in MoveSource(source).members.map(\.raw) + [target] where try MoveSource(row).worker.truthy && !rehomeOwnership(release(row)).truthy {
                     candidates.append((row: row, source: source))
                 }
             }
         }
         for source in inv.move.elements {
-            for row in inv.targets.elements where try row.worker.truthy && included(row, source).truthy && !ownership(release(row)).truthy {
+            for row in inv.targets.elements where try MoveSource(row).worker.truthy && included(row, source).truthy && !ownership(release(row)).truthy {
                 candidates.append((row: row, source: source))
             }
         }
     }
     let held: Value = []
-    func add(_ row: Value, _ source: Value, _ matches: [Value]) throws -> Bool {
-        let record = try desktopRecordOf(row), file = try desktopFileOf(row)
-        if held.elements.contains(where: { item in item.record === file && item.sources.elements.contains { member in member.file === source.file } }) { return false }
-        let release: Value = or(or(or(source.taskFamily, source.taskOwned), record.scheduledTaskId), record.notifySessionId).truthy ? "scheduler" : matches.count > 0 ? "worker" : "unknown"
-        let sources: [Value] = (source.members ?? [source]).elements.map { item in ["id": item.id, "file": item.file, "account": item.account.account, "org": item.account.org] }
-        let workerRows: [Value] = matches.map { ["pid": $0.pid, "started": $0.started, "desktopPid": $0.desktopPid] }
+    func add(_ value: Value, _ sourceValue: Value, _ matches: [Value]) throws -> Bool {
+        let row = MoveSource(value), source = MoveSource(sourceValue)
+        let record = row.desktopRecord, file = try desktopFileOf(value)
+        if held.elements.map(HeldRow.init).contains(where: { item in item.record === file && item.heldSources.contains { member in member.file === source.file } }) { return false }
+        let release: Value = or(or(or(source.taskFamily, source.taskOwnedValue), record.scheduledTaskId), record.notifySessionId).truthy ? "scheduler" : matches.count > 0 ? "worker" : "unknown"
+        let sources: [Value] = source.members.map { item in ["id": item.id, "file": item.file, "account": item.account.accountId, "org": item.account.orgId] }
+        let workerRows: [Value] = matches.map(ProcessRow.init).map { ["pid": $0.raw["pid"], "started": $0.started, "desktopPid": $0.raw["desktopPid"]] }
         held.push(["id": row.id, "record": file, "recordId": record.sessionId, "title": or(or(record.title, row.title), "Untitled"),
-                   "account": row.account.account, "org": row.account.org, "cwd": record.cwd,
+                   "account": row.account.accountId, "org": row.account.orgId, "cwd": record.cwd,
                    "release": release, "sources": sources.value, "workers": workerRows.value])
         return true
     }
     for (row, source) in candidates {
         let matches = try matching(row)
-        if stoppable(matches) || inv.blocked.elements.contains(where: { item in item.file === source.file && item.schedulerBusy.truthy }) && !matches.contains(where: { ProcessRow($0).desktopPid != desktopPid }) {
+        if stoppable(matches) || inv.blocked.elements.map(MoveSource.init).contains(where: { item in item.file === MoveSource(source).file && item.schedulerBusy.truthy }) && !matches.contains(where: { ProcessRow($0).desktopPid != desktopPid }) {
             _ = try add(row, source, matches)
         }
     }
@@ -627,13 +647,15 @@ func restartPlan(_ inv: MovePlan, _ paths: DataLayout, _ table: Value = .undefin
     while added && inv.isPresent {
         added = false
         for source in released + inv.there.elements {
-            let related = try held.elements.first { item in
-                try item.sources.elements.contains { member in
-                    let current = inv.sources.elements.first { row in row.file === member.file } ?? .undefined
-                    return try current.truthy && (source.members ?? [source]).elements.contains { row in
-                        try sameAccount(row.account, current.account).truthy &&
-                            (row.taskFamily.truthy && row.taskFamily === current.taskFamily || row.record.forkedFromSessionId === current.record.sessionId ||
-                                current.record.forkedFromSessionId === row.record.sessionId)
+            let related = try held.elements.map(HeldRow.init).first { item in
+                try item.heldSources.contains { member in
+                    guard let current = inv.sources.elements.map(MoveSource.init).first(where: { row in row.file === member.file }), current.raw.truthy else { return false }
+                    let currentRecord = DesktopRecord(current.record)
+                    return try MoveSource(source).members.contains { row in
+                        let record = DesktopRecord(row.record)
+                        return try sameAccount(row.account.raw, current.account.raw).truthy &&
+                            (row.taskFamily.truthy && row.taskFamily === current.taskFamily || record.forkedFromSessionId === currentRecord.sessionId ||
+                                currentRecord.forkedFromSessionId === record.sessionId)
                     }
                 }
             }
@@ -641,38 +663,38 @@ func restartPlan(_ inv: MovePlan, _ paths: DataLayout, _ table: Value = .undefin
         }
     }
     if inv.isPresent && held.length == 0 { return .null }
-    let known: [Value] = all.elements.flatMap { account in account.sessions.elements.map { session in Value.spread(session, ["account": account]) } }
+    let known: [DesktopSession] = all.elements.flatMap { account in Account(account).sessions.map { session in DesktopSession(Value.spread(session.raw, ["account": account])) } }
     let current = try signedIn(paths, table)
     let affected: [Value] = try owned.map { group in
-        var matches = try known.filter { row in try processOwns(group.ids, row).truthy }
+        var matches = try known.filter { row in try processOwns(group.ids, row.raw).truthy }
         let direct = matches.filter { row in
             group.ids.value.includes(row.record.sessionId.nullish ? .undefined : .string(re("^local_").replace(row.record.sessionId.description, "")))
         }
         if !direct.isEmpty { matches = direct }
         let scoped = try matches.filter { row in try sameAccount(row.account, current).truthy }
         if !scoped.isEmpty { matches = scoped }
-        let match: Value = matches.count == 1 || ValueSet(matches.map { $0.title }).size == 1 ? matches[0] : .null
-        let named = group.workers.first { $0.raw["sessionName"].truthy }?.raw ?? .undefined
-        let withCwd = group.workers.first { $0.raw["cwd"].truthy }?.raw ?? .undefined
+        let match = DesktopSession(matches.count == 1 || ValueSet(matches.map(\.title)).size == 1 ? matches[0].raw : .null)
+        let named = group.workers.first { $0.sessionName.truthy }?.sessionName ?? .undefined
+        let withCwd = group.workers.first { $0.cwd.truthy }?.cwd ?? .undefined
         let fields: [(String, Value)] = [
-            ("pid", group.root.raw["pid"]), ("started", group.root.raw["started"]), ("desktopPid", desktop.pid),
-            ("id", match.id ?? .null), ("recordId", match.record.sessionId ?? .null),
-            ("title", or(or(match.title, named.sessionName), "Another open Claude session")),
-            ("cwd", match.cwd ?? withCwd.cwd ?? .null),
+            ("pid", group.root.raw["pid"]), ("started", group.root.started), ("desktopPid", desktop.raw["pid"]),
+            ("id", match.raw["id"] ?? .null), ("recordId", match.record.sessionId ?? .null),
+            ("title", or(or(match.title, named), "Another open Claude session")),
+            ("cwd", match.cwd ?? withCwd ?? .null),
             ("pids", group.workers.map { $0.raw["pid"] }.value),
         ]
         return Value(fields)
     }
-    let selected = ValueSet(try held.elements.flatMap { row in try row.workers.elements.map(processIdentity) })
+    let selected = ValueSet(try held.elements.flatMap { row in try HeldRow(row).workers.elements.map(processIdentity) })
     let members: [Value] = processRows(table).filter { $0.desktopPid == desktopPid }.map { ["pid": $0.raw["pid"], "started": $0.raw["started"]] }
     let interrupts = affected.enumerated().filter { index, _ in
         !owned[index].workers.contains { selected.has($0.identity) }
     }.map { $0.element }
     let result: [(String, Value)] = [
-        ("app", Value(path.resolve(desktop.executable.description, "../../.."))),
-        ("desktop", ["pid": desktop.pid, "started": desktop.started]),
+        ("app", Value(path.resolve(desktop.raw["executable"].description, "../../.."))),
+        ("desktop", ["pid": desktop.raw["pid"], "started": desktop.started]),
         ("members", members.value), ("held", held), ("affected", affected.value),
-        ("interrupts", interrupts.value), ("fingerprint", try restartFingerprint(desktop, table)),
+        ("interrupts", interrupts.value), ("fingerprint", try restartFingerprint(desktop.raw, table)),
     ]
     return Value(result)
 }
@@ -707,8 +729,8 @@ func appendRestartEvent(_ paths: DataLayout, _ event: Value = .undefined) throws
         let file = path.join(paths.state, "restart-events.jsonl")
         var detail: FileStat?
         do { detail = try fs.lstat(file) } catch {
-            let error = errorObject(error)
-            if error.code !== "ENOENT" { throw EngineError(error) }
+            let error = ThrownError(error)
+            if error.code !== "ENOENT" { throw EngineError(error.raw) }
         }
         if let detail, !detail.isFile { return .undefined }
         let text = jsonText(event, 0)
@@ -732,7 +754,7 @@ func foldRestartHistory(_ paths: DataLayout, _ file: Value = .undefined, _ recei
         (!receipt.restartHistory.isArray || receipt.restartHistory.elements.contains { row in !row.truthy || row.typeOf != "object" }) { return .undefined }
     let receiptId = try restartReceiptId(paths, file)
     if !receiptId.truthy { return .undefined }
-    let outcomes = ValueMap((receipt.restartHistory ?? []).elements.map { ($0.attemptId, $0) })
+    let outcomes = ValueMap((receipt.restartHistory ?? []).elements.map { (RestartAttempt($0).attemptId, $0) })
     for name in ["restart-events.jsonl.1", "restart-events.jsonl"] {
         var handle: FileHandle?
         defer { try? handle?.close() }
@@ -742,9 +764,10 @@ func foldRestartHistory(_ paths: DataLayout, _ file: Value = .undefined, _ recei
             if !detail.isFile || Double(detail.size) > RESTART_LOG_BYTES { continue }
             let text = String(decoding: try handle!.readFile(), as: UTF8.self)
             for line in text.components(separatedBy: "\n").dropLast() {
-                guard let row = try? JSON.parse(line) else { continue }
+                guard let parsed = try? JSON.parse(line) else { continue }
+                let row = RestartEvent(parsed)
                 if row.event === "outcome" && row.receiptId === receiptId && UUID.test((row.attemptId ?? "").description) && !outcomes.has(row.attemptId) {
-                    outcomes.set(row.attemptId, row)
+                    outcomes.set(row.attemptId, parsed)
                 }
             }
         } catch {}
@@ -759,8 +782,8 @@ func updateRestartReceipt(_ paths: DataLayout, _ file: Value = .undefined, _ upd
         try [file.description, "\(file).journal"].map { name -> Value in
             var detail: FileStat?
             do { detail = try fs.lstat(name, bigint: true) } catch {
-                let error = errorObject(error)
-                if error.code !== "ENOENT" { throw EngineError(error) }
+                let error = ThrownError(error)
+                if error.code !== "ENOENT" { throw EngineError(error.raw) }
             }
             if let detail, !detail.isFile { throw EngineError("Restart receipt is not a regular file") }
             return detail.map { statIdentity($0) } ?? .null
@@ -784,7 +807,7 @@ func updateRestartReceipt(_ paths: DataLayout, _ file: Value = .undefined, _ upd
 
 public func withDesktopRestart(_ plan: Value = .undefined, _ paths: Value = .undefined, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value { try withDesktopRestart(RestartPlan(plan), DataLayout(paths), work, report, io) }
 func withDesktopRestart(_ plan: RestartPlan, _ paths: DataLayout, _ work: Value = .undefined, _ report: Value = .undefined, _ io: Value = .undefined) throws -> Value {
-    let report = fnOr(report)
+    let report = fnOr(report), io = RestartIO(io)
     var paths = paths
     paths.claudeApp = (plan.app ?? Value(paths.claudeApp)).description
     let nowValue: Value = io.now ?? Value { _ in Value(process.monotonic()) }
@@ -796,7 +819,8 @@ func withDesktopRestart(_ plan: RestartPlan, _ paths: DataLayout, _ work: Value 
     let reserve = toNumber(io.reserve ?? Value(REOPEN_RESERVE))
     let started = try now()
     var lastProgress = try now()
-    let activity: Value = ["progress": Value { _ in lastProgress = try now(); return .undefined }]
+    let progress = Value { _ in lastProgress = try now(); return .undefined }
+    let activity: Value = ["progress": progress]
     let shutdownWait = toNumber(io.shutdownWait ?? Value(SHUTDOWN_WAIT))
     let file = path.join(paths.state, "restart.json")
     let state = RestartAttempt(["at": Value(stamp()), "attemptId": Value(randomUUID()), "requestedAt": Value(isoNow()), "app": Value(paths.claudeApp),
@@ -840,12 +864,12 @@ func withDesktopRestart(_ plan: RestartPlan, _ paths: DataLayout, _ work: Value 
         }
         if try plan.held.elements.contains(where: { held in
             try processRows(live).contains { row in
-                try row.isWorker && row.desktopPid != ProcessRow(desktop).pid && ownsWorker(Value.newSet(row.ids), held.id, held.recordId).truthy
+                try row.isWorker && row.desktopPid != ProcessRow(desktop).pid && ownsWorker(Value.newSet(row.ids), HeldRow(held).id, HeldRow(held).recordId).truthy
             }
         }) { throw makeError("An external worker now owns a held session. No restart was started.", code: "RESTART_EXTERNAL_WORKER") }
         try report.call("desktop", "Closing Claude Desktop", ["live": true])
         let shutdownDeadline = try now() + shutdownWait
-        let quit = try run.call("/usr/bin/osascript", ["-e", Value("tell application \(JSON.text(Value(paths.claudeApp))) to quit")], Value(nanMax(0, shutdownDeadline - now())))
+        let quit = CommandResult(try run.call("/usr/bin/osascript", ["-e", Value("tell application \(JSON.text(Value(paths.claudeApp))) to quit")], Value(nanMax(0, shutdownDeadline - now()))))
         let gone = try quit.status === 0 && waitFor(Value { _ in
             Value(!(try inspect().elements.contains { row in
                 try plan.members.elements.contains { prior in try processIdentity(prior) === processIdentity(row) }
@@ -855,19 +879,19 @@ func withDesktopRestart(_ plan: RestartPlan, _ paths: DataLayout, _ work: Value 
             state.outcome = quit.timedOut.truthy ? "quit-timeout" : "quit-not-confirmed"
             state.error = "Claude Desktop did not confirm shutdown. Answer any native quit dialog yourself. Held records were not moved."
         } else {
-            try activity.progress.call()
+            try progress.call()
             state.exitedAt = Value(isoNow())
             state.outcome = "moving"
             try save()
             try diagnostic("exited")
             try check(true)
             result = try localActivity.run(activity) {
-                try work.call(["at": state.at, "restart": state.raw, "check": checkValue, "progress": activity.progress])
+                try work.call(["at": state.at, "restart": state.raw, "check": checkValue, "progress": progress])
             }
         }
     } catch {
         failure = errorObject(error)
-        state.error = failure.message
+        state.error = ThrownError(object: failure).message
         state.outcome = state.outcome === "closing" ? "quit-failed" : "move-failed"
     }
     // finally
@@ -878,7 +902,7 @@ func withDesktopRestart(_ plan: RestartPlan, _ paths: DataLayout, _ work: Value 
         let reopenDeadline = try now() + reserve
         let remaining = try reopenDeadline - now()
         // `open` returns before Desktop is up, so the reopen is reported after it returns.
-        let opened: Value = (try? run.call("/usr/bin/open", ["-g", "-a", Value(paths.claudeApp)], Value(nanMax(1, remaining)))) ?? ["status": .null]
+        let opened = CommandResult((try? run.call("/usr/bin/open", ["-g", "-a", Value(paths.claudeApp)], Value(nanMax(1, remaining)))) ?? ["status": .null])
         _ = try? report.call("reopen", "Opening Claude Desktop", ["live": true])
         let present = try waitFor(Value { _ in
             let rows = safeInspect()
@@ -887,40 +911,43 @@ func withDesktopRestart(_ plan: RestartPlan, _ paths: DataLayout, _ work: Value 
         state.outcome = opened.status === 0 && present.truthy ? "reopened" : "reopen-failed"
         if state.outcome === "reopened" { state.reopenedAt = Value(isoNow()) } else { state.error = "Could not confirm Claude Desktop reopened. Reopen it manually." }
     }
+    let outcome = WorkflowResult(result)
     do {
         try save()
-        if !failure.truthy && result.file.truthy && result.receipt.truthy {
-            let receipt = try updateRestartReceipt(paths, result.file, Value { args in arg(args, 0).restart = Value.spread(state.raw); return .undefined })
-            if receipt.truthy { Value.assign(result.receipt, receipt) }
+        if !failure.truthy && outcome.file.truthy && outcome.receipt.truthy {
+            let receipt = try updateRestartReceipt(paths, outcome.file, Value { args in Receipt(arg(args, 0)).restart = Value.spread(state.raw); return .undefined })
+            if receipt.truthy { Value.assign(outcome.receipt, receipt) }
         }
     } catch {
         let error = errorObject(error)
-        state.error = Value("Restart journal could not be saved: \(error.message)")
+        state.error = Value("Restart journal could not be saved: \(ThrownError(object: error).message)")
         if failure.nullish { failure = error }
     }
     let codes: Set<String> = ["MOVE_STALLED", "RESTART_REOPENED", "RESTART_PLAN_CHANGED", "RESTART_EXTERNAL_WORKER"]
     if failure.truthy {
-        stopCode = failure.code.asString.map { codes.contains($0) } == true ? failure.code : "WORK_FAILED"
+        let code = ThrownError(object: failure).code
+        stopCode = code.asString.map { codes.contains($0) } == true ? code : "WORK_FAILED"
     } else if state.outcome === "reopen-failed" {
         stopCode = "REOPEN_FAILED"
     } else if (state.outcomeBeforeReopen ?? state.outcome).description.hasPrefix("quit-") {
         stopCode = "QUIT_UNCONFIRMED"
     } else {
-        stopCode = state.error.truthy ? "WORK_FAILED" : result.ok === false ? "WORK_REFUSED" : result.truthy ? "COMPLETE" : "NO_WORK"
+        stopCode = state.error.truthy ? "WORK_FAILED" : outcome.ok === false ? "WORK_REFUSED" : outcome.isPresent ? "COMPLETE" : "NO_WORK"
     }
-    let receiptCounts: Value = result.receipt.truthy
-        ? ["sessions": optLength(result.receipt.sessions) ?? .null, "failed": optLength(result.receipt.failed) ?? .null, "remote": optLength(result.receipt.remote) ?? .null]
+    let finished = Receipt(outcome.receipt)
+    let receiptCounts: Value = finished.isPresent
+        ? ["sessions": optLength(finished.sessions) ?? .null, "failed": optLength(finished.failed) ?? .null, "remote": optLength(finished.remote) ?? .null]
         : .null
-    try diagnostic("outcome", ["receiptId": try restartReceiptId(paths, origin ?? result.file), "outcome": state.outcome, "stopCode": stopCode, "receiptCounts": receiptCounts])
+    try diagnostic("outcome", ["receiptId": try restartReceiptId(paths, origin ?? outcome.file), "outcome": state.outcome, "stopCode": stopCode, "receiptCounts": receiptCounts])
     if !failure.truthy {
         do {
-            let receiptFile = result.truthy && result.hasOwn("file") ? result.file : origin
+            let receiptFile = result.truthy && result.hasOwn("file") ? outcome.file : origin
             let receipt = try updateRestartReceipt(paths, receiptFile, Value { args in try foldRestartHistory(paths, receiptFile, Receipt(arg(args, 0))) })
-            if receipt.truthy && result.receipt.truthy { Value.assign(result.receipt, receipt) }
+            if receipt.truthy && outcome.receipt.truthy { Value.assign(outcome.receipt, receipt) }
         } catch {}
     }
-    return ["result": result, "restart": state.raw, "code": stopCode, "error": failure.message ?? state.error,
-            "ok": Value(state.outcome === "reopened" && !state.error.truthy && result.ok !== false)]
+    return ["result": result, "restart": state.raw, "code": stopCode, "error": ThrownError(object: failure).message ?? state.error,
+            "ok": Value(state.outcome === "reopened" && !state.error.truthy && outcome.ok !== false)]
 }
 
 // Where Claude Desktop, Claude Code and Claude Handoff keep their data under one home directory.

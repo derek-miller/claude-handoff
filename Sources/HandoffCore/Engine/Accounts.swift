@@ -1275,7 +1275,7 @@ let desktopBookkeeping: Set<String> = ["archived-sessions.idx", "backlog", "wait
 // empty folder for that pair in both session trees. Only folders with no sessions and no scheduled tasks qualify.
 func holdsNothing(_ dir: String) -> Bool {
     let names: [String]
-    do { names = try fs.names(dir) } catch { return errorObject(error).code === "ENOENT" }
+    do { names = try fs.names(dir) } catch { return ThrownError(error).code === "ENOENT" }
     for name in names {
         if desktopBookkeeping.contains(name) || name.hasPrefix("deleted_") { continue }
         guard name == "scheduled-tasks.json", let registry = try? fs.readJSON(path.join(dir, name)),
@@ -1301,9 +1301,9 @@ func leftovers(_ paths: DataLayout, _ all: Value = .undefined) throws -> Value {
 // Without a pair, sets aside the leftovers above; with one, sets aside that account/org if it holds nothing.
 public func tidy(_ paths: Value = .undefined, _ pair: Value = .null) throws -> Value { try tidy(DataLayout(paths), pair) }
 func tidy(_ paths: DataLayout, _ pair: Value = .null) throws -> Value {
-    let latest = try latestReceipt(paths)
-    if latest.truthy {
-        let unfinished = try latest.corrupt.truthy || needsRecovery(latest.receipt).truthy || deferredWorkflow(paths, latest).truthy
+    let latest = LatestReceipt(try latestReceipt(paths))
+    if latest.isPresent {
+        let unfinished = try latest.corrupt.truthy || needsRecovery(latest.receipt).truthy || deferredWorkflow(paths, latest.raw).truthy
         if unfinished { throw EngineError("Finish or undo the last move before tidying", code: "MOVE_UNFINISHED") }
     }
     let all = try accounts(paths).elements.map(Account.init)
