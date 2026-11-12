@@ -453,7 +453,6 @@ public func parseProcesses(_ processes: Value = .undefined, _ commands: Value = 
         rows.append(["pid": Value(toNumber(.string(match[1]!))), "ppid": Value(toNumber(.string(match[2]!))), "started": Value(match[3]!),
                      "executable": Value(executable), "worker": Value(worker), "ids": (identities["\(match[1]!)/\(match[3]!)"] ?? []).value])
     }
-    // Rows are built here, so their fields are set and read as stored rather than through ProcessRow's numbers.
     for row in rows.map(ProcessRow.init) where !registrations.elements.isEmpty {
         let started = dateParse(row.started.description)
         let registered = registrations.elements.map(SessionRegistration.init).first { item in
