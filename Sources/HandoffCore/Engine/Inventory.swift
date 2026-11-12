@@ -17,12 +17,12 @@ fileprivate func comparatorChain(_ ds: [Double]) -> Double {
 fileprivate func flatPart(_ v: Value) -> [Value] { v.isArray ? v.elements : [v] }
 
 func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ targets: Value = .undefined, _ move: Value = .undefined, _ cache: Value = .undefined, _ report: Value = .undefined, _ cutoff: Value = .undefined, _ liveSources: Value = .undefined, _ sessionIds: Value = .undefined, _ excludedIds: Value = .undefined, _ options: Value = .undefined) throws -> Value {
-    let opts = InventoryOptions(options)
     let cutoff: Value = cutoff.isUndefined ? .null : cutoff
     let liveSources: Value = liveSources.isUndefined ? .newArray() : liveSources
     let sessionIds: Value = sessionIds.isUndefined ? .null : sessionIds
     let excludedIds: Value = excludedIds.isUndefined ? .newSet() : excludedIds
     let options: Value = options.isUndefined ? .newObject() : options
+    let opts = InventoryOptions(options)
     if !cloud.truthy {
         let empty: Value = ["checked": false, "matches": [], "blocked": [], "waiting": [], "later": [], "client": .null]
         return empty
@@ -395,9 +395,9 @@ func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, 
 
 public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ options: Value = .undefined) throws -> Value { try inventory(from, to, DataLayout(paths), report, options) }
 func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ options: Value = .undefined) throws -> Value {
-    let opts = InventoryOptions(options)
     let report = fnOr(report)
     let options: Value = options.isUndefined ? .newObject() : options
+    let opts = InventoryOptions(options)
     let check = { () throws in
         if !opts.check.nullish { try opts.check.call() }
         try selectedMemory(options)["check"].call()
@@ -611,16 +611,16 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         try check()
     } catch {
         let errorValue = errorObject(error)
-        let checked = CloudPlan(cloudPlan), isolatedId = checked.isolatedId
+        let plan = CloudPlan(cloudPlan), isolatedId = plan.isolatedId
         if errorValue["code"] === "CLOUD_MEMORY_BUDGET" && isolatedId.truthy {
             var hit = false
-            for match in checked.matches.elements where try remoteId(match["session"]["id"]) === isolatedId { hit = true; break }
+            for match in plan.matches.elements where try remoteId(match["session"]["id"]) === isolatedId { hit = true; break }
             if !hit {
-                for row in checked.blocked.elements where row["code"] === "CLOUD_MEMORY_BUDGET" {
+                for row in plan.blocked.elements where row["code"] === "CLOUD_MEMORY_BUDGET" {
                     if try remoteId(row["id"]) === isolatedId { hit = true; break }
                 }
             }
-            if hit { errorValue["budgetWork"] = ["id": isolatedId, "waiting": checked.waiting] }
+            if hit { errorValue["budgetWork"] = ["id": isolatedId, "waiting": plan.waiting] }
         }
         throw error
     }
@@ -638,10 +638,10 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         "sources": found,
         "from": Value(sources.map { $0.raw["label"] }),
     ]
-    let result = MovePlan(out), checked = CloudPlan(cloudPlan)
+    let result = MovePlan(out), cloud = CloudPlan(cloudPlan)
     result.fromAccounts = Value(try from.elements.map { try accountRef($0) })
     result.cloudCheckAccounts = cloudCheckAccounts.value
-    let cloudSettled = checked.checked.truthy && !(checked.blocked.length > 0) && !checked.waiting["length"].truthy
+    let cloudSettled = cloud.checked.truthy && !(cloud.blocked.length > 0) && !cloud.waiting["length"].truthy
     result.pendingCloud = cloudRequested ? Value(cloudCheckAccounts.count - (cloudSettled ? 1 : 0)) : 0
     result.toAccount = try accountRef(to)
     result.requestedAt = requestedAt
