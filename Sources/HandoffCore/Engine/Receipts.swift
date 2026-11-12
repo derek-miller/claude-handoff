@@ -65,8 +65,8 @@ func latestReceipt(_ paths: DataLayout) throws -> Value {
     let file = Value(path.join(paths.state, name.description))
     let receipt = Receipt(catchNull { try readReceipt(file) })
     if !receipt.isPresent { return ["name": name, "file": file, "corrupt": true] }
-    if !receipt.writer.truthy && (receipt.finalizing.truthy && receipt.appendCheckpoint.truthy && receipt.appendCheckpoint.taskTransfers.isUndefined
-        || receipt.pending.truthy && !(["rehome", "remote"] as Value).includes(receipt.pending.strategy)) {
+    if !receipt.writer.truthy && (receipt.finalizing.truthy && receipt.appendCheckpoint.truthy && AppendCheckpoint(receipt.appendCheckpoint).taskTransfers.isUndefined
+        || receipt.pending.truthy && !(["rehome", "remote"] as Value).includes(PlacedSession(receipt.pending).strategy)) {
         throw makeError(OLDER_MOVE, code: "OLDER_MOVE", [("file", file)])
     }
     let before = stable(receipt.raw)
@@ -78,19 +78,22 @@ public func deferredWorkflow(_ paths: Value = .undefined, _ latest: Value = .und
 func deferredWorkflow(_ paths: DataLayout, _ latest: Value = .undefined) throws -> Value {
     var latest = latest
     if latest.isUndefined { latest = try latestReceipt(paths) }
-    if !latest.truthy || latest.corrupt.truthy { return .null }
-    let receipt = Receipt(latest.receipt)
+    if !latest.truthy || LatestReceipt(latest).corrupt.truthy { return .null }
+    let receipt = LatestReceipt(latest).receipt
     if receipt.remoteUndoing["length"].truthy {
         let m = ValueMap()
-        for row in receipt.remoteUndoing.elements {
-            m.set(Value("\(row.account)/\(row.org)"), ["account": row.account, "org": row.org, "label": try accountLabel(row)])
+        for row in receipt.remoteUndoing.elements.map(AccountRef.init) {
+            m.set(Value("\(row.accountId)/\(row.orgId)"), ["account": row.accountId, "org": row.orgId, "label": try accountLabel(row.raw)])
         }
         return .spread(latest, ["mode": "undo", "sources": Value(m.values)])
     }
     if (receipt.pending.truthy || receipt.retiring.truthy || receipt.finalizing.truthy || receipt.undoing.truthy) && receipt.taskTransfers["length"].truthy {
         let transfers = try recoveryFamilies(receipt)
         let m = ValueMap()
-        for row in transfers.elements { m.set(Value("\(row.from.account)/\(row.from.org)"), row.from) }
+        for family in transfers.elements.map(TaskFamily.init) {
+            let from = AccountRef(family.from)
+            m.set(Value("\(from.accountId)/\(from.orgId)"), from.raw)
+        }
         let sources = m.values
         if !sources.isEmpty {
             return .spread(latest, ["mode": receipt.undoing.truthy ? "undo" : "recovery", "recovery": true, "sources": Value(sources)])
@@ -99,15 +102,15 @@ func deferredWorkflow(_ paths: DataLayout, _ latest: Value = .undefined) throws 
     if receipt.undoing.truthy { return .spread(latest, ["mode": "undo", "sources": receipt.fromAccounts ?? Value.newArray()]) }
     if receipt.held["length"].truthy {
         let m = ValueMap()
-        for row in flatMapValues(receipt.held.elements, { $0.sources }) {
-            m.set(Value("\(row.account)/\(row.org)"), ["account": row.account, "org": row.org, "label": try accountLabel(row)])
+        for row in flatMapValues(receipt.held.elements, { $0["sources"] }).map(AccountRef.init) {
+            m.set(Value("\(row.accountId)/\(row.orgId)"), ["account": row.accountId, "org": row.orgId, "label": try accountLabel(row.raw)])
         }
         return .spread(latest, ["mode": "local", "sources": Value(m.values)])
     }
     let sources = try openCloudChecks(receipt)
     if sources.length == 0 && receipt.localStopped.truthy && !receipt.localCancelledAt.truthy {
         let partial = try receipt.fromAccounts.elements.filter { source in
-            try receiptSummary(receipt).notMoved.elements.contains { row in try sameAccount(row, source).truthy }
+            try ReceiptSummary(receiptSummary(receipt)).notMoved.elements.contains { row in try sameAccount(row, source).truthy }
         }
         return .spread(latest, ["mode": "partial", "sources": Value(partial)])
     }
@@ -151,18 +154,18 @@ public func readReceipt(_ file: Value = .undefined) throws -> Value {
     let receipt = Receipt(try readJson(file))
     let handle: FileHandle
     do { handle = try fs.open("\(file).journal", "r") } catch {
-        if errorObject(error).code === "ENOENT" { return receipt.raw }
+        if ThrownError(error).code === "ENOENT" { return receipt.raw }
         throw error
     }
     func apply(_ line: String) throws {
-        let patch = try JSON.parse(line)
+        let patch = JournalPatch(try JSON.parse(line))
         if !isSafeInteger(patch.sequence) || toNumber(patch.sequence) < 1 { throw EngineError("Invalid move journal sequence") }
         let sequence = toNumber(patch.sequence)
         if sequence <= toNumber(receipt.journalSequence ?? 0) { return }
         if sequence != toNumber(receipt.journalSequence ?? 0) + 1 { throw EngineError("Incomplete move journal") }
         for key in ["sessions", "failed", "retained"] {
-            if !patch[key].isArray { throw EngineError("Invalid move journal entries") }
-            for row in patch[key].elements {
+            if !patch.raw[key].isArray { throw EngineError("Invalid move journal entries") }
+            for row in patch.raw[key].elements {
                 if receipt.raw[key].nullish { receipt.raw[key] = Value.newArray() }
                 receipt.raw[key].push(row)
             }
@@ -222,7 +225,7 @@ func placementJournal(_ file: Value = .undefined, _ receipt: Receipt, _ check: V
             e["code"] = "JOURNAL_WRITE"
             throw EngineError(e)
         }
-        receipt.journalSequence = patch.sequence
+        receipt.journalSequence = JournalPatch(patch).sequence
         for key in keys { sizes[key] = receipt.raw[key].nullish ? 0 : receipt.raw[key].length }
         try check.call()
         return .undefined
@@ -240,25 +243,25 @@ func placementJournal(_ file: Value = .undefined, _ receipt: Receipt, _ check: V
 
 public func recoveryPending(_ paths: Value = .undefined) throws -> Value { try recoveryPending(DataLayout(paths)) }
 func recoveryPending(_ paths: DataLayout) throws -> Value {
-    let latest = try latestReceipt(paths)
-    if !latest.truthy || latest.corrupt.truthy { return latest }
-    return try needsRecovery(latest.receipt).truthy ? ["name": latest.name, "file": latest.file, "receipt": latest.receipt] : .null
+    let latest = LatestReceipt(try latestReceipt(paths))
+    if !latest.isPresent || latest.corrupt.truthy { return latest.raw }
+    return try needsRecovery(latest.receipt).truthy ? ["name": latest.name, "file": latest.file, "receipt": latest.receipt.raw] : .null
 }
 
 func parkingOrder(_ item: Value = .undefined) throws -> Value {
     func tmp(_ v: Value) -> Double { (v[0].asString?.hasSuffix(".json.tmp") ?? false) ? 1 : 0 }
-    return Value(stableSorted(item.moved.elements) { a, b in tmp(b) - tmp(a) })
+    return Value(stableSorted(RetirementItem(item).moved.elements) { a, b in tmp(b) - tmp(a) })
 }
 
 @discardableResult
 func park(_ plan: Value = .undefined, _ before: Value = .undefined) throws -> Value {
     let before = fnOr(before)
-    for item in plan.elements {
-        try before.call(item)
+    for item in plan.elements.map(RetirementItem.init) {
+        try before.call(item.raw)
         let hashes = ValueMap((item.hashes ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
         let trees = ValueMap((item.trees ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
         let semantics = ValueMap((item.semantics ?? Value.newArray()).elements.map { ($0[0], $0[1]) })
-        for pair in try parkingOrder(item).elements {
+        for pair in try parkingOrder(item.raw).elements {
             let original = pair[0], parked = pair[1]
             let hasOriginal = exists(original), hasParked = exists(parked)
             if hasOriginal && hasParked { throw EngineError("retirement path occupied: \(path.basename(parked.description))") }
@@ -267,7 +270,7 @@ func park(_ plan: Value = .undefined, _ before: Value = .undefined) throws -> Va
             if hashes.has(original), Value(sha(try readFile(original))) !== hashes.get(original) {
                 throw EngineError("retirement artifact changed: \(path.basename(original.description))")
             }
-            if trees.has(original), try manifest(original).sha !== trees.get(original) {
+            if trees.has(original), try SidecarTree(manifest(original)).sha !== trees.get(original) {
                 throw EngineError("retirement artifact changed: \(path.basename(original.description))")
             }
             if semantics.has(original), try recordSemantic(try readJson(original)) !== semantics.get(original) {
@@ -296,7 +299,7 @@ func restore(_ plan: Value = .undefined, _ root: Value = .undefined, _ before: V
     }
     let rootPath = root.description
     for p in plan.elements {
-        for pair in p.moved.elements {
+        for pair in RetirementItem(p).moved.elements {
             var dir = path.dirname(pair[1].description)
             while dir != rootPath && !path.relative(rootPath, dir).hasPrefix("..") && ((try? fs.rmdir(dir)) != nil) { dir = path.dirname(dir) }
         }
@@ -307,10 +310,11 @@ func restore(_ plan: Value = .undefined, _ root: Value = .undefined, _ before: V
 func prepareUndo(_ receipt: Receipt, _ paths: DataLayout) throws -> Value {
     let dest = path.join(paths.state, "quarantine", receipt.at.description)
     var plan: [Value] = []
-    for row in receipt.sessions.elements {
+    for row in receipt.sessions.elements.map(PlacedSession.init) {
         let files: [Value] = row.strategy === "rehome" ? [] : [row.targetTranscript].filter { $0.truthy }
         let trees: [Value] = row.strategy === "rehome" ? [] : [row.targetDir].filter { $0.truthy }
-        let items = try artifacts(row)
+        let items = try artifacts(row.raw)
+
         let item: Value = [
             "id": row.targetId,
             "title": row.title,
@@ -330,7 +334,7 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: DataLayout, 
     let check = fnOr(check)
     let snapshots = snapshots.isUndefined ? Value.null : snapshots
     var problems: [Value] = []
-    for family in transfers.elements {
+    for family in transfers.elements.map(TaskFamily.init) {
         try check.call()
         do {
             let ids = Value.newSet(family.ids.elements), recordIds = Value.newSet(family.recordIds.elements)
@@ -338,20 +342,21 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: DataLayout, 
             let cliIds = Value.newSet(family.links.elements.map { $0[1] })
             let inspected = try optCall(inspect)
             let table = try inspected.nullish ? processTable(Value(paths.claudeApp)) : inspected
-            let liveWorkers = Value.newSet(flatMapValues(table.elements.filter { $0.worker.truthy }) { $0.ids })
+            let liveWorkers = Value.newSet(flatMapValues(processRows(table).filter(\.isWorker).map(\.raw)) { $0["ids"] })
             if try schedulerBusy(paths, [family.from, family.to], table).truthy { problems.append(Value(SCHEDULER_OWNS)) }
             if try sameAccount(family.from, family.to).truthy { throw EngineError("scheduled task namespaces must differ") }
             var selected: [Bool] = []
-            for (file, namespace) in [(family.sourceFile, family.from), (family.targetFile, family.to)] {
-                if !UUID.test(namespace.account.description) || !UUID.test(namespace.org.description)
-                    || file !== Value(path.join(paths.records, namespace.account.description, namespace.org.description, "scheduled-tasks.json")) {
+            for (file, namespace) in [(family.sourceFile, AccountRef(family.from)), (family.targetFile, AccountRef(family.to))] {
+                if !UUID.test(namespace.accountId.description) || !UUID.test(namespace.orgId.description)
+                    || file !== Value(path.join(paths.records, namespace.accountId.description, namespace.orgId.description, "scheduled-tasks.json")) {
                     throw EngineError("scheduled task namespace mismatch")
                 }
-                let registry = try taskRegistry(file).data
-                let tasks = registry.scheduledTasks ?? Value.newArray()
+                let current = try taskRegistry(file)
+                let registry = current.data
+                let tasks = current.tasks
                 let target = file === family.targetFile
-                let kind = try taskRegistrationKind(family, registry, Value(target), selected.isEmpty ? .undefined : Value(selected[0]))
-                if tasks.elements.contains(where: { !ids.has($0.id) && recordIds.has($0.notifySessionId) }) { throw EngineError("new scheduled task dependency") }
+                let kind = try taskRegistrationKind(family.raw, registry, Value(target), selected.isEmpty ? .undefined : Value(selected[0]))
+                if tasks.elements.map(ScheduledTask.init).contains(where: { !ids.has($0.id) && recordIds.has($0.notifySessionId) }) { throw EngineError("new scheduled task dependency") }
                 if family.state.truthy {
                     let expected = try kind === "published" ? family.state : target ? family.targetState : taskState(.null, Value.newArray())
                     if try stable(taskState(registry, family.ids)) != stable(expected) { throw EngineError("scheduled task state changed") }
@@ -360,32 +365,32 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: DataLayout, 
                 let dir = Value(path.dirname(file.description))
                 let rows: Value
                 do { rows = try folderRecords(dir, snapshots, check) } catch {
-                    let e = errorObject(error)
+                    let e = ThrownError(error)
                     if file === family.targetFile && e.code === "ENOENT" && e.path === dir { rows = Value.newArray() } else { throw error }
                 }
                 var records: [Value] = []
-                for row in rows.elements {
+                for row in rows.elements.map(FolderRecord.init) {
                     let recordFile = row.file, record = row.record
                     try check.call()
-                    records.append(record)
+                    records.append(record.raw)
                     let member = recordIds.has(record.sessionId)
                     if !member && file === family.targetFile && cliIds.has(record.cliSessionId) { throw EngineError("target scheduled task session id collision") }
                     if !member && (ids.has(record.scheduledTaskId) || recordIds.has(record.notifySessionId) || recordIds.has(record.forkedFromSessionId)) {
                         throw EngineError("new scheduled task family dependency")
                     }
-                    if try member && (!validDesktopRecord(["file": recordFile, "record": record]).truthy || links.get(record.sessionId) !== Value(stable(taskLinks(record)))) {
+                    if try member && (!validDesktopRecord(["file": recordFile, "record": record.raw]).truthy || links.get(record.sessionId) !== Value(stable(taskLinks(record.raw)))) {
                         throw EngineError("scheduled task family identity or route changed")
                     }
                     if try member && ownsWorker(liveWorkers, record.cliSessionId, record.sessionId).truthy { throw EngineError("running worker owns scheduled task family") }
                 }
                 if kind === "twin" {
-                    for replaced in family.replaced.elements {
+                    for replaced in family.replaced.elements.map(ReplacedTask.init) {
                         let task = replaced.task
                         let first = selected[0]
                         let problem = try staleTaskProblem(
-                            family.tasks.elements.first { $0.id === task.id } ?? .undefined, task,
+                            family.tasks.elements.first { ScheduledTask($0).id === ScheduledTask(task).id } ?? .undefined, task,
                             ["source": family.state, "target": registry],
-                            Value(records.filter { first || !recordIds.has($0.sessionId) }), false)
+                            Value(records.filter { first || !recordIds.has(DesktopRecord($0).sessionId) }), false)
                         if problem.truthy { throw EngineError(problem.description) }
                     }
                 }
@@ -394,9 +399,9 @@ func taskTransferProblems(_ transfers: Value = .undefined, _ paths: DataLayout, 
                 throw EngineError("scheduled task ownership changed")
             }
         } catch {
-            let e = errorObject(error)
+            let e = ThrownError(error)
             if e.code === "MOVE_STALLED" || e.code === "RESTART_REOPENED" { throw error }
-            problems.append(e["message"])
+            problems.append(e.message)
         }
     }
     return Value(unique(problems))
@@ -407,26 +412,27 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
     let check = fnOr(check)
     let snapshots = snapshots.isUndefined ? Value.null : snapshots
     let families = side === "target" && !present.truthy ? Array(transfers.elements.reversed()) : transfers.elements
-    for family in families {
+    for family in families.map(TaskFamily.init) {
         try check.call(true)
-        let problems = try taskTransferProblems([family], paths, inspect, true, check, snapshots)
+        let problems = try taskTransferProblems([family.raw], paths, inspect, true, check, snapshots)
         if problems.length != 0 { throw EngineError(problems.join(", ")) }
         let file = side === "source" ? family.sourceFile : family.targetFile
-        let registry = try taskRegistry(file).data
-        let tasks = registry.scheduledTasks ?? Value.newArray()
-        let source = try taskRegistry(family.sourceFile).data
-        let kind = try taskRegistrationKind(family, registry, Value(side === "target"),
-                                            Value((source.scheduledTasks ?? Value.newArray()).elements.contains { family.ids.includes($0.id) }))
+        let current = try taskRegistry(file)
+        let registry = current.data
+        let tasks = current.tasks
+        let sourceTasks = try taskRegistry(family.sourceFile).tasks
+        let kind = try taskRegistrationKind(family.raw, registry, Value(side === "target"),
+                                            Value(sourceTasks.elements.contains { family.ids.includes(ScheduledTask($0).id) }))
         if Value(kind === "published") === present || family.tasks.length == 0 { continue }
-        var next = tasks.elements.filter { !family.ids.includes($0.id) }
+        var next = tasks.elements.filter { !family.ids.includes(ScheduledTask($0).id) }
         if present.truthy {
             for task in family.tasks.elements {
                 let order = family.sourceOrder
-                let following = side === "source" ? (next.firstIndex { indexOf(order, $0.id) > indexOf(order, task.id) } ?? -1) : -1
+                let following = side === "source" ? (next.firstIndex { indexOf(order, ScheduledTask($0).id) > indexOf(order, ScheduledTask(task).id) } ?? -1) : -1
                 next.insert(task, at: following < 0 ? next.count : following)
             }
         } else if side === "target" {
-            for replaced in (family.replaced ?? Value.newArray()).elements {
+            for replaced in (family.replaced ?? Value.newArray()).elements.map(ReplacedTask.init) {
                 next.insert(replaced.task, at: spliceStart(min(toNumber(replaced.index), Double(next.count)), next.count))
             }
         }
@@ -446,12 +452,13 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
         if !present.truthy && side === "target" && !family.targetHadTasks.truthy && next.isEmpty { after.removeKey("scheduledTasks") }
         let remove = !present.truthy && side === "target" && !family.targetExisted.truthy && after.ownKeys.isEmpty
         if remove {
-            do { try fs.unlink(file.description) } catch { if errorObject(error).code !== "ENOENT" { throw error } }
+            do { try fs.unlink(file.description) } catch { if ThrownError(error).code !== "ENOENT" { throw error } }
         } else {
             try saveText(file, Value(jsonText(after)), Value { _ in
-                let problems = try taskTransferProblems([family], paths, inspect, true, check, snapshots)
+                let problems = try taskTransferProblems([family.raw], paths, inspect, true, check, snapshots)
                 if problems.length != 0 { throw EngineError(problems.join(", ")) }
                 try check.call(true)
+
                 if try stable(taskRegistry(file).data) != stable(registry) { throw EngineError("scheduled task registry changed before publication") }
                 if try schedulerBusy(paths, [family.from, family.to], optCall(inspect)).truthy { throw EngineError(SCHEDULER_OWNS) }
                 return .undefined
@@ -464,6 +471,7 @@ func writeTaskRegistrations(_ transfers: Value = .undefined, _ side: Value = .un
 
 func finishUndo(_ receipt: Receipt, _ file: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options = options.isUndefined ? Value.newObject() : options
+    let check = RecoveryOptions(options).check
     let root = Value(path.join(paths.state, "quarantine"))
     let dest = Value(path.join(root.description, receipt.at.description))
     let superseded = receipt.superseded ?? Value.newArray(), undoing = receipt.undoing ?? Value.newArray()
@@ -472,10 +480,10 @@ func finishUndo(_ receipt: Receipt, _ file: Value = .undefined, _ paths: DataLay
     problems += try restoreProblems(undoing, root).elements
     problems += try bridgeProblems(receipt.sessions, true).elements
     problems += try activationProblems(receipt).elements
-    problems += try taskTransferProblems(receipt.taskTransfers, paths, inspector(paths, options), true, options.check).elements
+    problems += try taskTransferProblems(receipt.taskTransfers, paths, inspector(paths, options), true, check).elements
     if exists(Value(path.join(dest.description, "receipt.json"))) { problems.append("undo receipt path occupied") }
     let liveWorkers = try workers(inspector(paths, options).call())
-    for row in receipt.sessions.elements {
+    for row in receipt.sessions.elements.map(PlacedSession.init) {
         if try ownsWorker(liveWorkers, row.targetId, row.targetRecordId).truthy { problems.append(Value("\(row.title) | running worker kept in destination")) }
         if try !row.taskFamily.truthy && row.taskFile.truthy
             && Value(taskRegistry(row.taskFile).notifies(row.targetRecordId ?? Value("local_\(row.targetId)"))) !== row.taskOwned {
@@ -487,18 +495,18 @@ func finishUndo(_ receipt: Receipt, _ file: Value = .undefined, _ paths: DataLay
     var failure: Error? = nil
     let inspect = try inspector(paths, options)
     do {
-        try writeTaskRegistrations(receipt.taskTransfers, "target", false, paths, inspect, options.check)
-        try restore(superseded, root, options.check)
-        try park(undoing, Value { _ in try optCall(options.check) })
+        try writeTaskRegistrations(receipt.taskTransfers, "target", false, paths, inspect, check)
+        try restore(superseded, root, check)
+        try park(undoing, Value { _ in try optCall(check) })
         _ = try restoreActivations(receipt)
         for row in receipt.sessions.elements {
             _ = try restoreBridge(row, Value { _ in try saveJson(file, receipt.raw, 2, true) }, inspect, true)
         }
-        try writeTaskRegistrations(receipt.taskTransfers, "source", true, paths, inspect, options.check)
+        try writeTaskRegistrations(receipt.taskTransfers, "source", true, paths, inspect, check)
         try fs.mkdirp(dest.description)
     } catch { failure = error }
     problems += try undoParentProblems(receipt).elements
-    problems += try taskTransferProblems(receipt.taskTransfers, paths, inspect, true, options.check).elements
+    problems += try taskTransferProblems(receipt.taskTransfers, paths, inspect, true, check).elements
     if problems.isEmpty, let failure { throw failure }
     if !problems.isEmpty {
         if let failure { problems.append(errorMessage(failure)) }
@@ -519,15 +527,16 @@ func finishUndo(_ receipt: Receipt, _ file: Value = .undefined, _ paths: DataLay
 }
 
 func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liveWorkers: Value = .undefined, _ before: Value = .undefined) throws -> Value {
+    let row = PlacedSession(row)
     let liveWorkers = liveWorkers.isUndefined ? try workers() : liveWorkers
     let before = fnOr(before)
-    func locateArtifact(_ original: Value) -> Value {
+    func locateArtifact(_ original: Value) -> ArtifactLocation {
         let parked = Value(path.join(dest.description, path.basename(original.description)))
         let hasOriginal = exists(original), hasParked = exists(parked)
         if hasOriginal == hasParked {
-            return ["error": Value("\(path.basename(original.description)) \(hasOriginal ? "exists in both locations" : "is missing")")]
+            return ArtifactLocation(["error": Value("\(path.basename(original.description)) \(hasOriginal ? "exists in both locations" : "is missing")")])
         }
-        return ["original": original, "parked": parked, "file": hasOriginal ? original : parked, "move": Value(hasOriginal)]
+        return ArtifactLocation(["original": original, "parked": parked, "file": hasOriginal ? original : parked, "move": Value(hasOriginal)])
     }
     func sameRecordAs(_ file: Value) -> Bool {
         let raw = catchNull { try readFile(file) }
@@ -539,13 +548,13 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
     }
     let transcript = locateArtifact(row.targetTranscript)
     let record = locateArtifact(row.record)
-    let sidecarArtifact: Value = row.targetDir.truthy ? locateArtifact(row.targetDir) : .null
+    let sidecarArtifact = row.targetDir.truthy ? locateArtifact(row.targetDir) : ArtifactLocation(.null)
     if row.strategy === "rehome" {
         let candidates: [Value] = [
             transcript.error,
             !transcript.error.truthy && !transcript.move.truthy ? "transcript missing" : .null,
             sidecarArtifact.error,
-            sidecarArtifact.truthy && !sidecarArtifact.error.truthy && !sidecarArtifact.move.truthy ? "sidecars missing" : .null,
+            sidecarArtifact.isPresent && !sidecarArtifact.error.truthy && !sidecarArtifact.move.truthy ? "sidecars missing" : .null,
             record.error,
         ]
         var changes = candidates.filter { $0.truthy }
@@ -568,7 +577,7 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
     var changes = [transcript.error, record.error, sidecarArtifact.error].filter { $0.truthy }
     if !sidecarArtifact.error.truthy {
         let root = sidecarArtifact.file ?? Value(path.join(path.dirname(row.targetTranscript.description), row.targetId.description))
-        if try manifest(root).sha !== row.sidecars.sha { changes.append("sidecars changed") }
+        if try SidecarTree(manifest(root)).sha !== SidecarTree(row.sidecars).sha { changes.append("sidecars changed") }
     }
     if !record.error.truthy {
         if !sameRecordAs(record.file) { changes.append("desktop record changed") }
@@ -577,8 +586,9 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
         changes.append("scheduled tasks changed")
     }
     if try ownsWorker(liveWorkers, row.targetId, row.targetRecordId).truthy { changes.append("running worker") }
-    if try !transcript.error.truthy && changed(transcript.file, row.targetId, knownOf(row)).truthy { changes.append("transcript changed") }
-    let present = [transcript, sidecarArtifact, record].filter { $0.truthy }
+    if try !transcript.error.truthy && changed(transcript.file, row.targetId, knownOf(row.raw)).truthy { changes.append("transcript changed") }
+    let present = [transcript, sidecarArtifact, record].filter { $0.isPresent }
+
     if !changes.isEmpty {
         for artifact in present {
             if artifact.error.truthy || artifact.move.truthy || exists(artifact.original) || !exists(artifact.parked) { continue }
@@ -598,31 +608,31 @@ func rollbackTarget(_ row: Value = .undefined, _ dest: Value = .undefined, _ liv
 public func reconcile(_ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try reconcile(DataLayout(paths), options) }
 func reconcile(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     var paths = paths
-    let options = options.isUndefined ? Value.newObject() : options
+    let options = RecoveryOptions(options.isUndefined ? Value.newObject() : options)
     let file = Value(path.join(paths.state, "restart.json"))
-    let restart = catchNull { try readJson(file) }
-    let interrupted = restart.truthy && (["closing", "moving", "reopening"] as Value).includes(restart.outcome)
+    let restart = RestartAttempt(catchNull { try readJson(file) })
+    let interrupted = restart.raw.truthy && (["closing", "moving", "reopening"] as Value).includes(restart.outcome)
     var result: Value = .undefined
     var thrown: Error? = nil
     do {
         if options.background.truthy || options.automatic.truthy {
-            let pending = try recoveryPending(paths)
+            let pending = PendingRecovery(try recoveryPending(paths))
             if (!options.receiptFile.truthy || pending.file === options.receiptFile) && (pending.receipt.undoing.truthy || pending.receipt.remoteUndoing["length"].truthy) {
                 let labels = try (pending.receipt.remoteUndoing ?? Value.newArray()).elements.map { try loginLabel($0) }
                 result = ["title": "Undo pending", "error": "Finish undo to continue", "pendingUndo": Value(unique(labels))]
             }
         }
-        let pending = try recoveryPending(paths)
+        let pending = PendingRecovery(try recoveryPending(paths))
         if result.nullish {
-            result = try (options.background.truthy || options.automatic.truthy) && pending.receipt.localRecovery.blocked.truthy
-                ? ["title": "Move recovery blocked", "error": pending.receipt.localRecovery.blocked]
-                : reconcileFiles(paths, options)
+            result = try (options.background.truthy || options.automatic.truthy) && pending.receipt.localRecoveryBlocked.truthy
+                ? ["title": "Move recovery blocked", "error": pending.receipt.localRecoveryBlocked]
+                : reconcileFiles(paths, options.raw)
         }
     } catch { thrown = error }
     if interrupted {
         paths.claudeApp = (restart.app ?? Value(paths.claudeApp)).description
         let current = paths
-        let io = options.io ?? Value.newObject()
+        let io = RestartIO(options.io ?? Value.newObject())
         let now = io.now ?? Value { _ in Value(process.monotonic()) }
         let inspect = io.inspect ?? Value { _ in try processTable(Value(current.claudeApp)) }
         let running = Value { _ in
@@ -632,44 +642,45 @@ func reconcile(_ paths: DataLayout, _ options: Value = .undefined) throws -> Val
             let deadline = toNumber(try now.call()) + REOPEN_RESERVE
             let run = io.command ?? Value { a in try command(arg(a, 0), arg(a, 1), arg(a, 2)) }
             let opened = try run.call("/usr/bin/open", ["-g", "-a", Value(paths.claudeApp)], Value(REOPEN_RESERVE))
-            restart.outcome = try opened.status === 0 && waitFor(running, Value(deadline), now, io.wait).truthy ? "interrupted-reopened" : "reopen-failed"
+            restart.outcome = try CommandResult(opened).status === 0 && waitFor(running, Value(deadline), now, io.wait).truthy ? "interrupted-reopened" : "reopen-failed"
         } else { restart.outcome = "interrupted-app-running" }
         restart.recoveredAt = Value(isoNow())
-        try saveJson(file, restart)
+        try saveJson(file, restart.raw)
     }
     if let thrown { throw thrown }
     if interrupted && restart.outcome === "reopen-failed" {
-        let message = [result.error, "Reopen Claude Desktop manually, then retry"].filter { $0.truthy }.map { $0.description }.joined(separator: ". ")
+        let message = [RecoveryNote(result).error, "Reopen Claude Desktop manually, then retry"]
+.filter { $0.truthy }.map { $0.description }.joined(separator: ". ")
         throw makeError(message, code: "REOPEN_FAILED")
     }
     return result ?? (interrupted ? ["title": "Interrupted restart", "error": "Desktop is running. Retry the requested operation."] : .null)
 }
 
 func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
-    let options = options.isUndefined ? Value.newObject() : options
-    let p = try recoveryPending(paths)
-    if !p.truthy { return .null }
+    let options = RecoveryOptions(options.isUndefined ? Value.newObject() : options)
+    let p = PendingRecovery(try recoveryPending(paths))
+    if !p.isPresent { return .null }
     if options.receiptFile.truthy && p.file !== options.receiptFile { return ["title": "recovery blocked", "error": "The operation receipt changed"] }
     if p.corrupt.truthy {
         try fs.rename(p.file.description, "\(p.file).corrupt")
         return ["title": p.name, "error": "corrupt receipt set aside"]
     }
-    let receipt = Receipt(p.receipt)
-    let rollback = receipt.localRecovery.rollback ?? ""
+    let receipt = p.receipt
+    let rollback = LocalRecovery(receipt.localRecovery).rollback ?? ""
     let failedDirectory = Value(path.join(paths.state, "quarantine", receipt.at.description, "failed",
-                                          UUID.test(rollback.description) ? receipt.localRecovery.rollback.description : ""))
+                                          UUID.test(rollback.description) ? LocalRecovery(receipt.localRecovery).rollback.description : ""))
     let bridgeRows: Value
     if receipt.undoing.truthy { bridgeRows = receipt.sessions ?? Value.newArray() }
     else if receipt.remotePending.truthy { bridgeRows = Value.newArray() }
     else {
         var rows: [Value] = []
         if receipt.pending.truthy { rows.append(receipt.pending) }
-        if receipt.finalizing.truthy { rows += sliceArray((receipt.sessions ?? Value.newArray()).elements, toInteger(receipt.appendCheckpoint.sessions ?? 0)) }
+        if receipt.finalizing.truthy { rows += sliceArray((receipt.sessions ?? Value.newArray()).elements, toInteger(AppendCheckpoint(receipt.appendCheckpoint).sessions ?? 0)) }
         bridgeRows = Value(rows)
     }
     let bridgeIssues = try bridgeProblems(bridgeRows, Value(receipt.undoing.truthy))
     if bridgeIssues.length != 0 { return ["title": "bridge recovery blocked", "error": Value(bridgeIssues.join(", ")), "problems": bridgeIssues] }
-    let inspect = try inspector(paths, options)
+    let inspect = try inspector(paths, options.raw)
     let taskTransfers = try recoveryFamilies(receipt)
     let taskProblems = try taskTransferProblems(taskTransfers, paths, inspect, true, options.check)
     if taskProblems.length != 0 && !(receipt.undoing.truthy && receipt.remoteUndoing["length"].truthy
@@ -681,32 +692,32 @@ func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -
     if receipt.undoing.truthy {
         let blocked = try undoParentProblems(receipt)
         if blocked.length != 0 { return ["title": "undo recovery blocked", "error": Value(blocked.join(", ")), "problems": blocked] }
-        let remote = try restoreRemote(receipt, p.file, paths, options)
+        let remote = RemoteRestore(try restoreRemote(receipt, p.file, paths, options.raw))
         if remote.problems.length != 0 { return ["title": "Remote Control undo recovery blocked", "error": Value(remote.problems.join(", ")), "problems": remote.problems] }
         if remote.pending.length != 0 {
             return ["title": "Undo pending", "error": Value("sign Claude Desktop into \(remote.pending.join(" or "))"), "pendingUndo": remote.pending, "remoteRestored": remote.restored, "receipt": receipt.raw]
         }
-        let result = try finishUndo(receipt, p.file, paths, options)
+        let result = RecoveryNote(try finishUndo(receipt, p.file, paths, options.raw))
         if result.restoreProblems.truthy { return ["title": "undo recovery blocked", "error": Value(result.restoreProblems.join(", ")), "problems": result.restoreProblems] }
-        return ["title": Value("\(receipt.sessions["length"]) sessions"), "error": "interrupted undo completed", "undo": result]
+        return ["title": Value("\(receipt.sessions["length"]) sessions"), "error": "interrupted undo completed", "undo": result.raw]
     }
     if receipt.remotePending.truthy {
-        let row = receipt.remotePending
+        let row = PendingArchive(receipt.remotePending)
         do {
             let cloud = try receiptCloud(receipt, paths, options.cloud)
-            let current = try cloud["session"].call(row.id)
+            let current = RemoteSession(try cloud["session"].call(row.id))
             if current.status === "archived" {
                 if receipt.remote.nullish { receipt.remote = Value.newArray() }
-                if !receipt.remote.elements.contains(where: { $0.id === row.id }) { receipt.remote.push(row) }
-                receipt.failed = Value(receipt.failed.elements.filter { $0.id !== row.id })
+                if !receipt.remote.elements.contains(where: { RemoteSession($0).id === row.id }) { receipt.remote.push(row.raw) }
+                receipt.failed = Value(receipt.failed.elements.filter { FailedSession($0).id !== row.id })
                 receipt.clear(.remotePending)
                 try saveJson(p.file, receipt.raw)
                 return ["title": row.title, "error": "interrupted Remote Control archive completed"]
             }
             if current.status === "active" || current.status === "paused" {
-                let target = receipt.sessions.elements.first { $0.record === row.activation.record } ?? .undefined
+                let target = receipt.sessions.elements.first { PlacedSession($0).record === row.activationRecord } ?? .undefined
                 _ = try rollbackActivation(row.activation, target)
-                _ = try addCloudFailure(receipt, row, ["id": row.id, "title": row.title, "error": "interrupted Remote Control archive not applied"])
+                _ = try addCloudFailure(receipt, row.raw, ["id": row.id, "title": row.title, "error": "interrupted Remote Control archive not applied"])
                 receipt.clear(.remotePending)
                 try saveJson(p.file, receipt.raw)
                 return ["title": row.title, "error": "interrupted Remote Control archive not applied"]
@@ -727,21 +738,21 @@ func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -
         recovered.append(["title": Value("\(plan["length"]) retirement entries"), "error": "interrupted retirement rolled back"])
     }
     if receipt.pending.truthy {
-        let pendingRow = receipt.pending
+        let pendingRow = PlacedSession(receipt.pending)
         let id = pendingRow.id, title = pendingRow.title, targetId = pendingRow.targetId, made = pendingRow.made
         let strategy = pendingRow.strategy, creationRequired = pendingRow.creationRequired, created = pendingRow.created
         let found: FileStat? = creationRequired.truthy ? try? fs.stat(made[0].description, bigint: false) : nil
-        let foreign = found.map { !created.truthy || $0.devValue !== created.dev || $0.inoValue !== created.ino } ?? false
+        let foreign = found.map { !created.raw.truthy || $0.devValue !== created.dev || $0.inoValue !== created.ino } ?? false
         do { _ = try restoreBridge(receipt.pending, Value { _ in try saveJson(p.file, receipt.raw, 2, true) }, inspect) }
         catch { return ["title": "bridge recovery blocked", "error": errorMessage(error)] }
         let used: Value
         if strategy === "rehome" {
             let raw: Value? = try? readFile(made[0])
-            if let raw { used = Value(receipt.pending.recordSha.truthy && Value(sha(raw)) !== receipt.pending.recordSha) } else { used = false }
+            if let raw { used = Value(pendingRow.recordSha.truthy && Value(sha(raw)) !== pendingRow.recordSha) } else { used = false }
         } else {
             used = try changed(made[0], targetId, knownOf(receipt.pending))
         }
-        if (used.truthy || foreign) && taskTransfers.elements.contains(where: { $0.recordIds.includes(Value(path.basename(made[0].description, ".json"))) }) {
+        if (used.truthy || foreign) && taskTransfers.elements.contains(where: { TaskFamily($0).recordIds.includes(Value(path.basename(made[0].description, ".json"))) }) {
             return ["title": "scheduled task recovery blocked", "error": "scheduled task target record changed, recovery remains pending"]
         }
         if !used.truthy && !foreign {
@@ -762,7 +773,7 @@ func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -
         recovered.append(["title": title, "error": error])
     }
     if receipt.finalizing.truthy {
-        let checkpoint = receipt.appendCheckpoint
+        let checkpoint = AppendCheckpoint(receipt.appendCheckpoint)
         let root = Value(path.join(paths.state, "quarantine"))
         let superseded = Value(sliceArray(receipt.superseded.elements, toInteger(checkpoint.superseded ?? 0)))
         let rollingBack = Value(sliceArray((receipt.sessions ?? Value.newArray()).elements, toInteger(checkpoint.sessions ?? 0)))
@@ -774,22 +785,22 @@ func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -
         var rolledBack = 0
         let dest = failedDirectory
         let liveWorkers = try workers(inspect.call())
-        for row in rollingBack.elements {
+        for row in rollingBack.elements.map(PlacedSession.init) {
             try optCall(options.check)
             let changes: Value
             do {
-                changes = try rollbackTarget(row.taskFamily.truthy ? .spread(row, ["taskOwned": false]) : row, dest, liveWorkers,
-                                             Value { _ in try restoreBridge(row, Value { _ in try saveJson(p.file, receipt.raw, 2, true) }, inspect) })
+                changes = try rollbackTarget(row.taskFamily.truthy ? .spread(row.raw, ["taskOwned": false]) : row.raw, dest, liveWorkers,
+                                             Value { _ in try restoreBridge(row.raw, Value { _ in try saveJson(p.file, receipt.raw, 2, true) }, inspect) })
             } catch { return ["title": "bridge recovery blocked", "error": errorMessage(error)] }
             if changes.length != 0 {
-                kept.append(row)
+                kept.append(row.raw)
                 receipt.failed.push(["id": row.id, "title": row.title, "error": Value("interrupted finalization, \(changes.join(", ")) changed since, left in place")])
             } else {
                 receipt.failed.push(["id": row.id, "title": row.title, "error": "interrupted finalization"])
                 rolledBack += 1
             }
         }
-        if kept.contains(where: { $0.taskFamily.truthy }) {
+        if kept.contains(where: { PlacedSession($0).taskFamily.truthy }) {
             return ["title": "scheduled task recovery blocked", "error": "scheduled task family records changed, recovery remains pending"]
         }
         try writeTaskRegistrations(taskTransfers, "source", true, paths, inspect, options.check)
@@ -799,9 +810,9 @@ func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -
         receipt.finalizing = false
         receipt.verification = checkpoint.verification ?? [
             "ok": Value(kept.isEmpty),
-            "problems": Value(kept.map { ["id": $0.targetId, "title": $0.title, "check": "interrupted finalization"] as Value }),
+            "problems": Value(kept.map(PlacedSession.init).map { ["id": $0.targetId, "title": $0.title, "check": "interrupted finalization"] as Value }),
         ]
-        if checkpoint.truthy { receipt.held = checkpoint.held } else { _ = try cancelCloudChecks(receipt) }
+        if checkpoint.isPresent { receipt.held = checkpoint.held } else { _ = try cancelCloudChecks(receipt) }
         receipt.clear(.appendCheckpoint)
         recovered.append([
             "title": Value("\(rolledBack) unfinished copies"),
@@ -814,42 +825,46 @@ func reconcileFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -
     try fs.rm("\(p.file).journal", recursive: false, force: true)
     if recovered.count == 1 { return recovered[0] }
     return [
-        "title": Value(recovered.map { $0.title.description }.joined(separator: " + ")),
-        "error": Value(recovered.map { $0.error.description }.joined(separator: ", ")),
+        "title": Value(recovered.map { RecoveryNote($0).title.description }.joined(separator: " + ")),
+        "error": Value(recovered.map { RecoveryNote($0).error.description }.joined(separator: ", ")),
+
     ]
 }
 
 func witnessed(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ checkShared: Value = .undefined) throws -> Value {
     let checkShared = checkShared.isUndefined ? Value(true) : checkShared
-    let expectedSidecars = row.sidecar ?? row.sidecars
-    if row.strategy === "rehome" && row.transcriptFingerprint.truthy && expectedSidecars.fingerprint.truthy {
-        let sidecarRoot = Value(path.join(path.dirname(row.transcript.description), row.id.description))
-        let currentTranscript = catchNull { try fingerprint(row.transcript) }
-        let currentSidecars = catchNull { try treeFingerprint(sidecarRoot) }
-        let sameTask = try !row.account.taskFile.truthy
-            || Value(taskRegistry(row.account.taskFile).notifies(desktopRecordOf(row).sessionId)) === row.taskOwned
+    let source = MoveSource(row)
+    let expectedSidecars = SidecarTree(source.sidecar ?? source.sidecars)
+    if source.strategy === "rehome" && source.transcriptFingerprint.truthy && expectedSidecars.fingerprint.truthy {
+        let sidecarRoot = Value(path.join(path.dirname(source.transcript.description), source.id.description))
+        let currentTranscript = catchNull { try fingerprint(source.transcript) }
+        let currentSidecars = SidecarTree(catchNull { try treeFingerprint(sidecarRoot) })
+        let sameTask = try !source.account.taskFile.truthy
+            || Value(taskRegistry(source.account.taskFile).notifies(source.desktopRecord.sessionId)) === source.taskOwnedValue
         let shared = try and(and(and(Value(currentTranscript.truthy),
                                      Value(!expectedSidecars.count.truthy || exists(sidecarRoot))),
                                  Value(!expectedSidecars.canonicalRoot.truthy || currentSidecars.canonicalRoot === expectedSidecars.canonicalRoot)),
-                             !checkShared.truthy ? Value(true) : and(Value(currentTranscript === row.transcriptFingerprint), try sameTree(expectedSidecars, currentSidecars)))
-        return try and(and(and(shared, Value(sameTask)), Value(!ownsWorker(liveWorkers, row.id, desktopRecordOf(row).sessionId).truthy)), try bridgeIntact(row))
+                             !checkShared.truthy ? Value(true) : and(Value(currentTranscript === source.transcriptFingerprint), try sameTree(expectedSidecars.raw, currentSidecars.raw)))
+        return try and(and(and(shared, Value(sameTask)), Value(!ownsWorker(liveWorkers, source.id, source.desktopRecord.sessionId).truthy)), try bridgeIntact(row))
     }
-    let now = catchNull { try sidecars(row.transcript, row.id) }
-    let sameTask = try !row.account.taskFile.truthy
-        || Value(taskRegistry(row.account.taskFile).notifies(desktopRecordOf(row).sessionId)) === row.taskOwned
-    if try !now.truthy || now.sha !== row.sidecar.sha || row.sidecar.canonicalRoot.truthy && now.canonicalRoot !== row.sidecar.canonicalRoot
-        || !sameTask || ownsWorker(liveWorkers, row.id, desktopRecordOf(row).sessionId).truthy {
+    let now = SidecarTree(catchNull { try sidecars(source.transcript, source.id) })
+    let expected = SidecarTree(source.sidecar)
+    let sameTask = try !source.account.taskFile.truthy
+        || Value(taskRegistry(source.account.taskFile).notifies(source.desktopRecord.sessionId)) === source.taskOwnedValue
+    if try !now.isPresent || now.sha !== expected.sha || expected.canonicalRoot.truthy && now.canonicalRoot !== expected.canonicalRoot
+        || !sameTask || ownsWorker(liveWorkers, source.id, source.desktopRecord.sessionId).truthy {
         return false
     }
-    return try Value(exists(row.transcript) && !changed(row.transcript, row.id, ["semantic": row.snapshot, "semanticVersion": Value(SEMANTIC_VERSION), "bridge": row.bridge]).truthy)
+    return try Value(exists(source.transcript) && !changed(source.transcript, source.id, ["semantic": source.snapshot, "semanticVersion": Value(SEMANTIC_VERSION), "bridge": source.bridge]).truthy)
 }
 
 func untouched(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ checkShared: Value = .undefined) throws -> Value {
-    let record = row.session.file ?? row.file
+    let source = MoveSource(row)
+    let record = source.desktopFile
     let raw: Value = record.truthy ? catchNull { try readFile(record) } : .null
     var sameRecord = raw.truthy
     if raw.truthy {
-        do { sameRecord = try row.recordSemantic.truthy && recordSemantic(JSON.parse(raw.asData ?? Data())) === row.recordSemantic } catch { sameRecord = false }
+        do { sameRecord = try source.recordSemantic.truthy && recordSemantic(JSON.parse(raw.asData ?? Data())) === source.recordSemantic } catch { sameRecord = false }
     }
     return try and(Value(sameRecord), try witnessed(row, liveWorkers, checkShared))
 }
@@ -857,23 +872,22 @@ func untouched(_ row: Value = .undefined, _ liveWorkers: Value = .undefined, _ c
 public func carrying(_ inv: Value = .undefined, _ landed: Value = .undefined, _ gone: Value = .undefined) throws -> Value { try carrying(MovePlan(inv), landed, gone) }
 func carrying(_ inv: MovePlan, _ landed: Value = .undefined, _ gone: Value = .undefined) throws -> Value {
     let gone = gone.isUndefined ? Value.newSet() : gone
-    let carried = inv.targets.elements.filter { $0.transcript.truthy && !gone.has($0) }.map { ["by": $0.id, "history": $0] as Value }
+    let carried = inv.targets.elements.filter { MoveTarget($0).transcript.truthy && !gone.has($0) }.map { ["by": MoveTarget($0).id, "history": $0] as Value }
     return Value(landed.elements + carried)
 }
 
 public func owners(_ sources: Value = .undefined, _ carried: Value = .undefined) throws -> Value {
-    let candidates = ValueMap(sources.elements.filter { $0.roots["size"].truthy }.map { (firstValue($0.roots), Value.newArray()) })
-    for carrier in carried.elements { for root in carrier.history.roots.elements { candidates.get(root).push(carrier) } }
+    let candidates = ValueMap(sources.elements.filter { MoveSource($0).roots["size"].truthy }.map { (firstValue(MoveSource($0).roots), Value.newArray()) })
+    for carrier in carried.elements { for root in Carrier(carrier).history.roots.elements { candidates.get(root).push(carrier) } }
     var out: [Value] = []
     for s in sources.elements {
         let owner: Value
-        if s.sole.truthy {
-            owner = carried.elements.first { $0.history.members.includes(s) } ?? .undefined
+        if MoveSource(s).isSole {
+            owner = carried.elements.first { Carrier($0).history.members.includes(s) } ?? .undefined
         } else {
-            owner = try candidates.get(firstValue(s.roots)).elements.first { try included(s, $0.history).truthy } ?? .undefined
+            owner = try candidates.get(firstValue(MoveSource(s).roots)).elements.first { try included(s, Carrier($0).history.raw).truthy } ?? .undefined
         }
-        let row: Value = ["s": s, "owner": owner]
-        if row.owner.truthy { out.append(row) }
+        if owner.truthy { out.append(["s": s, "owner": owner]) }
     }
     return Value(out)
 }
@@ -883,7 +897,7 @@ func parentReferences(_ directories: Value = .undefined, _ snapshots: Value = .u
     let check = fnOr(check)
     let parents = ValueMap()
     for dir in directories.elements {
-        for row in try folderRecords(dir, snapshots, check).elements {
+        for row in try folderRecords(dir, snapshots, check).elements.map(FolderRecord.init) {
             let parent = row.record.forkedFromSessionId
             parents.set(row.file, LOCAL_RECORD.test((parent ?? "").description) ? Value(path.join(dir.description, "\(parent).json")) : .null)
         }
@@ -892,7 +906,8 @@ func parentReferences(_ directories: Value = .undefined, _ snapshots: Value = .u
 }
 
 func undoParentProblems(_ receipt: Receipt) throws -> Value {
-    let removing = Value.newSet(receipt.sessions.elements.map { $0.record })
+    let removing = Value.newSet(receipt.sessions.elements.map { PlacedSession($0).record })
+
     do {
         let parents = try parentReferences(Value.newSet(removing.elements.map { Value(path.dirname($0.description)) }))
         return Value(parents.asMap!.entries.filter { file, parent in !removing.has(file) && removing.has(parent) }
