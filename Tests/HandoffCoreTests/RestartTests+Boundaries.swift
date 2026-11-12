@@ -39,7 +39,7 @@ extension Engine.Restarts {
                 return nil
             }, NOOP, mock.io)
         }
-        for name in [file, "\(file).1"] { ok((try stat(name)["size"].asNumber ?? .infinity) <= 1024 * 1024, name) }
+        for name in [file, "\(file).1"] { let size: Double = try stat(name)["size"].asNumber ?? .infinity; ok(size <= 1024 * 1024, name) }
         let text = try readText(file), outcomes = lines(text).filter { $0["event"] == "outcome" }
         deq(outcomes.map { $0["stopCode"] }, ["NO_WORK", "WORK_FAILED", "NO_WORK"])
         deq(outcomes.map { $0["kind"] }, ["restart", "restart", "undo"])

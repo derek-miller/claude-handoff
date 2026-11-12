@@ -271,7 +271,8 @@ extension Engine.Cloud {
         let inv = try f.inventory()
         deq(inv["cloud"]["matches"], [])
         eq(inv["cloud"]["blocked"][0]["code"], "CLOUD_ARTIFACT_LINE_LIMIT")
-        ok((inv["cloud"]["artifacts"]["used"].asNumber ?? .infinity) <= 16 * 1024 * 1024 + 256 * 1024)
+        let used: Double = inv["cloud"]["artifacts"]["used"].asNumber ?? .infinity
+        ok(used <= 16 * 1024 * 1024 + 256 * 1024)
     }
 
     @Test("artifact search stops after complete proof but still reads required files outside the time window")
@@ -282,7 +283,8 @@ extension Engine.Cloud {
         try Self.utimes(file, "2001-01-01T00:00:00.000Z")
         let inv = try f.inventory()
         eq(inv["cloud"]["matches"][0]["target"]["matchMode"], "artifacts")
-        ok((inv["cloud"]["artifacts"]["used"].asNumber ?? .infinity) < 1024 * 1024)
+        let used: Double = inv["cloud"]["artifacts"]["used"].asNumber ?? .infinity
+        ok(used < 1024 * 1024)
         try unlink(file)
         let required = path.join(f.directory, "agent-a0.jsonl")
         try writeText(required, f.agents[0].elements.map { JSON.text(.spread($0, ["timestamp": "2000-01-01T00:00:00.000Z"])) }.joined(separator: "\n") + "\n")
