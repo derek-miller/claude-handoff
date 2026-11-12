@@ -18,20 +18,20 @@ extension Engine.Cloud {
                              return ["status": 0]
                          }]
         let planned = try executeMove([from], to, h.paths, ["io": io, "cloudRequested": true, "cloud": cloudFixture(h)])
-        ok(planned.plan.token)
+        ok(planned["plan"]["token"])
         #expect(calls == [])
         ok(exists(h.recordFile("P", SOURCE)))
         eq(readOrNil(h.recordFile("T", SOURCE)), nil)
-        let result = try executeMove([from], to, h.paths, ["io": io, "approve": planned.plan.token, "cloudRequested": true, "report": fn { args in
+        let result = try executeMove([from], to, h.paths, ["io": io, "approve": planned["plan"]["token"], "cloudRequested": true, "report": fn { args in
             if Self.arg(args, 0) == "move" { ok(calls.contains("/usr/bin/osascript")) }
             return .undefined
         }])
-        eq(result.restarted, true)
-        eq(result.receipt.sessions.length, 1)
+        eq(result["restarted"], true)
+        eq(result["receipt"]["sessions"].length, 1)
         #expect(calls == ["/usr/bin/osascript", "/usr/bin/open"])
-        eq(result.receipt.cloudChecks[0].status, "pending")
-        eq(result.receipt.startedAt, planned.plan.requestedAt)
-        eq(result.receipt.restart.outcome, "reopened")
+        eq(result["receipt"]["cloudChecks"][0]["status"], "pending")
+        eq(result["receipt"]["startedAt"], planned["plan"]["requestedAt"])
+        eq(result["receipt"]["restart"]["outcome"], "reopened")
     }
 
     @Test("undo refuses before removing the destination when a source recovery artifact is missing")
@@ -41,17 +41,17 @@ extension Engine.Cloud {
         try h.record("P", id(921))
         let by = Self.byAccount(try accounts(h.paths))
         let result = try move(try inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths)
-        let pair = result.receipt.superseded.find { $0.source.truthy }.moved[0]
+        let pair = result["receipt"]["superseded"].find { $0["source"].truthy }["moved"][0]
         let original = pair[0].str, parked = pair[1].str
         try unlink(parked)
         let refused = try undo(h.paths)
-        match(refused.restoreProblems[0], "recovery artifact missing")
-        ok(exists(result.receipt.sessions[0].record.str))
+        match(refused["restoreProblems"][0], "recovery artifact missing")
+        ok(exists(result["receipt"]["sessions"][0]["record"].str))
         deq(.strings(try readdir(h.dir("P"))), [])
         try writeText(original, "{broken")
         let corrupt = try undo(h.paths)
-        match(corrupt.restoreProblems[0], "recovery artifact changed")
-        ok(exists(result.receipt.sessions[0].record.str))
+        match(corrupt["restoreProblems"][0], "recovery artifact changed")
+        ok(exists(result["receipt"]["sessions"][0]["record"].str))
     }
 
     @Test("cloud bridges rehome while destination task ownership stays locked")
@@ -65,9 +65,9 @@ extension Engine.Cloud {
         try writeJSON(path.join(h.dir("Z"), "scheduled-tasks.json"), ["scheduledTasks": [["id": "task", "notifySessionId": Value("local_\(id(924))")]]])
         let by = Self.byAccount(try accounts(h.paths))
         let result = try move(try inventory([by[h.acct.P]], by[h.acct.Z], h.paths), by[h.acct.Z], h.paths)
-        eq(result.ok, false)
-        deq(result.receipt.failed.map { $0.error }, ["scheduled task registry kept in destination"])
-        deq(try readJSON(result.receipt.sessions[0].record.str).bridgeSessionIds, [])
+        eq(result["ok"], false)
+        deq(result["receipt"]["failed"].map { $0["error"] }, ["scheduled task registry kept in destination"])
+        deq(try readJSON(result["receipt"]["sessions"][0]["record"].str)["bridgeSessionIds"], [])
         deq(.strings(try readdir(h.dir("P"))), [])
         ok(try readdir(h.dir("Z")).contains("local_\(id(924)).json"))
     }
@@ -77,17 +77,17 @@ extension Engine.Cloud {
         let h = try home()
         let at = "2099-01-01T00-00-00-000"
         let original = path.join(h.project, "missing.json")
-        let parked = path.join(h.paths.state.str, "quarantine", at, "sources", "missing.json")
+        let parked = path.join(h.paths["state"].str, "quarantine", at, "sources", "missing.json")
         let receipt: Value = ["at": Value(at), "from": [], "to": "x", "sessions": [], "failed": [], "superseded": [], "finalizing": true,
                               "retiring": [["id": "x", "title": "x", "by": "y", "required": [Value(original)], "moved": [[Value(original), Value(parked)]]]]]
-        let file = path.join(h.paths.state.str, "\(at).json")
-        try mkdirp(h.paths.state)
+        let file = path.join(h.paths["state"].str, "\(at).json")
+        try mkdirp(h.paths["state"])
         try writeJSON(file, receipt)
         let result = try undo(h.paths)
-        match(result.reconciled.error, "recovery artifact missing")
+        match(result["reconciled"]["error"], "recovery artifact missing")
         let unresolved = try readJSON(file)
-        ok(unresolved.retiring)
-        eq(unresolved.finalizing, true)
+        ok(unresolved["retiring"])
+        eq(unresolved["finalizing"], true)
     }
 
     @Test("cloud identity rejects a stale authenticated account even when both logins share the organization")
@@ -118,8 +118,8 @@ extension Engine.Cloud {
             return response(requested.last == "/api/account" ? ["uuid": Value(h.acct.P)] : [["uuid": Value(h.org.P)], ["uuid": Value(h.org.T)]])
         }
         let io: Value = ["active": ["state": "unknown", "account": nil, "org": nil], "cookies": .newMap([(Value("sessionKey"), Value("fixture")), (Value("lastActiveOrg"), Value(h.org.P))]), "userAgent": "fixture"]
-        eq(try cloudClient(h.paths, nil, io).org, Value(h.org.P))
-        eq(try cloudClient(h.paths, ["account": Value(h.acct.P), "org": Value(h.org.T), "label": "Team"], io).org, Value(h.org.T))
+        eq(try cloudClient(h.paths, nil, io)["org"], Value(h.org.P))
+        eq(try cloudClient(h.paths, ["account": Value(h.acct.P), "org": Value(h.org.T), "label": "Team"], io)["org"], Value(h.org.T))
         requested = []
         throwsError("signed out") { try cloudClient(h.paths, nil, .spread(io, ["active": ["state": "logged-out"]])) }
         #expect(requested == [])
@@ -154,11 +154,11 @@ extension Engine.Cloud {
         let cloud = try cloudClient(h.paths, nil, ["active": ["state": "known", "account": Value(h.acct.P), "org": Value(h.org.P)], "cookies": .newMap([(Value("sessionKey"), Value("fixture"))]), "userAgent": "fixture", "memory": memory])
         let errors = ["repeated cursor": "cursor did not advance", "repeated sequence": "sequence changed", "oversized page": "response changed", "event limit": "exceeded 1,000,000 events", "memory pressure": "memory budget"]
         if let error = errors[scenario] {
-            throwsError(error) { try cloud.eventRows.call("cse_large") }
+            throwsError(error) { try cloud["eventRows"].call("cse_large") }
         } else {
-            let rows = try cloud.eventRows.call("cse_large")
+            let rows = try cloud["eventRows"].call("cse_large")
             eq(rows.length, limit)
-            eq(rows.at(-1).sequence_num, Value(limit - 1))
+            eq(rows.at(-1)["sequence_num"], Value(limit - 1))
             eq(pages, limit / 500 + 1)
         }
         if scenario == "event limit" { eq(pages, 2001) }
@@ -171,20 +171,20 @@ extension Engine.Cloud {
             var rss = 0.0, heapUsed = 0.0, available = 8 * GiB
             let budget = try memoryBudget(["platform": "linux", "total": Value(gib * GiB), "heap": Value(4 * GiB),
                                            "usage": fn { _ in ["rss": Value(rss), "heapUsed": Value(heapUsed)] }, "available": fn { _ in Value(available) }])
-            eq(budget.limit, Value((gib * GiB * 0.2).rounded(.down)))
-            eq(try budget.parallel.call(), 8)
-            rss = budget.limit.asNumber! * 0.6
-            eq(try budget.parallel.call(), 2)
-            rss = budget.limit.asNumber! * 0.8
-            eq(try budget.parallel.call(), 1)
-            rss = budget.limit.asNumber!
-            throwsError(where: ["code": "CLOUD_MEMORY_BUDGET"]) { try budget.check.call() }
+            eq(budget["limit"], Value((gib * GiB * 0.2).rounded(.down)))
+            eq(try budget["parallel"].call(), 8)
+            rss = budget["limit"].asNumber! * 0.6
+            eq(try budget["parallel"].call(), 2)
+            rss = budget["limit"].asNumber! * 0.8
+            eq(try budget["parallel"].call(), 1)
+            rss = budget["limit"].asNumber!
+            throwsError(where: ["code": "CLOUD_MEMORY_BUDGET"]) { try budget["check"].call() }
             rss = 0; heapUsed = 4 * GiB
-            throwsError(where: ["code": "CLOUD_MEMORY_BUDGET"]) { try budget.check.call() }
+            throwsError(where: ["code": "CLOUD_MEMORY_BUDGET"]) { try budget["check"].call() }
             heapUsed = 0; available = 0
-            throwsError(where: ["code": "CLOUD_MEMORY_PRESSURE"]) { try budget.check.call() }
+            throwsError(where: ["code": "CLOUD_MEMORY_PRESSURE"]) { try budget["check"].call() }
             available = GiB
-            #expect(throws: Never.self) { try budget.check.call() }
+            #expect(throws: Never.self) { try budget["check"].call() }
         }
     }
 
@@ -198,15 +198,15 @@ extension Engine.Cloud {
         budget = try memoryBudget(["total": 10000, "heap": 10000, "available": fn { _ in 10000 }, "usage": fn { _ in
             usageCalls += 1
             // Calls 1 and 2 check the first read before its first chunk is reserved; call 3 comes after.
-            if usageCalls == 3 { concurrent = throwsError(where: ["code": "CLOUD_MEMORY_BUDGET"]) { try budget.read.call(Self.json(Value(String(repeating: "x", count: 300)))) } }
+            if usageCalls == 3 { concurrent = throwsError(where: ["code": "CLOUD_MEMORY_BUDGET"]) { try budget["read"].call(Self.json(Value(String(repeating: "x", count: 300)))) } }
             return ["rss": 0, "heapUsed": 0]
         }])
-        let first = try budget.read.call(["body": [Value(Data(("\"" + String(repeating: "x", count: 150)).utf8)), Value(Data("\"".utf8))]])
+        let first = try budget["read"].call(["body": [Value(Data(("\"" + String(repeating: "x", count: 150)).utf8)), Value(Data("\"".utf8))]])
         ok(!concurrent.isUndefined, "the second read never ran while the first held its reservation")
         eq(first, Value(String(repeating: "x", count: 150)))
-        eq(try budget.read.call(Self.json(Value(String(repeating: "x", count: 300)))), Value(String(repeating: "x", count: 300)))
-        throwsError(where: ["name": "SyntaxError"]) { try budget.read.call(["body": [Value(Data("{bad".utf8))]]) }
-        deq(try budget.read.call(Self.json(["recovered": true])), ["recovered": true])
+        eq(try budget["read"].call(Self.json(Value(String(repeating: "x", count: 300)))), Value(String(repeating: "x", count: 300)))
+        throwsError(where: ["name": "SyntaxError"]) { try budget["read"].call(["body": [Value(Data("{bad".utf8))]]) }
+        deq(try budget["read"].call(Self.json(["recovered": true])), ["recovered": true])
     }
 
     @Test("memory pressure during final cloud proof keeps its source active until a complete retry")
@@ -222,18 +222,18 @@ extension Engine.Cloud {
                                      "eventRows": fn { _ in
                                          reads += 1
                                          if reads == 2 { pressure = true }
-                                         return try memory.read.call(Self.json(remoteRows(entries)))
+                                         return try memory["read"].call(Self.json(remoteRows(entries)))
                                      }])
-        let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
+        let all = try accounts(h.paths, []), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.Z }
         let result = try move(try inventory([from], to, h.paths, NOOP, ["cloud": cloud, "processes": []]), to, h.paths)
-        eq(result.receipt.sessions.length, 1)
-        eq(result.receipt.remote.length, 0)
-        eq(result.receipt.failed[0].code, "CLOUD_MEMORY_PRESSURE")
+        eq(result["receipt"]["sessions"].length, 1)
+        eq(result["receipt"]["remote"].length, 0)
+        eq(result["receipt"]["failed"][0]["code"], "CLOUD_MEMORY_PRESSURE")
         eq(status, "active")
         pressure = false
         let retried = try finishPending(h.paths, ["cloud": cloud, "active": ["state": "known", "account": Value(h.acct.P), "org": Value(h.org.P)], "processes": []])
-        eq(retried.complete, true)
-        eq(retried.ok, true)
+        eq(retried["complete"], true)
+        eq(retried["ok"], true)
         eq(status, "archived")
     }
 }

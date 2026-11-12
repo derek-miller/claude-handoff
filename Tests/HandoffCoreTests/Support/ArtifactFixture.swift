@@ -29,7 +29,7 @@ final class ArtifactFixture {
         agents = Value([35, 35, 34].enumerated().map { index, amount in
             branchEntries(amount, SOURCE, 3000 + index * 100).map { .spread($0, ["agentId": Value("a\(index)"), "isSidechain": true]) }
         })
-        agents[0][0].message = main[0].message.deepClone()
+        agents[0][0]["message"] = main[0]["message"].deepClone()
         let prompt: Value = [["type": "text", "text": "Synthetic queued image"],
                              ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": Value(String(repeating: "YWJj", count: large ? 300_000 : 4))]]]
         queued = ["type": "attachment", "uuid": Value(id(8100)), "sessionId": Value(SOURCE),
@@ -58,8 +58,8 @@ final class ArtifactFixture {
             "unarchive": fn { [unowned self] () in self.status = "active" },
         ])
         let all = try accounts(h.paths, [])
-        from = all.find { $0.account.str == h.acct.P }
-        to = all.find { $0.account.str == h.acct.Z }
+        from = all.find { $0["account"].str == h.acct.P }
+        to = all.find { $0["account"].str == h.acct.Z }
     }
 
     func write() throws {

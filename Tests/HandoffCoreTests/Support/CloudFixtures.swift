@@ -23,17 +23,17 @@ final class NativePrior {
         let local = remote.deepClone()
         for at in [80, 180] {
             local[at] = ["type": "queue-operation", "operation": "remove", "reason": "absorbed_mid_turn", "sessionId": Value(prior),
-                         "commandUuid": remote[at].uuid, "deliveryId": Value("delivery-\(at)"), "content": remote[at].message.content]
+                         "commandUuid": remote[at]["uuid"], "deliveryId": Value("delivery-\(at)"), "content": remote[at]["message"]["content"]]
         }
         let swapped = local[20]
         local[20] = local[21]
         local[21] = swapped
         let bridge: Value = ["type": "bridge-session", "sessionId": Value(prior), "bridgeSessionId": "session_native_prior",
                              "ownerAccountUuid": Value(h.acct.P), "ownerOrganizationUuid": Value(h.org.P)]
-        if scenario == "wrong owner" { bridge.ownerAccountUuid = Value(h.acct.T) }
-        if scenario == "wrong org" { bridge.ownerOrganizationUuid = Value(h.org.T) }
-        if scenario == "wrong session" { bridge.sessionId = Value(SOURCE) }
-        if scenario == "wrong mirror" { bridge.bridgeSessionId = "session_foreign" }
+        if scenario == "wrong owner" { bridge["ownerAccountUuid"] = Value(h.acct.T) }
+        if scenario == "wrong org" { bridge["ownerOrganizationUuid"] = Value(h.org.T) }
+        if scenario == "wrong session" { bridge["sessionId"] = Value(SOURCE) }
+        if scenario == "wrong mirror" { bridge["bridgeSessionId"] = "session_foreign" }
         try h.write(SOURCE, branchEntries(4, SOURCE, 5000))
         try h.write(prior, local.concat([bridge]).concat(scenario == "conflicting bridge" ? [.spread(bridge, ["ownerAccountUuid": Value(h.acct.T)])] : []))
         priorFile = h.transcript(prior)
@@ -42,7 +42,7 @@ final class NativePrior {
             try symlink("\(priorFile).saved", priorFile)
         }
         if scenario == "other project" {
-            let project = path.join(h.paths.pool.str, "-tmp-other")
+            let project = path.join(h.paths["pool"].str, "-tmp-other")
             try mkdirp(project)
             try rename(priorFile, path.join(project, "\(prior).jsonl"))
         }
@@ -54,8 +54,8 @@ final class NativePrior {
         let priors: [String] = scenario == "unrecorded" ? [] : scenario == "split priors" ? [prior, other] : [prior]
         try h.record("P", SOURCE, rehomeRecord(["title": "Current generation", "priorCliSessionIds": .strings(priors)]))
         let all = try accounts(h.paths, [])
-        from = all.find { $0.account.str == h.acct.P }
-        to = all.find { $0.account.str == h.acct.Z }
+        from = all.find { $0["account"].str == h.acct.P }
+        to = all.find { $0["account"].str == h.acct.Z }
         let late: Value = scenario == "after cutoff" ? ["created_at": "2099-01-01T00:00:00.000Z"] : [:]
         cloud = cloudFixture(h, [
             "list": fn { [unowned self] _ in [remoteSession(.spread(["id": "cse_native_prior", "title": "Old generation", "status": Value(self.status)], late))] },
@@ -106,8 +106,8 @@ final class LimitRetry {
             try h.record("P", row.sid, rehomeRecord(["title": Value(row.title), "bridgeSessionIds": [Value(row.id.replacingOccurrences(of: "cse_", with: "session_"))]]))
         }
         let all = try accounts(h.paths, [])
-        from = all.find { $0.account.str == h.acct.P }
-        to = all.find { $0.account.str == h.acct.Z }
+        from = all.find { $0["account"].str == h.acct.P }
+        to = all.find { $0["account"].str == h.acct.Z }
         moved = try move(try inventory([from], to, h.paths, NOOP, ["cloudRequested": true, "processes": []]), to, h.paths)
         memory = .spread(try memoryBudget(), ["check": NOOP, "parallel": fn { [unowned self] _ in
             self.batchRoom = 8
@@ -128,7 +128,7 @@ final class LimitRetry {
                 if self.batchRoom > 0 { self.batchRoom -= 1; self.batchReads += 1 } else { self.batchReads = 1 }
                 self.peak = max(self.peak, self.batchReads)
                 if let code = codes[row.mode] { throw makeError("Synthetic \(row.mode) refusal", code: code) }
-                eq(self.cloud.memory, self.memory)
+                eq(self.cloud["memory"], self.memory)
                 return remoteRows(row.entries)
             },
             "archive": fn { [unowned self] args in try self.lookup(args[0]).status = "archived"; return .undefined },

@@ -2,7 +2,6 @@ import Foundation
 
 // A dynamic value. The engine works on untyped JSON that it mutates in place and writes back byte for byte,
 // so objects and arrays are shared references, keys keep insertion order, and undefined is distinct from null.
-@dynamicMemberLookup
 public enum Value {
     case undefined
     case null
@@ -334,11 +333,6 @@ extension Value {
     public subscript(key: Value) -> Value {
         get { if case .number(let d) = key, let i = Int(exactly: d) { return self[i] }; return self[key.description] }
         nonmutating set { self[key.description] = newValue }
-    }
-
-    public subscript(dynamicMember key: String) -> Value {
-        get { self[key] }
-        nonmutating set { self[key] = newValue }
     }
 
     // delete obj[key]

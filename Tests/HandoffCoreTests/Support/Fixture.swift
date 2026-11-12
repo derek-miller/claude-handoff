@@ -52,7 +52,7 @@ func remoteState(_ status: String, _ extra: Value = [:]) -> Value {
 
 func remoteRows(_ entries: Value) -> Value {
     Value(entries.elements.enumerated().map { sequence, payload in
-        ["event_type": payload.type, "payload": payload, "sequence_num": Value(sequence), "created_at": payload.timestamp]
+        ["event_type": payload["type"], "payload": payload, "sequence_num": Value(sequence), "created_at": payload["timestamp"]]
     })
 }
 
@@ -81,22 +81,22 @@ func desktopFixture(_ session: String = SOURCE) -> Value {
 
 // A fork of a transcript as Claude Code writes it: fresh uuids linked back to the source messages.
 func fork(_ entries: Value, _ sourceId: String, _ targetId: String, _ title: String) -> Value {
-    let kept = entries.elements.filter { MESSAGES.contains($0.type.description) && $0.uuid.isString && !$0.isSidechain.truthy }
+    let kept = entries.elements.filter { MESSAGES.contains($0["type"].description) && $0["uuid"].isString && !$0["isSidechain"].truthy }
     var fresh: [String: String] = [:]
-    for entry in kept { fresh[entry.uuid.description] = randomUUID() }
+    for entry in kept { fresh[entry["uuid"].description] = randomUUID() }
     func mapped(_ uuid: Value) -> Value {
         guard let fresh = fresh[uuid.description] else { return .null }
         return Value(fresh)
     }
     var moved: [Value] = kept.map { entry -> Value in
-        let logical: Value = entry.logicalParentUuid
+        let logical: Value = entry["logicalParentUuid"]
         let changes = Value.newObject()
-        changes["uuid"] = mapped(entry.uuid)
-        changes["parentUuid"] = mapped(entry.parentUuid)
+        changes["uuid"] = mapped(entry["uuid"])
+        changes["parentUuid"] = mapped(entry["parentUuid"])
         changes["logicalParentUuid"] = logical.nullish ? logical : mapped(logical)
         changes["sessionId"] = Value(targetId)
         changes["isSidechain"] = false
-        changes["forkedFrom"] = ["sessionId": Value(sourceId), "messageUuid": entry.uuid]
+        changes["forkedFrom"] = ["sessionId": Value(sourceId), "messageUuid": entry["uuid"]]
         return .spread(entry, changes)
     }
     let title: Value = ["type": "custom-title", "sessionId": Value(targetId), "customTitle": Value(title), "uuid": Value(randomUUID()), "timestamp": Value(isoNow())]
@@ -124,7 +124,7 @@ class Home {
         root = temporaryDirectory("ct-home-")
         process.homedir = { [root] in root }
         paths = try layout(Value(root))
-        project = path.join(paths.pool.str, "-tmp-fixture")
+        project = path.join(paths["pool"].str, "-tmp-fixture")
         for a in ["P", "T", "Z", "Q"] { try mkdirp(dir(a)) }
         try mkdirp(path.join(root, ".claude-x"))
         try writeJSON(path.join(root, ".claude-x", ".claude.json"), ["oauthAccount": [
@@ -132,15 +132,15 @@ class Home {
             "organizationName": "Zed Person", "organizationType": "claude_max",
         ]])
         try mkdirp(project)
-        try mkdirp(paths.backups.str)
-        try writeJSON(paths.desktop.str, ["lastKnownAccountUuid": Value(acct.P)])
-        try writeJSON(paths.login.str, ["oauthAccount": ["accountUuid": Value(acct.P), "organizationUuid": Value(org.P), "emailAddress": "p@example.com", "organizationName": "Personal P"]])
-        try writeJSON(path.join(paths.backups.str, ".claude.json.backup.1"), ["oauthAccount": [
+        try mkdirp(paths["backups"].str)
+        try writeJSON(paths["desktop"].str, ["lastKnownAccountUuid": Value(acct.P)])
+        try writeJSON(paths["login"].str, ["oauthAccount": ["accountUuid": Value(acct.P), "organizationUuid": Value(org.P), "emailAddress": "p@example.com", "organizationName": "Personal P"]])
+        try writeJSON(path.join(paths["backups"].str, ".claude.json.backup.1"), ["oauthAccount": [
             "accountUuid": Value(acct.T), "organizationUuid": Value(org.T), "emailAddress": "t@example.com", "organizationName": "Team T",
         ]])
     }
 
-    func dir(_ a: String) -> String { path.join(paths.records.str, acct[a], org[a]) }
+    func dir(_ a: String) -> String { path.join(paths["records"].str, acct[a], org[a]) }
 
     func recordFile(_ a: String, _ sid: String) -> String { path.join(dir(a), "local_\(sid).json") }
 
@@ -172,7 +172,7 @@ class Home {
     // The accounts() row for a fixture account, in its own organization unless another is named.
     func account(_ a: String, org o: String? = nil, _ processes: Value = .undefined) throws -> Value {
         let all = try accounts(paths, processes)
-        return all.find { $0.account.str == acct[a] && $0.org.str == org[o ?? a] }
+        return all.find { $0["account"].str == acct[a] && $0["org"].str == org[o ?? a] }
     }
 }
 
@@ -182,8 +182,8 @@ func moveWithPending(_ h: Home, _ from: Value, _ to: Value, _ cloud: Value = .nu
     let pending = id(997)
     try h.record("T", pending, rehomeRecord(["title": "Pending local source"]))
     let current = try accounts(h.paths)
-    let source = from.map { row in current.find { $0.account === row.account && $0.org === row.org } }
-    let target = current.find { $0.account === to.account && $0.org === to.org }
+    let source = from.map { row in current.find { $0["account"] === row["account"] && $0["org"] === row["org"] } }
+    let target = current.find { $0["account"] === to["account"] && $0["org"] === to["org"] }
     let result = try move(try inventory(source, target, h.paths, NOOP, ["cloud": cloud, "cloudRequested": true]), target, h.paths)
     try unlink(path.join(h.dir("T"), "local_\(pending).json"))
     return result
@@ -192,7 +192,7 @@ func moveWithPending(_ h: Home, _ from: Value, _ to: Value, _ cloud: Value = .nu
 // SHA-256 of every file under the given directories; receipts and journals only under state.
 func fixtureSnapshot(_ h: Home, _ directories: [String]? = nil) throws -> Value {
     let out = Value.newObject()
-    let state = h.paths.state.str
+    let state = h.paths["state"].str
     func visit(_ dir: String) throws {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
         for name in names.sorted() {
@@ -203,7 +203,7 @@ func fixtureSnapshot(_ h: Home, _ directories: [String]? = nil) throws -> Value 
             else if dir != state || TextPattern.cached(#"^\d.*\.json(?:\.journal)?$"#).test(name) { out[file] = Value(sha(try readData(file))) }
         }
     }
-    for dir in directories ?? [h.paths.records.str, h.paths.pool.str, state] { try visit(dir) }
+    for dir in directories ?? [h.paths["records"].str, h.paths["pool"].str, state] { try visit(dir) }
     return out
 }
 
@@ -224,8 +224,8 @@ struct IdentityFixture {
 func identityFixture(_ h: Home) throws -> IdentityFixture {
     let started = ((dateNow() - 24 * 60 * 60 * 1000) / 1000).rounded(.down) * 1000
     let processes: Value = [["pid": 500, "started": Value(dateString(started)), "executable": "/Applications/Claude.app/Contents/MacOS/Claude"]]
-    try mkdirp(h.paths.logs.str)
-    let f = IdentityFixture(started: started, processes: processes, logs: h.paths.logs.str, h: h)
+    try mkdirp(h.paths["logs"].str)
+    let f = IdentityFixture(started: started, processes: processes, logs: h.paths["logs"].str, h: h)
     try f.write(f.`init`())
     return f
 }

@@ -8,8 +8,8 @@ extension Engine.Inventory {
         let text = "Synthetic text"
         let blocks: Value = [["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": "YWJj"]], ["type": "text", "text": Value(text)]]
         let user: Value = ["type": "user", "uuid": Value(id(8000)), "sessionId": Value(SOURCE), "message": ["role": "user", "content": Value(text)]]
-        let attachment: Value = ["type": "attachment", "sessionId": Value(SOURCE), "attachment": ["type": "queued_command", "source_uuid": user.uuid, "delivery_id": "delivery", "prompt": blocks]]
-        let removed: Value = ["type": "queue-operation", "sessionId": Value(SOURCE), "operation": "remove", "reason": "absorbed_mid_turn", "commandUuid": user.uuid, "deliveryId": "delivery"]
+        let attachment: Value = ["type": "attachment", "sessionId": Value(SOURCE), "attachment": ["type": "queued_command", "source_uuid": user["uuid"], "delivery_id": "delivery", "prompt": blocks]]
+        let removed: Value = ["type": "queue-operation", "sessionId": Value(SOURCE), "operation": "remove", "reason": "absorbed_mid_turn", "commandUuid": user["uuid"], "deliveryId": "delivery"]
         let session = Value(SOURCE)
         for rows in [[user, attachment, removed], [removed, attachment, user], [attachment, removed, user], [user, attachment, removed, user, removed]] as [Value] {
             let before = JSON.text(rows)
@@ -29,13 +29,13 @@ extension Engine.Inventory {
             let conflictingUser = Value.spread(canonical, ["message": ["role": "user", "content": reverse ? Value(text) : blocks]])
             deq(try conversation([canonical, attachment, consumed, conflictingUser], session), [])
             deq(try conversation([conflictingUser, attachment, consumed, canonical], session), [])
-            deq(try conversation([canonical, attachment, consumed, .spread(consumed, ["content": canonical.message.content])], session), [])
+            deq(try conversation([canonical, attachment, consumed, .spread(consumed, ["content": canonical["message"]["content"]])], session), [])
             deq(try conversation([canonical, attachment, .spread(consumed, ["deliveryId": "different"])], session), [])
-            let changedPrompt = Value.spread(attachment, ["attachment": .spread(attachment.attachment, ["prompt": queuedImagePrompt(text + " changed")])])
+            let changedPrompt = Value.spread(attachment, ["attachment": .spread(attachment["attachment"], ["prompt": queuedImagePrompt(text + " changed")])])
             deq(try conversation([canonical, changedPrompt, consumed], session), [])
         }
-        let differentImage: Value = [.spread(blocks[0], ["source": .spread(blocks[0].source, ["data": "ZGlmZmVyZW50"])]), blocks[1]]
-        let differentAttachment = Value.spread(attachment, ["attachment": .spread(attachment.attachment, ["prompt": differentImage])])
+        let differentImage: Value = [.spread(blocks[0], ["source": .spread(blocks[0]["source"], ["data": "ZGlmZmVyZW50"])]), blocks[1]]
+        let differentAttachment = Value.spread(attachment, ["attachment": .spread(attachment["attachment"], ["prompt": differentImage])])
         deq(try conversation([user, attachment, removed, differentAttachment], session), [])
         let second = Value.spread(user, ["uuid": Value(id(8001))])
         deq(try conversation([user, attachment, removed, second, user], session), try conversation([user, second]))
@@ -48,7 +48,7 @@ extension Engine.Inventory {
             let payload = reverse ? blocks : Value(text)
             let consumed: Value = ["type": "queue-operation", "operation": "remove", "reason": "absorbed_mid_turn", "sessionId": session, "commandUuid": Value(id(8000)), "deliveryId": "delivery-1", "content": payload]
             let attachment: Value = ["type": "attachment", "uuid": Value(id(8100)), "sessionId": session,
-                                     "attachment": ["type": "queued_command", "source_uuid": consumed.commandUuid, "delivery_id": consumed.deliveryId, "prompt": reverse ? Value(text) : blocks]]
+                                     "attachment": ["type": "queued_command", "source_uuid": consumed["commandUuid"], "delivery_id": consumed["deliveryId"], "prompt": reverse ? Value(text) : blocks]]
             let user = entry("user", 8000, nil, SOURCE, ["message": ["role": "user", "content": payload]])
             let expected = try conversation([user])
             for copies in [[attachment, consumed], [consumed, attachment], [attachment, attachment, consumed, consumed], [user, attachment, consumed], [attachment, user, consumed]] as [Value] {
@@ -57,28 +57,28 @@ extension Engine.Inventory {
                 eq(JSON.text(copies), before)
             }
             let second = Value.spread(consumed, ["commandUuid": Value(id(8001)), "deliveryId": "delivery-2"])
-            let secondAttachment = Value.spread(attachment, ["uuid": Value(id(8101)), "attachment": .spread(attachment.attachment, ["source_uuid": second.commandUuid, "delivery_id": second.deliveryId])])
+            let secondAttachment = Value.spread(attachment, ["uuid": Value(id(8101)), "attachment": .spread(attachment["attachment"], ["source_uuid": second["commandUuid"], "delivery_id": second["deliveryId"]])])
             deq(try conversation([attachment, consumed, secondAttachment, second, consumed, secondAttachment], session), expected.concat(expected))
             deq(try conversation([attachment, consumed, .spread(consumed, ["content": reverse ? Value(text) : blocks])], session), [])
             deq(try conversation([attachment, consumed, .spread(consumed, ["deliveryId": "conflicting-delivery"])], session), [])
             let different = reverse ? Value(text + " changed") : queuedImagePrompt(text + " changed")
-            deq(try conversation([.spread(attachment, ["attachment": .spread(attachment.attachment, ["prompt": different])]), consumed], session), [])
+            deq(try conversation([.spread(attachment, ["attachment": .spread(attachment["attachment"], ["prompt": different])]), consumed], session), [])
             let elsewhere = try conversation([attachment, .spread(consumed, ["sessionId": Value(id(2))])], session)
             deq(elsewhere, reverse ? try conversation([.spread(user, ["message": ["role": "user", "content": Value(text)]])]) : [])
         }
         let consumed: Value = ["type": "queue-operation", "operation": "remove", "reason": "absorbed_mid_turn", "sessionId": session, "commandUuid": Value(id(8000)), "deliveryId": "delivery-1", "content": Value(text)]
         let attachment: Value = ["type": "attachment", "uuid": Value(id(8100)), "sessionId": session, "attachment": ["type": "queued_command", "source_uuid": Value(id(8000)), "delivery_id": "delivery-1", "prompt": blocks]]
-        let differentImage: Value = [.spread(blocks[0], ["source": .spread(blocks[0].source, ["data": "ZGlmZmVyZW50"])]), blocks[1]]
-        deq(try conversation([attachment, consumed, .spread(attachment, ["uuid": Value(id(8101)), "attachment": .spread(attachment.attachment, ["prompt": differentImage])])], session), [])
+        let differentImage: Value = [.spread(blocks[0], ["source": .spread(blocks[0]["source"], ["data": "ZGlmZmVyZW50"])]), blocks[1]]
+        deq(try conversation([attachment, consumed, .spread(attachment, ["uuid": Value(id(8101)), "attachment": .spread(attachment["attachment"], ["prompt": differentImage])])], session), [])
         let incompatibles: [Value] = [
             blocks.concat([["type": "text", "text": ""]]),
-            [["type": "document", "source": blocks[0].source], blocks[1]],
+            [["type": "document", "source": blocks[0]["source"]], blocks[1]],
             [blocks[0], .spread(blocks[1], ["otherFilledValue": "different representation"])],
         ]
         for incompatible in incompatibles {
-            deq(try conversation([consumed, .spread(attachment, ["attachment": .spread(attachment.attachment, ["prompt": incompatible])])], session), [])
+            deq(try conversation([consumed, .spread(attachment, ["attachment": .spread(attachment["attachment"], ["prompt": incompatible])])], session), [])
         }
-        deq(try conversation([attachment, .spread(attachment, ["uuid": Value(id(8101)), "attachment": .spread(attachment.attachment, ["prompt": Value(text)])])], session), [])
+        deq(try conversation([attachment, .spread(attachment, ["uuid": Value(id(8101)), "attachment": .spread(attachment["attachment"], ["prompt": Value(text)])])], session), [])
     }
 
     // The reference LCS the bounded matcher is checked against.
@@ -167,17 +167,17 @@ extension Engine.Inventory {
                 if scenario == "relative roots" { try symlink("relative-destination", path.join(second, "snapshot")) }
                 else { try writeText(path.join(second, "snapshot"), "relative-destination") }
             }
-            let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
+            let all = try accounts(h.paths, []), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.Z }
             let inv = try inventory([from], to, h.paths, NOOP, ["processes": [], "writeCache": true])
-            eq(inv.move.length, 1, scenario)
-            eq(inv.there.length, 0, scenario)
+            eq(inv["move"].length, 1, scenario)
+            eq(inv["there"].length, 0, scenario)
             if scenario.hasPrefix("changed") || scenario == "link replaced by file" {
                 try unlink(file)
                 if scenario == "changed link" { try symlink("different", file) } else { try writeText(file, "relative-destination") }
                 var reports: [Value] = []
                 let moved = try move(inv, to, h.paths, fn { args in reports.append(Self.arg(args, 0)); return .undefined })
                 ok(reports.contains("recovery"), scenario)
-                eq(moved.ok, true, scenario)
+                eq(moved["ok"], true, scenario)
             }
         }
     }
@@ -191,7 +191,7 @@ extension Engine.Inventory {
             try mkdirp(dir)
             try writeText(file, "original")
             try writeText(external, "never read this synthetic target")
-            let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
+            let all = try accounts(h.paths, []), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.Z }
             if warm { _ = try inventory([from], to, h.paths, NOOP, ["processes": [], "writeCache": true]) }
             let physicalFile = try FileSystem.nativeRealpath(file), physicalExternal = try FileSystem.nativeRealpath(external)
             let originalOpen = fs.open, originalLstat = fs.lstat
@@ -216,8 +216,8 @@ extension Engine.Inventory {
                 inv = try inventory([from], to, h.paths, NOOP, ["processes": [], "writeCache": true])
             }
             #expect(replaced)
-            eq(inv.move.length, 0)
-            eq(inv.rejected.length, 1)
+            eq(inv["move"].length, 0)
+            eq(inv["rejected"].length, 1)
         }
     }
 
@@ -234,10 +234,10 @@ extension Engine.Inventory {
                 try writeText(path.join(external, "unrelated.txt"), "Synthetic target that the walker must not read")
             }
             try symlink(external, dir)
-            let link = dir, inode = try lstat(link).ino
+            let link = dir, inode = try lstat(link)["ino"]
             let physicalDir = path.join(try FileSystem.nativeRealpath(h.project), SOURCE), physicalExternal = path.join(try FileSystem.nativeRealpath(h.root), "unrelated")
             let before = try fixtureSnapshot(h, [h.dir("P"), h.dir("Z")])
-            let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.Z }
+            let all = try accounts(h.paths, []), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.Z }
             let check = { (name: String, key: String) in
                 ok(name != dir && !name.hasPrefix(dir + "/"), "sidecar root target \(key)")
                 ok(name != external && !name.hasPrefix(external + "/"), "external target \(key)")
@@ -253,14 +253,14 @@ extension Engine.Inventory {
                 defer { fs.readdir = readdirOriginal; fs.readFile = readFileOriginal; fs.open = openOriginal }
                 inv = try inventory([from], to, h.paths, NOOP, ["processes": []])
             }
-            eq(inv.move.length, 0, scenario)
-            eq(inv.there.length, 0, scenario)
-            eq(inv.rejected.length, 1, scenario)
-            eq(inv.rejected[0].error, Value("unsupported entry \(dir)"), scenario)
+            eq(inv["move"].length, 0, scenario)
+            eq(inv["there"].length, 0, scenario)
+            eq(inv["rejected"].length, 1, scenario)
+            eq(inv["rejected"][0]["error"], Value("unsupported entry \(dir)"), scenario)
             deq(try fixtureSnapshot(h, [h.dir("P"), h.dir("Z")]), before, scenario)
             eq(String(decoding: try FileSystem.nativeReadlink(link), as: UTF8.self), external)
-            eq(try lstat(link).ino, inode)
-            ok(!exists(h.paths.state.str))
+            eq(try lstat(link)["ino"], inode)
+            ok(!exists(h.paths["state"].str))
         }
     }
 }

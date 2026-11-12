@@ -28,14 +28,14 @@ enum Sandbox {
         let home = temporaryDirectory("ct-sandbox-")
         process.homedir = { home }
         childProcess = fixtureChildProcess()
-        cloudFetch = { request in throw EngineError("fixture fetch requires a mock: \(request.url)") }
+        cloudFetch = { request in throw EngineError("fixture fetch requires a mock: \(request["url"])") }
     }
 
     static func end() {
         fs = FileSystem()
         process = Host()
         childProcess = ChildProcess()
-        cloudFetch = { request in throw EngineError("fixture fetch requires a mock: \(request.url)") }
+        cloudFetch = { request in throw EngineError("fixture fetch requires a mock: \(request["url"])") }
         for root in roots { try? FileManager.default.removeItem(atPath: root) }
         roots = []
     }

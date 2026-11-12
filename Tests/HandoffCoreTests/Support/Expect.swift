@@ -71,8 +71,8 @@ func throwsError(_ pattern: String? = nil, _ flags: String = "", sourceLocation:
         _ = try body()
     } catch {
         let value = errorObject(error)
-        if let pattern, !TextPattern.cached(pattern, flags).test(value.message.description) && !TextPattern.cached(pattern, flags).test(value.description) {
-            Issue.record("expected an error matching /\(pattern)/, got \(value.message)", sourceLocation: sourceLocation)
+        if let pattern, !TextPattern.cached(pattern, flags).test(value["message"].description) && !TextPattern.cached(pattern, flags).test(value.description) {
+            Issue.record("expected an error matching /\(pattern)/, got \(value["message"])", sourceLocation: sourceLocation)
         }
         return value
     }

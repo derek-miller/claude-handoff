@@ -41,11 +41,11 @@ final class RuntimeTests: XCTestCase {
 
     func testReferenceSemantics() {
         let receipt: Value = ["checks": [["status": "open"]]]
-        let check = receipt.checks[0]
-        check.status = "cancelled"
-        XCTAssertEqual(receipt.checks[0].status, "cancelled")
-        receipt.checks.push(["status": "new"])
-        XCTAssertEqual(receipt.checks.length, 2)
+        let check = receipt["checks"][0]
+        check["status"] = "cancelled"
+        XCTAssertEqual(receipt["checks"][0]["status"], "cancelled")
+        receipt["checks"].push(["status": "new"])
+        XCTAssertEqual(receipt["checks"].length, 2)
     }
 
     func testSpreadAndErrors() {
@@ -54,7 +54,7 @@ final class RuntimeTests: XCTestCase {
         let e = makeError("boom", code: "X", [("file", "f")])
         XCTAssertEqual(JSON.text(e.value), #"{"code":"X","file":"f"}"#)
         XCTAssertEqual(e.value.description, "Error: boom")
-        XCTAssertEqual(e.value.message, "boom")
+        XCTAssertEqual(e.value["message"], "boom")
     }
 
     func testSetsAndMaps() {

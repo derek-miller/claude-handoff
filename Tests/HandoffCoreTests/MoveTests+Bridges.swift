@@ -35,8 +35,8 @@ extension Engine.Moves {
             result = try move(inv, h.to, h.paths)
         }
         #expect(injected)
-        eq(result.ok, true)
-        ok(try undo(h.paths, ["processes": []]).dest)
+        eq(result["ok"], true)
+        ok(try undo(h.paths, ["processes": []])["dest"])
         let after = try readData(transcript)
         assertBridgeRestored(mode == "partial-write" ? h.before : changedHistory, after, h.bridge)
         deq(lines(Self.text(after)).at(-1), h.bridge)
@@ -50,11 +50,11 @@ extension Engine.Moves {
         var transcript = h.transcriptPath
         let entries = lines(Self.text(h.before))
         if mode == "unknown owner" { bridge.removeKey("ownerAccountUuid"); bridge.removeKey("ownerOrganizationUuid") }
-        if mode == "destination owner" || mode == "other organization" { bridge.ownerAccountUuid = h.to.account }
-        if mode == "destination owner" { bridge.ownerOrganizationUuid = h.to.org }
-        if mode == "legacy" { bridge.bridge_session_id = bridge.bridgeSessionId; bridge.removeKey("bridgeSessionId") }
-        if mode == "empty" { bridge.bridgeSessionId = "" }
-        if mode == "foreign session" { bridge.sessionId = Value(id(799)) }
+        if mode == "destination owner" || mode == "other organization" { bridge["ownerAccountUuid"] = h.to["account"] }
+        if mode == "destination owner" { bridge["ownerOrganizationUuid"] = h.to["org"] }
+        if mode == "legacy" { bridge["bridge_session_id"] = bridge["bridgeSessionId"]; bridge.removeKey("bridgeSessionId") }
+        if mode == "empty" { bridge["bridgeSessionId"] = "" }
+        if mode == "foreign session" { bridge["sessionId"] = Value(id(799)) }
         entries[entries.length - 1] = bridge
         let text = entries.elements.map { mode == "spaced" ? JSON.text($0, space: 1).replacingOccurrences(of: "\n", with: " ") : JSON.text($0) }.joined(separator: "\n") + (mode == "no newline" ? "" : "\n")
         try writeText(transcript, text)
@@ -73,24 +73,24 @@ extension Engine.Moves {
             output.append("\(Self.arg(args, 0)) \(Self.arg(args, 1))")
             return .undefined
         })
-        eq(result.ok, true)
-        eq(result.receipt.failed.length, 0)
+        eq(result["ok"], true)
+        eq(result["receipt"]["failed"].length, 0)
         noMatch(output.joined(separator: "\n"), "warning|suppressed|bridge", "i")
         let cleared = !["destination owner", "empty", "foreign session"].contains(mode)
         let after = try readData(transcript), records = lines(Self.text(after))
         #expect(after.prefix(before.count) == before)
         eq(records.length, entries.length + (cleared ? 1 : 0))
-        deq(records.filter { MESSAGES.contains($0.type.str) }, entries.filter { MESSAGES.contains($0.type.str) })
-        deq(records.filter { $0.type == "history-suppression" }, entries.filter { $0.type == "history-suppression" })
-        eq(records.at(-1).bridgeSessionId, cleared ? "" : bridge.bridgeSessionId)
+        deq(records.filter { MESSAGES.contains($0["type"].str) }, entries.filter { MESSAGES.contains($0["type"].str) })
+        deq(records.filter { $0["type"] == "history-suppression" }, entries.filter { $0["type"] == "history-suppression" })
+        eq(records.at(-1)["bridgeSessionId"], cleared ? "" : bridge["bridgeSessionId"])
         eq(Value(try readText(sidecar)), "synthetic sidecar\n")
-        let all = try accounts(h.paths, []), next = all.find { $0.account.str == h.acct.T }, source = all.find { $0.account.str == h.acct.Z }
+        let all = try accounts(h.paths, []), next = all.find { $0["account"].str == h.acct.T }, source = all.find { $0["account"].str == h.acct.Z }
         if cleared {
             let again = try move(try inventory([source], next, h.paths, NOOP, ["processes": []]), next, h.paths)
-            eq(again.ok, true)
+            eq(again["ok"], true)
             #expect(try readData(transcript) == after)
         } else {
-            ok(try undo(h.paths, ["processes": []]).dest)
+            ok(try undo(h.paths, ["processes": []])["dest"])
             #expect(try readData(transcript) == before)
         }
     }
@@ -98,22 +98,22 @@ extension Engine.Moves {
     @Test("bridge rehome keeps ordinary lines just over 16 MiB movable", arguments: [false, true], [false, true])
     func bridgeRehomeLargeLines(bridge: Bool, tool: Bool) throws {
         let h = try bridgeFixture(), transcript = h.transcriptPath
-        let entries = lines(Self.text(h.before)).filter { bridge || $0.type != "bridge-session" }
+        let entries = lines(Self.text(h.before)).filter { bridge || $0["type"] != "bridge-session" }
         let content = Value(String(repeating: "x", count: 16 * 1024 * 1024 + 1))
-        entries[0].message.content = tool ? [["type": "tool_result", "tool_use_id": "synthetic", "content": content]] : content
+        entries[0]["message"]["content"] = tool ? [["type": "tool_result", "tool_use_id": "synthetic", "content": content]] : content
         try h.write(SOURCE, entries)
         let before = try readData(transcript)
         let inv = try inventory([h.from], h.to, h.paths, NOOP, ["processes": []])
-        eq(inv.move.length, 1)
+        eq(inv["move"].length, 1)
         let moved = try move(inv, h.to, h.paths)
-        eq(moved.ok, true, moved.receipt.failed.map { $0.error }.join(", "))
-        eq(moved.receipt.verification.ok, true)
+        eq(moved["ok"], true, moved["receipt"]["failed"].map { $0["error"] }.join(", "))
+        eq(moved["receipt"]["verification"]["ok"], true)
         let after = try readData(transcript)
         #expect(after.prefix(before.count) == before)
         eq(after.count > before.count, bridge)
-        ok(JSON.text(moved.receipt.sessions[0].bridgeAppend ?? .null).utf16.count < 4096)
+        ok(JSON.text(moved["receipt"]["sessions"][0]["bridgeAppend"] ?? .null).utf16.count < 4096)
         deq(try Self.names(h.dir("P")), [])
-        ok(try undo(h.paths, ["processes": []]).dest)
+        ok(try undo(h.paths, ["processes": []])["dest"])
         if bridge { assertBridgeRestored(after, try readData(transcript), h.bridge) } else { #expect(try readData(transcript) == before) }
         deq(try Self.names(h.dir("Z")), [])
     }
@@ -148,13 +148,13 @@ extension Engine.Moves {
         }
         let healed = ["replacement", "parent replacement"].contains(mode)
         #expect(injected)
-        eq(result.ok, Value(healed))
+        eq(result["ok"], Value(healed))
         deq(try Self.names(h.dir("Z")), healed ? [Value("local_\(SOURCE).json")] : [])
         if mode == "missing" { #expect(!exists(transcript)) }
-        else if mode == "directory" { eq(try lstat(transcript).isDirectory.call(), true) }
+        else if mode == "directory" { eq(try lstat(transcript)["isDirectory"].call(), true) }
         else if healed { assertBridgeRestored(h.before, try readData(transcript), ["type": "bridge-session", "sessionId": Value(SOURCE), "bridgeSessionId": "", "lastSequenceNum": 0]) }
         else { #expect(try readData(transcript) == h.before) }
-        if mode == "symlink" { eq(try lstat(transcript).isSymbolicLink.call(), true) }
+        if mode == "symlink" { eq(try lstat(transcript)["isSymbolicLink"].call(), true) }
         if !healed { ok(exists(h.recordFile("P", SOURCE))) }
     }
 
@@ -185,16 +185,16 @@ extension Engine.Moves {
         }
         #expect(injected)
         let after = try readData(transcript)
-        eq(try keepLocal(h.paths).recoveryRequired, true)
+        eq(try keepLocal(h.paths)["recoveryRequired"], true)
         let recovered = try undo(h.paths, ["inspect": inspect])
         let restored = try readData(transcript)
         if mode == "growth" {
-            match(recovered.reconciled.error, "interrupted")
+            match(recovered["reconciled"]["error"], "interrupted")
             #expect(restored.prefix(after.count) == after)
             deq(lines(Self.text(restored)).at(-1), h.bridge)
-            eq(lines(Self.text(restored)).filter { MESSAGES.contains($0.type.str) }.length, 3)
+            eq(lines(Self.text(restored)).filter { MESSAGES.contains($0["type"].str) }.length, 3)
         } else {
-            match(recovered.reconciled.error, "bridge|worker")
+            match(recovered["reconciled"]["error"], "bridge|worker")
             #expect(restored == after)
         }
         ok(exists(h.recordFile("P", SOURCE)))
@@ -221,14 +221,14 @@ extension Engine.Moves {
             result = try executeMove([from], to, h.paths, ["processes": []])
         }
         #expect(injected)
-        eq(result.ok, true)
-        eq(result.receipt.sessions.length, 4)
+        eq(result["ok"], true)
+        eq(result["receipt"]["sessions"].length, 4)
         deq(try readJSON(h.targetFile), h.targetAfter)
-        ok(try undo(h.paths, ["processes": []]).dest)
+        ok(try undo(h.paths, ["processes": []])["dest"])
         let restored = try readData(transcript)
         #expect(restored.prefix(before.count) == before)
-        deq(lines(Self.text(restored)).filter { $0.type == "bridge-session" }.at(-1), bridge)
-        eq(lines(Self.text(restored)).filter { MESSAGES.contains($0.type.str) }.length, later ? 2 : 1)
+        deq(lines(Self.text(restored)).filter { $0["type"] == "bridge-session" }.at(-1), bridge)
+        eq(lines(Self.text(restored)).filter { MESSAGES.contains($0["type"].str) }.length, later ? 2 : 1)
         deq(try readJSON(h.sourceFile), h.sourceRegistry)
     }
 
@@ -250,11 +250,11 @@ extension Engine.Moves {
                 "list": fn { _ in [remoteSession(["id": "cse_linked_fork", "title": "Remote fork"])] },
                 "eventRows": fn { _ in remoteRows(base) },
             ])
-            let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
+            let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.T }
             let inv = try inventory([from], to, h.paths, NOOP, ["cloud": cloud])
-            deq(inv.cloud.matches, [], links)
-            eq(inv.cloud.blocked.length, 1, links)
-            match(inv.cloud.blocked[0].error, "multiple .*local target")
+            deq(inv["cloud"]["matches"], [], links)
+            eq(inv["cloud"]["blocked"].length, 1, links)
+            match(inv["cloud"]["blocked"][0]["error"], "multiple .*local target")
         }
     }
 
@@ -265,7 +265,7 @@ extension Engine.Moves {
         try h.record("P", SOURCE, rehomeRecord())
         let from = try h.account("P"), to = try h.account("Z")
         let inv = try inventory([from], to, h.paths)
-        eq(inv.move[0].bridge, true)
-        deq(inv.move[0].bridgeIds, [])
+        eq(inv["move"][0]["bridge"], true)
+        deq(inv["move"][0]["bridgeIds"], [])
     }
 }

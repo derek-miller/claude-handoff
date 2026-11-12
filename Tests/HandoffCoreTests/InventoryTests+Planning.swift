@@ -14,21 +14,21 @@ extension Engine.Inventory {
                 try h.record(account, parent, rehomeRecord(["forkedFromSessionId": Value("local_\(SOURCE)")]))
             }
             try h.record(location, child, rehomeRecord(["isArchived": true, "forkedFromSessionId": Value("local_\(parent)")]))
-            let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
+            let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.T }
             let inv = try inventory([from], to, h.paths)
-            eq(inv.there.length, 2)
+            eq(inv["there"].length, 2)
             let moved = try move(inv, to, h.paths)
             if location == "P" {
                 eq(moved, nil)
             } else {
-                eq(moved.ok, true)
-                deq(moved.receipt.failed, [])
-                eq(moved.receipt.superseded.length, 2)
+                eq(moved["ok"], true)
+                deq(moved["receipt"]["failed"], [])
+                eq(moved["receipt"]["superseded"].length, 2)
             }
             deq(.strings(try readdir(h.dir(location)).sorted()), .strings([SOURCE, parent, child].map { "local_\($0).json" }.sorted()))
             if location == "Q" {
                 deq(try Self.names(h.dir("P")), [])
-                ok(try undo(h.paths).dest)
+                ok(try undo(h.paths)["dest"])
             }
         }
     }
@@ -41,7 +41,7 @@ extension Engine.Inventory {
             try h.record("T", SOURCE, rehomeRecord())
             try h.write(richer, fork(base, SOURCE, richer, "Richer").concat([entry("user", 3, nil, richer)]))
             try h.record("P", richer, rehomeRecord())
-            let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
+            let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.T }
             let inv = try inventory([from], to, h.paths)
             let addFork = {
                 try writeJSON(h.recordFile("T", child), ["sessionId": Value("local_\(child)"), "cliSessionId": Value(child), "isArchived": true, "forkedFromSessionId": Value("local_\(SOURCE)")])
@@ -51,11 +51,11 @@ extension Engine.Inventory {
                 if stage == "finalize" && Self.arg(args, 0).str == stage { try addFork() }
                 return .undefined
             })
-            eq(moved.ok, true)
-            deq(moved.receipt.failed, [])
-            eq(moved.receipt.superseded.some { !$0.source.truthy }, false)
+            eq(moved["ok"], true)
+            deq(moved["receipt"]["failed"], [])
+            eq(moved["receipt"]["superseded"].some { !$0["source"].truthy }, false)
             ok(exists(h.recordFile("T", SOURCE)))
-            ok(try undo(h.paths).dest)
+            ok(try undo(h.paths)["dest"])
             deq(.strings(try readdir(h.dir("T")).sorted()), .strings([SOURCE, child].map { "local_\($0).json" }.sorted()))
         }
     }
@@ -76,52 +76,52 @@ extension Engine.Inventory {
     @Test("progress begins before analysis and every counted phase reaches its total")
     func progressReachesTotals() throws {
         let h = try home()
-        try mkdirp(path.join(h.paths.records.str, h.acct.P, h.org.T))
+        try mkdirp(path.join(h.paths["records"].str, h.acct.P, h.org.T))
         try h.write(SOURCE, [entry("user", 1, nil, SOURCE), entry("assistant", 2, 1, SOURCE)])
         try h.record("P", SOURCE, rehomeRecord())
         let from = try h.account("P"), to = try h.account("P", org: "T")
         var progress: [Value] = []
         let report = fn { args in
             let extra = Self.arg(args, 2).nullish ? Value.newObject() : Self.arg(args, 2)
-            if extra.live.truthy { progress.append(["stage": Self.arg(args, 0), "text": Self.arg(args, 1), "completed": extra.completed, "total": extra.total]) }
+            if extra["live"].truthy { progress.append(["stage": Self.arg(args, 0), "text": Self.arg(args, 1), "completed": extra["completed"], "total": extra["total"]]) }
             return .undefined
         }
         let inv = try inventory([from], to, h.paths, report)
         _ = try move(inv, to, h.paths, report)
         deq(progress.first ?? .undefined, ["stage": "scan", "text": "0/1", "completed": 0, "total": 1])
         for stage in ["scan", "move", "verify", "retire"] {
-            let rows = progress.filter { $0.stage.str == stage && $0.completed.asInt != nil && $0.total.asInt != nil }
+            let rows = progress.filter { $0["stage"].str == stage && $0["completed"].asInt != nil && $0["total"].asInt != nil }
             ok(rows.count >= 2, "\(stage) did not report a counted phase")
             guard let first = rows.first, let last = rows.last else { continue }
-            eq(first.completed, 0)
-            eq(last.completed, last.total)
-            ok(rows.indices.allSatisfy { $0 == 0 || rows[$0].completed.asNumber! >= rows[$0 - 1].completed.asNumber! })
+            eq(first["completed"], 0)
+            eq(last["completed"], last["total"])
+            ok(rows.indices.allSatisfy { $0 == 0 || rows[$0]["completed"].asNumber! >= rows[$0 - 1]["completed"].asNumber! })
         }
     }
 
     @Test("the planning cache skips unchanged analysis but never authorizes a move")
     func planningCacheNeverAuthorizes() throws {
         let h = try home()
-        let teamDir = path.join(h.paths.records.str, h.acct.P, h.org.T)
+        let teamDir = path.join(h.paths["records"].str, h.acct.P, h.org.T)
         try mkdirp(teamDir)
         let transcript = h.transcript(SOURCE)
         try h.write(SOURCE, [entry("user", 1, nil, SOURCE), entry("assistant", 2, 1, SOURCE)])
         try h.record("P", SOURCE, rehomeRecord())
         let from = try h.account("P"), to = try h.account("P", org: "T")
         let cold = try inventory([from], to, h.paths, NOOP, ["writeCache": true])
-        ok(cold.cacheStats.historyMisses.asNumber! > 0)
-        let cache = try readJSON(path.join(h.paths.state.str, "cache.json"))
-        ok(cache.histories.valuesArray.every { $0.value.result.contentSha.isString })
+        ok(cold["cacheStats"]["historyMisses"].asNumber! > 0)
+        let cache = try readJSON(path.join(h.paths["state"].str, "cache.json"))
+        ok(cache["histories"].valuesArray.every { $0["value"]["result"]["contentSha"].isString })
         let warm = try inventory([from], to, h.paths)
-        ok(warm.cacheStats.historyHits.asNumber! > 0)
-        eq(warm.cacheStats.historyMisses, 0)
-        ok(warm.cacheStats.manifestHits.asNumber! > 0)
+        ok(warm["cacheStats"]["historyHits"].asNumber! > 0)
+        eq(warm["cacheStats"]["historyMisses"], 0)
+        ok(warm["cacheStats"]["manifestHits"].asNumber! > 0)
 
         try appendText(transcript, "\(JSON.text(entry("user", 3, 2, SOURCE)))\n")
         var reports: [String] = []
         let retried = try move(warm, to, h.paths, fn { args in reports.append("\(Self.arg(args, 0)) \(Self.arg(args, 1))"); return .undefined })
         ok(reports.contains("recovery Retrying unfinished sessions once"))
-        eq(retried.receipt.sessions.length, 1)
+        eq(retried["receipt"]["sessions"].length, 1)
         deq(try Self.names(h.dir("P")), [])
         deq(try Self.names(teamDir), [Value("local_\(SOURCE).json")])
     }
@@ -129,7 +129,7 @@ extension Engine.Inventory {
     @Test("rehome verification catches transcript and sidecar drift after placement")
     func rehomeVerificationCatchesDrift() throws {
         let h = try home()
-        let teamDir = path.join(h.paths.records.str, h.acct.P, h.org.T)
+        let teamDir = path.join(h.paths["records"].str, h.acct.P, h.org.T)
         try mkdirp(teamDir)
         let transcript = h.transcript(SOURCE)
         let sidecar = path.join(h.project, SOURCE, "subagents", "agent.jsonl")
@@ -142,13 +142,13 @@ extension Engine.Inventory {
         var reports: [String] = []
         let result = try move(inv, to, h.paths, fn { args in
             reports.append("\(Self.arg(args, 0)) \(Self.arg(args, 1))")
-            if Self.arg(args, 0) != "verify" || Self.arg(args, 2).completed != 0 { return .undefined }
+            if Self.arg(args, 0) != "verify" || Self.arg(args, 2)["completed"] != 0 { return .undefined }
             try appendText(transcript, "\(JSON.text(entry("assistant", 2, 1, SOURCE)))\n")
             try appendText(sidecar, "{\"after\":true}\n")
             return .undefined
         })
         ok(reports.contains("recovery Retrying unfinished sessions once"))
-        eq(result.ok, true)
+        eq(result["ok"], true)
         deq(try Self.names(h.dir("P")), [])
         deq(try Self.names(teamDir), [Value("local_\(SOURCE).json")])
     }
@@ -156,7 +156,7 @@ extension Engine.Inventory {
     @Test("rehome retirement allows shared growth without duplicate records")
     func rehomeRetirementSharedGrowth() throws {
         let h = try home()
-        let teamDir = path.join(h.paths.records.str, h.acct.P, h.org.T)
+        let teamDir = path.join(h.paths["records"].str, h.acct.P, h.org.T)
         try mkdirp(teamDir)
         let transcript = h.transcript(SOURCE)
         try h.write(SOURCE, [entry("user", 1, nil, SOURCE)])
@@ -169,7 +169,7 @@ extension Engine.Inventory {
             try appendText(transcript, "\(JSON.text(entry("assistant", 2, 1, SOURCE)))\n")
             return .undefined
         })
-        eq(result.ok, true)
+        eq(result["ok"], true)
         #expect(changed)
         deq(try Self.names(h.dir("P")), [])
         deq(try Self.names(teamDir), [Value("local_\(SOURCE).json")])
@@ -180,43 +180,43 @@ extension Engine.Inventory {
     func corruptAndLegacyCaches() throws {
         for state in ["corrupt", "legacy"] {
             let h = try home()
-            try mkdirp(path.join(h.paths.records.str, h.acct.P, h.org.T))
+            try mkdirp(path.join(h.paths["records"].str, h.acct.P, h.org.T))
             let parent = entry("assistant", 1, nil, SOURCE)
             let image: Value = ["base64": Value(Data("synthetic image bytes".utf8).base64EncodedString()), "dimensions": ["width": 1, "height": 1], "originalSize": 21, "type": "image/png"]
             let full = entry("user", 2, 1, SOURCE, ["toolUseResult": ["type": "image", "file": image]])
-            let replay = Value.spread(full, ["toolUseResult": .spread(full.toolUseResult, ["file": .spread(full.toolUseResult.file, ["base64": ""])])])
+            let replay = Value.spread(full, ["toolUseResult": .spread(full["toolUseResult"], ["file": .spread(full["toolUseResult"]["file"], ["base64": ""])])])
             let edits: [Value] = [3, 4, 5, 6].flatMap { k -> [Value] in
                 let original = entry("attachment", k, 2, SOURCE, ["attachment": ["type": "edited_text_file", "filename": Value("/tmp/fixture-\(k).txt"), "snippet": Value("synthetic edit \(k)")]])
-                return [original, .spread(original, ["attachment": .spread(original.attachment, ["displayPath": Value("fixture-\(k).txt")])])]
+                return [original, .spread(original, ["attachment": .spread(original["attachment"], ["displayPath": Value("fixture-\(k).txt")])])]
             }
             let entries = Value([parent, full, replay] + edits)
-            eq(try normalize(entries).replays, 5)
+            eq(try normalize(entries)["replays"], 5)
             try h.write(SOURCE, entries)
             try h.record("P", SOURCE, rehomeRecord())
             let transcript = h.transcript(SOURCE), before = try readData(transcript)
             let from = try h.account("P"), to = try h.account("P", org: "T")
             _ = try inventory([from], to, h.paths, NOOP, ["writeCache": true, "processes": []])
-            let file = path.join(h.paths.state.str, "cache.json"), stored = try readJSON(file)
-            stored.version = 10
-            for row in stored.histories.valuesArray.elements {
-                row.value.result.conflicts = 10
-                row.value.result.comparable = false
+            let file = path.join(h.paths["state"].str, "cache.json"), stored = try readJSON(file)
+            stored["version"] = 10
+            for row in stored["histories"].valuesArray.elements {
+                row["value"]["result"]["conflicts"] = 10
+                row["value"]["result"]["comparable"] = false
             }
             try writeText(file, state == "corrupt" ? "{broken" : JSON.text(stored))
             let inv = try inventory([from], to, h.paths, NOOP, ["writeCache": true, "processes": []])
-            eq(inv.blocked.length, 0)
-            eq(inv.move.length, 1)
-            eq(inv.cacheStats.historyHits, 0)
-            ok(inv.cacheStats.historyMisses.asNumber! > 0)
+            eq(inv["blocked"].length, 0)
+            eq(inv["move"].length, 1)
+            eq(inv["cacheStats"]["historyHits"], 0)
+            ok(inv["cacheStats"]["historyMisses"].asNumber! > 0)
             let refreshed = try readJSON(file)
-            eq(refreshed.version, Value(CACHE_VERSION))
-            eq(refreshed.semanticVersion, 3)
-            ok(refreshed.histories.valuesArray.every { $0.value.result.conflicts == 0 && $0.value.result.comparable.truthy })
+            eq(refreshed["version"], Value(CACHE_VERSION))
+            eq(refreshed["semanticVersion"], 3)
+            ok(refreshed["histories"].valuesArray.every { $0["value"]["result"]["conflicts"] == 0 && $0["value"]["result"]["comparable"].truthy })
             let warm = try inventory([from], to, h.paths, NOOP, ["processes": []])
-            eq(warm.blocked.length, 0)
-            eq(warm.move.length, 1)
-            ok(warm.cacheStats.historyHits.asNumber! > 0)
-            eq(warm.cacheStats.historyMisses, 0)
+            eq(warm["blocked"].length, 0)
+            eq(warm["move"].length, 1)
+            ok(warm["cacheStats"]["historyHits"].asNumber! > 0)
+            eq(warm["cacheStats"]["historyMisses"], 0)
             #expect(try readData(transcript) == before)
         }
     }
@@ -228,11 +228,11 @@ extension Engine.Inventory {
             try h.write(session, [entry("user", Int(String(session.suffix(1)))!, nil, session)])
             try h.record("P", session)
         }
-        let all = try accounts(h.paths), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
+        let all = try accounts(h.paths), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.T }
         var completed: Value = 0
         throwsError("fixture deadline spent") {
             try inventory([from], to, h.paths, fn { args in
-                if Self.arg(args, 0) == "scan" { completed = Self.arg(args, 2).completed }
+                if Self.arg(args, 0) == "scan" { completed = Self.arg(args, 2)["completed"] }
                 return .undefined
             }, ["processes": [], "check": fn { () in if completed.asNumber ?? 0 > 0 { throw EngineError("fixture deadline spent") } }])
         }
@@ -248,8 +248,8 @@ extension Engine.Inventory {
                 try h.write(sid, [entry("user", sid == SOURCE ? 101 : 102, nil, sid)])
                 try h.record("P", sid, rehomeRecord())
             }
-            let all = try accounts(h.paths, []), from = all.find { $0.account.str == h.acct.P }, to = all.find { $0.account.str == h.acct.T }
-            from.sessions = from.sessions.filter { $0.id.str == SOURCE }
+            let all = try accounts(h.paths, []), from = all.find { $0["account"].str == h.acct.P }, to = all.find { $0["account"].str == h.acct.T }
+            from["sessions"] = from["sessions"].filter { $0["id"].str == SOURCE }
             let read = fs.readFile, file = h.recordFile("P", other)
             var armed = false, changed = false
             fs.readFile = { name in
@@ -257,7 +257,7 @@ extension Engine.Inventory {
                 if armed && !changed && name == file {
                     changed = true
                     let record = try JSON.parse(result)
-                    if change == "runtime" { record.completedTurns = 7 } else { record.forkedFromSessionId = Value("local_\(SOURCE)") }
+                    if change == "runtime" { record["completedTurns"] = 7 } else { record["forkedFromSessionId"] = Value("local_\(SOURCE)") }
                     try writeJSON(file, record)
                 }
                 return result
@@ -271,14 +271,14 @@ extension Engine.Inventory {
                 }])
             }
             #expect(changed)
-            eq(result.ok, true)
-            eq(result.receipt.sessions.length, 1)
-            deq(result.receipt.failed, [])
+            eq(result["ok"], true)
+            eq(result["receipt"]["sessions"].length, 1)
+            deq(result["receipt"]["failed"], [])
             if change == "runtime" {
-                eq(result.receipt.superseded.length, 1)
-                eq(try readJSON(file).completedTurns, 7)
+                eq(result["receipt"]["superseded"].length, 1)
+                eq(try readJSON(file)["completedTurns"], 7)
             } else {
-                eq(result.receipt.superseded.length, 0)
+                eq(result["receipt"]["superseded"].length, 0)
                 ok(exists(h.recordFile("P", SOURCE)))
                 ok(exists(h.recordFile("T", SOURCE)))
             }
@@ -292,10 +292,10 @@ extension Engine.Inventory {
         try h.record("P", SOURCE)
         let from = try h.account("P"), to = try h.account("T")
         let moved = try move(try inventory([from], to, h.paths), to, h.paths)
-        let file = moved.receipt.sessions[0].record.str
+        let file = moved["receipt"]["sessions"][0]["record"].str
         try unlink(file)
-        deq(try verifyPlaced(h.paths).changed[0].fields, ["record unavailable"])
+        deq(try verifyPlaced(h.paths)["changed"][0]["fields"], ["record unavailable"])
         try writeText(file, "{")
-        deq(try verifyPlaced(h.paths).changed[0].fields, ["record unavailable"])
+        deq(try verifyPlaced(h.paths)["changed"][0]["fields"], ["record unavailable"])
     }
 }

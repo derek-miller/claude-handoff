@@ -13,9 +13,9 @@ extension Engine.Inventory {
         let from = try h.account("P"), to = try h.account("Z")
         let inv = try inventory([from], to, h.paths)
         let result = try move(inv, to, h.paths)
-        eq(inv.there.length, 0)
-        match(inv.rejected[0].error, "Desktop record identity is invalid")
-        eq(result.ok, false)
+        eq(inv["there"].length, 0)
+        match(inv["rejected"][0]["error"], "Desktop record identity is invalid")
+        eq(result["ok"], false)
         ok(exists(h.recordFile("P", SOURCE)))
     }
 
@@ -27,17 +27,17 @@ extension Engine.Inventory {
         let taskFile = path.join(h.dir("P"), "scheduled-tasks.json")
         try writeText(taskFile, "[]")
         var by = try Self.byAccount(h)
-        match(by[h.acct.P]!.taskError, "invalid scheduled task registry")
-        match(by[h.acct.P]!.stats, "task registry unreadable")
+        match(by[h.acct.P]!["taskError"], "invalid scheduled task registry")
+        match(by[h.acct.P]!["stats"], "task registry unreadable")
         let blocked = try inventory([by[h.acct.P]!], by[h.acct.Z]!, h.paths)
-        eq(blocked.move.length, 0)
-        match(blocked.blocked[0].error, "invalid scheduled task registry")
+        eq(blocked["move"].length, 0)
+        match(blocked["blocked"][0]["error"], "invalid scheduled task registry")
         try writeJSON(taskFile, ["scheduledTasks": []])
         by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!], by[h.acct.Z]!, h.paths)
         throwsError("unreadable scheduled task registry") {
             try move(inv, by[h.acct.Z]!, h.paths, fn { args in
-                if Self.arg(args, 0) == "verify" && Self.arg(args, 2).completed == 0 { try writeText(taskFile, "{broken") }
+                if Self.arg(args, 0) == "verify" && Self.arg(args, 2)["completed"] == 0 { try writeText(taskFile, "{broken") }
                 return .undefined
             })
         }
@@ -52,13 +52,13 @@ extension Engine.Inventory {
         try h.record("T", id(926))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        eq(inv.sources.length, 2)
-        eq(inv.move.length, 1)
-        eq(inv.blocked.length, 0)
+        eq(inv["sources"].length, 2)
+        eq(inv["move"].length, 1)
+        eq(inv["blocked"].length, 0)
         let result = try move(inv, by[h.acct.Z]!, h.paths)
-        eq(result.ok, true)
-        eq(result.receipt.sessions.length, 1)
-        eq(result.receipt.superseded.filter { $0.source.truthy }.length, 2)
+        eq(result["ok"], true)
+        eq(result["receipt"]["sessions"].length, 1)
+        eq(result["receipt"]["superseded"].filter { $0["source"].truthy }.length, 2)
         deq(try Self.names(h.dir("P")), [])
         deq(try Self.names(h.dir("T")), [])
         deq(try Self.names(h.dir("Z")), [Value("local_\(id(926)).json")])
@@ -74,10 +74,10 @@ extension Engine.Inventory {
         try h.record("P", id(984))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!], by[h.acct.Z]!, h.paths)
-        match(inv.rejected[0].error, "unsupported entry .*linked")
+        match(inv["rejected"][0]["error"], "unsupported entry .*linked")
         let result = try move(inv, by[h.acct.Z]!, h.paths)
-        eq(result.validationOnly, true)
-        eq(result.receipt.failed[0].id, Value(id(984)))
+        eq(result["validationOnly"], true)
+        eq(result["receipt"]["failed"][0]["id"], Value(id(984)))
     }
 
     @Test("versions that grew apart both move and are counted")
@@ -90,31 +90,31 @@ extension Engine.Inventory {
         try h.record("T", id(990))
         let by = try Self.byAccount(h)
         let inv = try inventory([by[h.acct.P]!, by[h.acct.T]!], by[h.acct.Z]!, h.paths)
-        eq(inv.apart, 2)
-        deq(inv.move.map { $0.id }.sorted(), [Value(id(980)), Value(id(990))])
+        eq(inv["apart"], 2)
+        deq(inv["move"].map { $0["id"] }.sorted(), [Value(id(980)), Value(id(990))])
     }
 
     @Test("real-shape sync replays collapse without conflicts")
     func realShapeSyncReplays() throws {
         let shaped = try normalize(try fixture("replay.jsonl"))
-        eq(shaped.replays, 20)
-        eq(shaped.conflicts, 0)
+        eq(shaped["replays"], 20)
+        eq(shaped["conflicts"], 0)
     }
 
     @Test("bridge byte verification parses history only when inventory found metadata", arguments: ["no bridge metadata", "bridge metadata", "shared transcript records"])
     func bridgeByteVerification(mode: String) throws {
         let bridge = mode != "no bridge metadata"
         let h = try bridgeFixture()
-        let messages = branchEntries(48, SOURCE, 1).map { .spread($0, ["message": .spread($0.message, ["content": Value(String(repeating: "synthetic history ", count: 128))])]) }
+        let messages = branchEntries(48, SOURCE, 1).map { .spread($0, ["message": .spread($0["message"], ["content": Value(String(repeating: "synthetic history ", count: 128))])]) }
         try h.write(SOURCE, messages.concat(bridge ? [h.bridge] : []))
         var from = h.from
         if mode == "shared transcript records" {
             try h.record("P", id(777), rehomeRecord(["cliSessionId": Value(SOURCE), "forkedFromSessionId": Value("local_\(SOURCE)")]))
-            from = try accounts(h.paths, []).find { $0.account.str == h.acct.P }
+            from = try accounts(h.paths, []).find { $0["account"].str == h.acct.P }
         }
         let before = try readData(h.transcriptPath), inv = try inventory([from], h.to, h.paths, NOOP, ["processes": []])
         let result = try move(inv, h.to, h.paths)
-        eq(result.ok, true)
+        eq(result["ok"], true)
         #expect(try readData(h.transcriptPath).prefix(before.count) == before)
     }
 
@@ -122,17 +122,17 @@ extension Engine.Inventory {
     func bridgeAppendShared() throws {
         let h = try bridgeFixture(), child = id(777)
         try h.record("P", child, rehomeRecord(["cliSessionId": Value(SOURCE), "forkedFromSessionId": Value("local_\(SOURCE)")]))
-        let from = try accounts(h.paths, []).find { $0.account.str == h.acct.P }
+        let from = try accounts(h.paths, []).find { $0["account"].str == h.acct.P }
         let inv = try inventory([from], h.to, h.paths, NOOP, ["processes": []])
-        eq(inv.move.length, 2)
+        eq(inv["move"].length, 2)
         let moved = try move(inv, h.to, h.paths)
-        eq(moved.ok, true)
-        eq(moved.receipt.sessions.length, 2)
-        eq(moved.receipt.sessions.filter { $0.bridgeAppend.truthy }.length, 1)
-        eq(lines(try readText(h.transcriptPath)).filter { $0.type == "bridge-session" }.length, 2)
+        eq(moved["ok"], true)
+        eq(moved["receipt"]["sessions"].length, 2)
+        eq(moved["receipt"]["sessions"].filter { $0["bridgeAppend"].truthy }.length, 1)
+        eq(lines(try readText(h.transcriptPath)).filter { $0["type"] == "bridge-session" }.length, 2)
         deq(try Self.names(h.dir("P")), [])
-        eq(try readJSON(h.recordFile("Z", child)).forkedFromSessionId, Value("local_\(SOURCE)"))
-        ok(try undo(h.paths, ["processes": []]).dest)
+        eq(try readJSON(h.recordFile("Z", child))["forkedFromSessionId"], Value("local_\(SOURCE)"))
+        ok(try undo(h.paths, ["processes": []])["dest"])
         assertBridgeRestored(h.before, try readData(h.transcriptPath), h.bridge)
         deq(.strings(try readdir(h.dir("P")).sorted()), .strings([SOURCE, child].map { "local_\($0).json" }.sorted()))
     }
@@ -143,7 +143,7 @@ extension Engine.Inventory {
         try writeText(h.recordFile("T", SOURCE), "{")
         let from = try h.account("T"), to = try h.account("Z")
         let inv = try inventory([from], to, h.paths, NOOP, ["cloudRequested": true])
-        eq(inv.cloudCheckAccounts.length, 1)
+        eq(inv["cloudCheckAccounts"].length, 1)
     }
 
     @Test("duplicate owners keep record-only bridge identities scoped to each source account")
@@ -157,7 +157,7 @@ extension Engine.Inventory {
         let from: Value = [try h.account("P"), try h.account("T")]
         let to = try h.account("Z")
         let moved = try moveWithPending(h, from, to)
-        eq(moved.receipt.cloudLinks.some { $0.account.str == h.acct.T && $0.bridgeIds.includes("session_second_owner") }, true)
+        eq(moved["receipt"]["cloudLinks"].some { $0["account"].str == h.acct.T && $0["bridgeIds"].includes("session_second_owner") }, true)
         var status = "active"
         let cloud = cloudFixture(h, [
             "account": Value(h.acct.T),
@@ -169,9 +169,9 @@ extension Engine.Inventory {
             "unarchive": fn { () in status = "active" },
         ])
         let finished = try finishPending(h.paths, ["cloud": cloud])
-        eq(finished.ok, true)
-        deq(finished.failed, [])
-        deq(finished.summary.kept.map { $0.code }, ["CLOUD_UNPROVEN"])
+        eq(finished["ok"], true)
+        deq(finished["failed"], [])
+        deq(finished["summary"]["kept"].map { $0["code"] }, ["CLOUD_UNPROVEN"])
         eq(status, "active")
     }
 
@@ -179,29 +179,29 @@ extension Engine.Inventory {
     func forkLinkedDeletedRoutine() throws {
         let h = try taskHistoryFixture(), first = h.sessions[0], second = h.sessions[1], mock = taskHarness()
         try h.record("P", second, rehomeRecord(["scheduledTaskId": Value(h.taskId), "isArchived": true, "forkedFromSessionId": Value("local_\(first)")]))
-        let (from, to) = try h.selection(), before = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str])
+        let (from, to) = try h.selection(), before = try fixtureSnapshot(h, [h.paths["records"].str, h.paths["pool"].str])
         let registries = try [h.sourceFile, h.targetFile].map(readData)
         let planned = try executeMove([from], to, h.paths, ["io": mock.io])
-        eq(planned.plan.held.length, 2)
-        let result = try executeMove([from], to, h.paths, ["io": mock.io, "approve": planned.plan.token])
-        eq(result.ok, true, JSON.text(result.receipt.failed))
-        deq(result.receipt.sessions.map { $0.id }.sorted(), Value([Value(first), Value(second)]).sorted())
-        deq(result.receipt.taskTransfers[0].tasks, [])
+        eq(planned["plan"]["held"].length, 2)
+        let result = try executeMove([from], to, h.paths, ["io": mock.io, "approve": planned["plan"]["token"]])
+        eq(result["ok"], true, JSON.text(result["receipt"]["failed"]))
+        deq(result["receipt"]["sessions"].map { $0["id"] }.sorted(), Value([Value(first), Value(second)]).sorted())
+        deq(result["receipt"]["taskTransfers"][0]["tasks"], [])
         #expect(try [h.sourceFile, h.targetFile].map(readData) == registries)
         deq(.strings(try readdir(h.dir("P")).filter { $0.hasPrefix("local_") }), [])
-        ok(try undo(h.paths, ["processes": []]).dest)
-        deq(try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str]), before)
+        ok(try undo(h.paths, ["processes": []])["dest"])
+        deq(try fixtureSnapshot(h, [h.paths["records"].str, h.paths["pool"].str]), before)
     }
 
     @Test("task preflight refuses absent sources and unreadable destination data")
     func taskPreflightRefuses() throws {
         for scenario in ["missing source", "unreadable source", "unreadable target", "denied target"] {
             let h = try taskFamilyFixture(), (from, to) = try h.selection()
-            let source = Value.spread(from, ["sessions": from.sessions.filter { $0.id.str != h.cold }])
+            let source = Value.spread(from, ["sessions": from["sessions"].filter { $0["id"].str != h.cold }])
             let inv = try inventory([source], to, h.paths, NOOP, ["processes": []])
             if scenario == "missing source" { try rmrf(h.dir("P")) }
             if scenario.hasPrefix("unreadable") { try writeText(path.join(h.dir(scenario == "unreadable source" ? "P" : "T"), "local_\(id(796)).json"), "{broken") }
-            let before = try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str]), original = fs.readdir
+            let before = try fixtureSnapshot(h, [h.paths["records"].str, h.paths["pool"].str]), original = fs.readdir
             if scenario == "denied target" {
                 let target = h.dir("T")
                 fs.readdir = { dir in
@@ -211,10 +211,10 @@ extension Engine.Inventory {
             }
             let result: Value
             do { defer { fs.readdir = original }; result = try move(inv, to, h.paths) }
-            eq(result.ok, false, scenario)
-            eq(result.receipt.sessions.length, 0, scenario)
-            ok(result.receipt.failed.length > 0, scenario)
-            deq(try fixtureSnapshot(h, [h.paths.records.str, h.paths.pool.str]), before, scenario)
+            eq(result["ok"], false, scenario)
+            eq(result["receipt"]["sessions"].length, 0, scenario)
+            ok(result["receipt"]["failed"].length > 0, scenario)
+            deq(try fixtureSnapshot(h, [h.paths["records"].str, h.paths["pool"].str]), before, scenario)
         }
     }
 
@@ -224,15 +224,15 @@ extension Engine.Inventory {
         try appendText(transcript, "{broken\n")
         let before = try readData(transcript), source = try readData(f.investorFile)
         let result = try verifyPlaced(h.paths)
-        eq(result.ok, true)
-        let receipt = try readJSON(f.result.file.str)
-        deq(receipt.failed.find { $0.id == "cse_investor" }.blockedByLocal, [Value("\(h.acct.P)/\(h.org.P)/\(f.recordId)")])
-        eq(receipt.cloudChecks[0].status, "blocked-local")
-        ok(result.summary.notMoved.some { $0.sessionId.str == f.recordId })
+        eq(result["ok"], true)
+        let receipt = try readJSON(f.result["file"].str)
+        deq(receipt["failed"].find { $0["id"] == "cse_investor" }["blockedByLocal"], [Value("\(h.acct.P)/\(h.org.P)/\(f.recordId)")])
+        eq(receipt["cloudChecks"][0]["status"], "blocked-local")
+        ok(result["summary"]["notMoved"].some { $0["sessionId"].str == f.recordId })
         let (from, to) = try h.selection()
         let inv = try inventory([from], to, h.paths, NOOP, ["processes": []])
-        ok(inv.blocked.some { $0.id.str == f.investor && TextPattern.cached("unparseable lines").test($0.error.str) })
-        ok(!inv.move.some { $0.id.str == f.investor })
+        ok(inv["blocked"].some { $0["id"].str == f.investor && TextPattern.cached("unparseable lines").test($0["error"].str) })
+        ok(!inv["move"].some { $0["id"].str == f.investor })
         #expect(try readData(transcript) == before)
         #expect(try readData(f.investorFile) == source)
         ok(!exists(path.join(h.dir("T"), "\(f.recordId).json")))

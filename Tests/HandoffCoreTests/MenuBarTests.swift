@@ -102,16 +102,16 @@ extension Engine {
             ].enumerated().map { index, row -> Value in .spread(row, ["activeAt": Value(3 - index), "pending": nil, "pendingFailures": [], "identityState": "known"]) })
             func pending(_ index: Int, _ mode: String, _ count: Int, _ code: String? = nil, _ release: String? = nil, _ activeIndex: Int = 0, _ seconds: Value = nil) throws -> Value {
                 let rows = Value(base.deepClone().elements.enumerated().map { i, row -> Value in
-                    .spread(row, ["active": Value(i == activeIndex), "signedIn": Value(row.account === base[activeIndex].account)])
+                    .spread(row, ["active": Value(i == activeIndex), "signedIn": Value(row["account"] === base[activeIndex]["account"])])
                 })
                 let account = rows[index]
-                let source: Value = ["account": account.account, "org": account.org, "sessionIds": .strings((0..<count).map { "session_\($0)" })]
+                let source: Value = ["account": account["account"], "org": account["org"], "sessionIds": .strings((0..<count).map { "session_\($0)" })]
                 if let code {
-                    source.failures = source.sessionIds.map { ["id": $0, "title": "Research conversation", "code": Value(code), "error": Value(code)] }
+                    source["failures"] = source["sessionIds"].map { ["id": $0, "title": "Research conversation", "code": Value(code), "error": Value(code)] }
                 }
                 if let code, ["CLOUD_HISTORY_LIMIT", "CLOUD_BUDGET_LIMIT", "CLOUD_PARSER_LIMIT"].contains(code) {
-                    source.attemptEngine = try artifactEngine()
-                    source.attemptBudget = try memoryBudget().signature
+                    source["attemptEngine"] = try artifactEngine()
+                    source["attemptBudget"] = try memoryBudget()["signature"]
                 }
                 let releaseValue: Value = release.map { Value($0) } ?? .null
                 let held: Value = mode == "local" ? Value((0..<count).map { i -> Value in
@@ -121,35 +121,35 @@ extension Engine {
                 let receipt: Value = ["held": held, "remote": mode == "undo" ? [["id": "cse_0"], ["id": "cse_1"]] : [],
                                       "remoteUndoing": mode == "undo" ? [.spread(source, ["id": "cse_1"])] : []]
                 let table: Value = release == "worker"
-                    ? Value([desktopFixture()[0]] + held.elements.enumerated().map { i, row in .spread(desktopFixture()[1], ["pid": Value(501 + i), "ids": [row.id]]) })
+                    ? Value([desktopFixture()[0]] + held.elements.enumerated().map { i, row in .spread(desktopFixture()[1], ["pid": Value(501 + i), "ids": [row["id"]]]) })
                     : desktopFixture()
                 let presentation = try pendingPresentation(receipt, source, account, Value(mode), table, Value(release == "scheduler"),
-                                                           .newMap(held.elements.map { ($0.recordId, seconds) }))
-                let fields: Value = ["pending": Value(mode), "pendingFailures": source.failures ?? [], "pendingWaiting": source.waiting ?? [], "receipt": "synthetic-receipt",
+                                                           .newMap(held.elements.map { ($0["recordId"], seconds) }))
+                let fields: Value = ["pending": Value(mode), "pendingFailures": source["failures"] ?? [], "pendingWaiting": source["waiting"] ?? [], "receipt": "synthetic-receipt",
                                      "receiptMoved": mode == "local" ? 359 : 361, "receiptDestination": index == 0 ? "work/personal" : "work/company",
                                      "pendingCancel": mode == "cloud" ? Value(String(repeating: String(index + 1), count: 64)) : .null]
                 _ = Value.assign(account, fields, presentation, ["pendingRetryAt": nil])
                 return rows
             }
             let plan: Value = ["plan": true, "kind": "move", "token": Value(String(repeating: "a", count: 64)), "heldCount": 102, "remainingCount": 102, "moved": 259,
-                               "sourceLabels": [base[1].label],
+                               "sourceLabels": [base[1]["label"]],
                                "affected": [["pid": 501, "started": "synthetic", "recordId": "local_one", "title": "Research notes"], ["pid": 502, "started": "synthetic", "recordId": "local_two", "title": "Daily brief"]]]
             let capacityPlan = Value.spread(plan, ["ok": false, "code": "RESTART_CAPACITY", "capacity": ["records": 102, "estimatedMs": 26000, "availableMs": 22000, "fits": false]])
             let held = try pending(1, "local", 102, nil, "scheduler")
-            held[1].receiptMoved = 259
+            held[1]["receiptMoved"] = 259
             let mixed = try pending(2, "cloud", 3)
             mixed[1] = held[1]
-            mixed[2].receiptMoved = 259
+            mixed[2]["receiptMoved"] = 259
             let mixedWaiting = try pending(0, "cloud", 2, "CLOUD_HISTORY_UNREADABLE"), mixedAccount = mixedWaiting[0]
-            let mixedSource: Value = ["account": mixedAccount.account, "org": mixedAccount.org, "failures": mixedAccount.pendingFailures.slice(0, 1),
+            let mixedSource: Value = ["account": mixedAccount["account"], "org": mixedAccount["org"], "failures": mixedAccount["pendingFailures"].slice(0, 1),
                                       "waiting": [["id": "session_1", "title": "Another open conversation", "localId": Value(SOURCE)]]]
-            _ = Value.assign(mixedAccount, ["pendingFailures": mixedSource.failures, "pendingWaiting": mixedSource.waiting],
+            _ = Value.assign(mixedAccount, ["pendingFailures": mixedSource["failures"], "pendingWaiting": mixedSource["waiting"]],
                              try pendingPresentation([:], mixedSource, mixedAccount, "cloud", desktopFixture()))
             let limitAndSignIn = try pending(1, "cloud", 1, "CLOUD_HISTORY_LIMIT")
             limitAndSignIn[2] = try pending(2, "cloud", 3)[2]
             let twoSources = try pending(0, "cloud", 1)
             twoSources[1] = try pending(1, "cloud", 1)[1]
-            for row in twoSources.elements where row.pending.truthy { row.receiptDestination = "home/personal" }
+            for row in twoSources.elements where row["pending"].truthy { row["receiptDestination"] = "home/personal" }
             let localUndo = try pending(2, "undo", 1)
             _ = Value.assign(localUndo[2], try pendingPresentation(["undoing": [], "remote": [["id": "cse_one"]]], localUndo[2], localUndo[2], "undo"))
             let partialSummary: Value = ["moved": 272, "notMoved": Value((0..<3).map { i -> Value in
@@ -158,13 +158,13 @@ extension Engine {
             let partial = base.deepClone()
             _ = Value.assign(partial[1], ["pending": "partial", "pendingState": "partial", "pendingAction": "blocked", "pendingCount": 3, "pendingAutomatic": false,
                                           "receipt": "synthetic-receipt", "receiptSummary": partialSummary, "receiptMoved": 272, "receiptDestination": "work/company"])
-            let recorded = base.map { .spread($0, ["receipt": "/synthetic/2026-10-30T21-00-00-000.json", "receiptDone": base[1].label,
+            let recorded = base.map { .spread($0, ["receipt": "/synthetic/2026-10-30T21-00-00-000.json", "receiptDone": base[1]["label"],
                                                    "receiptSummary": ["moved": 499, "notMoved": [], "groups": [], "attention": [], "kept": []]]) }
             let starting = try pending(0, "cloud", 1, "CLOUD_AUTH_PENDING", nil, 2).map { .spread($0, ["active": false, "signedIn": false, "identityState": "unknown"]) }
-            let unfinished = try pending(2, "cloud", 3).map { $0.pending.truthy ? .spread($0, ["receiptSummary": partialSummary]) : $0 }
+            let unfinished = try pending(2, "cloud", 3).map { $0["pending"].truthy ? .spread($0, ["receiptSummary": partialSummary]) : $0 }
             // An hour ahead: compiling the menu bar app before it renders can take most of a minute on CI.
-            let retrying = { (rows: Value) in rows.map { $0.pending.truthy ? .spread($0, ["pendingRetryAt": Value(dateNow() + 3_600_000)]) : $0 } }
-            let label0 = base[0].label, label1 = base[1].label
+            let retrying = { (rows: Value) in rows.map { $0["pending"].truthy ? .spread($0, ["pendingRetryAt": Value(dateNow() + 3_600_000)]) : $0 } }
+            let label0 = base[0]["label"], label1 = base[1]["label"]
             let rows: [Value] = [
                 ["name": "01-done", "screen": "moved", "event": ["done": true, "ok": true, "complete": true, "moved": 361, "destinationLabel": label0], "contains": ["Done. 361 sessions are now in", label0], "primary": nil],
                 ["name": "02-held", "screen": "needs a restart", "accounts": held, "contains": ["259 sessions moved\n102 more need Claude to restart."], "primary": "Restart Claude and move 102"],
@@ -223,8 +223,8 @@ extension Engine {
                 ["name": "53-other-login-and-unfinished-local", "screen": "needs a sign-in", "accounts": unfinished, "contains": ["272 sessions moved\n3 old copies need checking"], "primary": nil],
             ]
             return Value(rows.map { row in
-                .spread(row, ["accounts": row.accounts ?? base, "operation": row.operation ?? ["--from", "work personal", "--to", "work company", "--cloud", "--json"],
-                              "event": row.event.truthy ? Value(JSON.text(row.event)) : .null])
+                .spread(row, ["accounts": row["accounts"] ?? base, "operation": row["operation"] ?? ["--from", "work personal", "--to", "work company", "--cloud", "--json"],
+                              "event": row["event"].truthy ? Value(JSON.text(row["event"])) : .null])
             })
         }
 
@@ -238,7 +238,7 @@ extension Engine {
             let manifest = try readJSON(path.join(root, "manifest.json"))
             eq(manifest.length, fixtures.length)
             for row in manifest.elements {
-                #expect(try readData(row.path.str).prefix(8) == Data([137, 80, 78, 71, 13, 10, 26, 10]), "\(row.name)")
+                #expect(try readData(row["path"].str).prefix(8) == Data([137, 80, 78, 71, 13, 10, 26, 10]), "\(row["name"])")
             }
         }
 
@@ -256,17 +256,17 @@ extension Engine {
             var captured: [Value] = []
             let planned = try executeMove([selected.from], selected.to, transfer.paths, ["io": mock.io])
             var closing = false
-            let moved = try executeMove([selected.from], selected.to, transfer.paths, ["io": mock.io, "approve": planned.plan.token, "report": fn { args in
+            let moved = try executeMove([selected.from], selected.to, transfer.paths, ["io": mock.io, "approve": planned["plan"]["token"], "report": fn { args in
                 let stage = MenuBar.arg(args, 0), text = MenuBar.arg(args, 1), extra = MenuBar.arg(args, 2)
                 if stage == "desktop" { closing = true }
                 let line = Value.spread(["stage": stage, "text": text], extra.isObjectLike ? extra : [:])
                 captured.append(["preQuit": Value(!closing), "line": Value(JSON.text(line))])
                 return .undefined
             }])
-            eq(moved.ok, true, moved.reason.description)
+            eq(moved["ok"], true, moved["reason"].description)
             ok(try captured.contains { row in
-                let line = try JSON.parse(row.line.str)
-                return row.preQuit.truthy && line.stage == "move" && toNumber(line.completed) > 0
+                let line = try JSON.parse(row["line"].str)
+                return row["preQuit"].truthy && line["stage"] == "move" && toNumber(line["completed"]) > 0
             })
 
             let retryHome = try taskFamilyFixture(), retrySelection = try retryHome.selection()
@@ -275,22 +275,22 @@ extension Engine {
             let retryMock = taskHarness(try parseProcesses(Value(desktop), Value(desktop)))
             let retryPlan = try executeMove([retrySelection.from], retrySelection.to, retryHome.paths, ["io": retryMock.io])
             var changed = false
-            let interrupted = try executeMove([retrySelection.from], retrySelection.to, retryHome.paths, ["io": retryMock.io, "approve": retryPlan.plan.token, "report": fn { args in
-                if !changed && MenuBar.arg(args, 0) == "move" && MenuBar.arg(args, 2).completed == 1 {
+            let interrupted = try executeMove([retrySelection.from], retrySelection.to, retryHome.paths, ["io": retryMock.io, "approve": retryPlan["plan"]["token"], "report": fn { args in
+                if !changed && MenuBar.arg(args, 0) == "move" && MenuBar.arg(args, 2)["completed"] == 1 {
                     changed = true
                     retryMock.rows = try parseProcesses(Value(listing), Value(commands))
                 }
                 return .undefined
             }])
             #expect(changed)
-            eq(interrupted.code, "RESTART_PLAN_CHANGED")
-            eq(interrupted.receipt.sessions.length, 1)
+            eq(interrupted["code"], "RESTART_PLAN_CHANGED")
+            eq(interrupted["receipt"]["sessions"].length, 1)
             #expect(retryMock.calls == [])
             let retryAccounts = cli(retryHome.root, ["accounts", "--json"]) { processSetup(list: listing, commands: commands) }
             eq(retryAccounts.code, 0, retryAccounts.stderr)
-            let event = Value.spread(interrupted, ["done": true, "receipt": interrupted.file, "moved": Value(interrupted.receipt.sessions.length),
-                                                   "heldCount": Value(interrupted.receipt.held.length), "held": interrupted.receipt.held])
-            let continuation: Value = ["accounts": try JSON.parse(retryAccounts.stdout), "args": ["--from", retrySelection.from.label, "--to", retrySelection.to.label, "--json"],
+            let event = Value.spread(interrupted, ["done": true, "receipt": interrupted["file"], "moved": Value(interrupted["receipt"]["sessions"].length),
+                                                   "heldCount": Value(interrupted["receipt"]["held"].length), "held": interrupted["receipt"]["held"]])
+            let continuation: Value = ["accounts": try JSON.parse(retryAccounts.stdout), "args": ["--from", retrySelection.from["label"], "--to", retrySelection.to["label"], "--json"],
                                        "event": Value(JSON.text(event))]
 
             let data: [(String, String)] = [
@@ -310,20 +310,20 @@ extension Engine {
                 return
             }
             let command = try JSON.parse(String(commandLine.dropFirst("CONTINUATION_COMMAND ".count))).elements.map(\.str)
-            let receiptBytes = try readData(interrupted.file.str)
+            let receiptBytes = try readData(interrupted["file"].str)
             let next = cli(retryHome.root, command) { processSetup(list: listing, commands: commands) }
             eq(next.code, 0, next.stderr)
-            let continuationPlan = lines(next.stdout).find { $0.plan.truthy }
+            let continuationPlan = lines(next.stdout).find { $0["plan"].truthy }
             ok(continuationPlan, next.stdout)
-            eq(continuationPlan.receiptFile, interrupted.file)
-            eq(continuationPlan.resume, true)
-            ne(continuationPlan.token, retryPlan.plan.token)
-            #expect(try readData(interrupted.file.str) == receiptBytes)
-            let finished = try finishWorkflow(retryHome.paths, ["io": retryMock.io, "approve": continuationPlan.token])
-            eq(finished.ok, true, finished.reason.description)
-            eq(finished.complete, true)
-            eq(finished.file, interrupted.file)
-            eq(finished.receipt.sessions.length, 4)
+            eq(continuationPlan["receiptFile"], interrupted["file"])
+            eq(continuationPlan["resume"], true)
+            ne(continuationPlan["token"], retryPlan["plan"]["token"])
+            #expect(try readData(interrupted["file"].str) == receiptBytes)
+            let finished = try finishWorkflow(retryHome.paths, ["io": retryMock.io, "approve": continuationPlan["token"]])
+            eq(finished["ok"], true, finished["reason"].description)
+            eq(finished["complete"], true)
+            eq(finished["file"], interrupted["file"])
+            eq(finished["receipt"]["sessions"].length, 4)
         }
     }
 }
