@@ -320,6 +320,11 @@ struct CloudCheck: AccountKey {
 struct CloudPlan {
     let raw: Value
     init(_ raw: Value) { self.raw = raw }
+    var checked: Value { raw["checked"] }
+    var memory: Value {
+        get { raw["memory"] }
+        nonmutating set { raw["memory"] = newValue }
+    }
     var matches: Value { raw["matches"] }
     var blocked: Value { raw["blocked"] }
     var waiting: Value { raw["waiting"] }
@@ -382,7 +387,10 @@ extension MovePlan {
     var missing: Value { raw["missing"] }
     var twice: Value { raw["twice"] }
     var apart: Value { raw["apart"] }
-    var pendingCloud: Value { raw["pendingCloud"] }
+    var pendingCloud: Value {
+        get { raw["pendingCloud"] }
+        nonmutating set { raw["pendingCloud"] = newValue }
+    }
     var cloudPlan: CloudPlan { CloudPlan(raw["cloud"]) }
 }
 

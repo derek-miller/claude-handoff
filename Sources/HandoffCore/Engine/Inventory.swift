@@ -17,6 +17,7 @@ fileprivate func comparatorChain(_ ds: [Double]) -> Double {
 fileprivate func flatPart(_ v: Value) -> [Value] { v.isArray ? v.elements : [v] }
 
 func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ targets: Value = .undefined, _ move: Value = .undefined, _ cache: Value = .undefined, _ report: Value = .undefined, _ cutoff: Value = .undefined, _ liveSources: Value = .undefined, _ sessionIds: Value = .undefined, _ excludedIds: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+    let opts = InventoryOptions(options)
     let cutoff: Value = cutoff.isUndefined ? .null : cutoff
     let liveSources: Value = liveSources.isUndefined ? .newArray() : liveSources
     let sessionIds: Value = sessionIds.isUndefined ? .null : sessionIds
@@ -57,8 +58,8 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
             "account": cloud["account"],
             "org": cloud["org"],
             "source": account,
-            "serial": Value(options["serial"].truthy),
-            "isolatedId": options["budgetRetry"].truthy ? .null : .undefined,
+            "serial": Value(opts.serial.truthy),
+            "isolatedId": opts.budgetRetry.truthy ? .null : .undefined,
         ]
         out["memory"] = try selectedMemory(Value.spread(options, ["cloud": cloud]))
         return out
@@ -72,7 +73,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
         let value = cache["data"]["remote"][id]["value"]["artifactDeferred"]
         return isSafeInteger(value) && toNumber(value) > 0 ? toNumber(value) : .infinity
     }
-    let priority = Value.newMap((options["budgetRetry"] ?? []).elements.enumerated().map { ($0.element, Value($0.offset)) })
+    let priority = Value.newMap((opts.budgetRetry ?? []).elements.enumerated().map { ($0.element, Value($0.offset)) })
     let retryOrder = { (id: Value) throws -> Double in
         let found = priority.get(try remoteId(id))
         return found.isUndefined ? .infinity : toNumber(found)
@@ -98,14 +99,14 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     let eligibleSessions = try stableSorted(filtered) { a, b in
         comparatorChain([try retryOrder(a["id"]) - retryOrder(b["id"]), deferredOrder(a["id"]) - deferredOrder(b["id"])])
     }
-    let sessions: [Value] = options["budgetRetry"].truthy ? sliceArray(eligibleSessions, 0, 1) : eligibleSessions
-    if options["budgetRetry"].truthy {
+    let sessions: [Value] = opts.budgetRetry.truthy ? sliceArray(eligibleSessions, 0, 1) : eligibleSessions
+    if opts.budgetRetry.truthy {
         for session in sliceArray(eligibleSessions, 1).map(RemoteSession.init) {
             waiting.push(["id": session.id, "title": or(session.title, "Untitled session"), "localId": .null, "code": "CLOUD_MEMORY_DEFERRED"])
         }
     }
     let matches = Value.newArray()
-    let artifacts = try artifactBudget(options["artifactLimit"])
+    let artifacts = try artifactBudget(opts.artifactLimit)
     var completed = 0
     var deferralSequence = sessions.reduce(0.0) { maximum, session in
         let order = deferredOrder(RemoteSession(session).id)
@@ -190,7 +191,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
                         let inputs = try artifactInputs(selected["row"])
                         retrySignature = Value(sha(stable(["engine": try artifactEngine(), "limit": artifacts["limit"], "remote": signature, "id": selected["id"], "record": selected["row"]["recordSemantic"], "files": inputs["fingerprints"]])))
                         let previous = remote["artifactFailure"]
-                        if options["automatic"].truthy && previous["signature"] === retrySignature { throw EngineError(try artifactError("unchanged inputs still exceed the supplemental read limits", previous["code"])) }
+                        if opts.automatic.truthy && previous["signature"] === retrySignature { throw EngineError(try artifactError("unchanged inputs still exceed the supplemental read limits", previous["code"])) }
                         remote.removeKey("artifactFailure")
                         remote.removeKey("artifactDeferred")
                         checked = true
@@ -232,7 +233,7 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     }
     var at = 0
     while at < sessions.count {
-        let size = options["serial"].truthy ? 1 : (try selectedMemory(Value.spread(options, ["cloud": cloud]))["parallel"].call()).asInt ?? 0
+        let size = opts.serial.truthy ? 1 : (try selectedMemory(Value.spread(options, ["cloud": cloud]))["parallel"].call()).asInt ?? 0
         var batch: [CloudOutcome] = []
         for session in sliceArray(sessions, at, at + size) { batch.append(try analyze(session)) }
         at += batch.count
@@ -246,10 +247,11 @@ func cloudInventory(_ cloud: Value = .undefined, _ from: Value = .undefined, _ t
     }
     let out: Value = [
         "checked": true, "matches": matches, "blocked": blocked, "waiting": waiting, "later": later, "client": cloud,
-        "account": cloud["account"], "org": cloud["org"], "source": account, "artifacts": artifacts, "serial": Value(options["serial"].truthy),
+        "account": cloud["account"], "org": cloud["org"], "source": account, "artifacts": artifacts, "serial": Value(opts.serial.truthy),
     ]
-    out["isolatedId"] = options["budgetRetry"].truthy ? try remoteId(sessions.first?["id"] ?? .undefined) : .undefined
-    out["memory"] = try selectedMemory(Value.spread(options, ["cloud": cloud]))
+    let plan = CloudPlan(out)
+    plan.isolatedId = opts.budgetRetry.truthy ? try remoteId(sessions.first?["id"] ?? .undefined) : .undefined
+    plan.memory = try selectedMemory(Value.spread(options, ["cloud": cloud]))
     return out
 }
 
@@ -307,8 +309,8 @@ func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -
             }
         }
     }
-    for source in pendingRows where source["taskFamily"].truthy && !availableParents.has(recordId(source)) {
-        for row in pendingRows.filter({ $0["taskFamily"] === source["taskFamily"] }) where !reasons.get(row).truthy { reasons.set(row, .string(PARENT_MISSING)) }
+    for source in pendingRows where MoveSource(source).taskFamily.truthy && !availableParents.has(recordId(source)) {
+        for row in pendingRows.filter({ MoveSource($0).taskFamily === MoveSource(source).taskFamily }) where !reasons.get(row).truthy { reasons.set(row, .string(PARENT_MISSING)) }
     }
     let blocked = Value.newArray()
     var move: [Value] = []
@@ -316,7 +318,7 @@ func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -
         let reason = or(reasons.get(source), !availableParents.has(recordId(source)) ? .string(PARENT_MISSING) : .null)
         if reason.truthy { blocked.push(Value.spread(source, ["error": reason])) }
         else {
-            source["strategy"] = "rehome"
+            MoveSource(source).strategy = "rehome"
             move.append(source)
         }
     }
@@ -336,19 +338,20 @@ func localPlan(_ pending: Value = .undefined, _ to: Value = .undefined) throws -
 }
 
 func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, _ options: Value = .undefined, _ owners: Value = .undefined, _ enabled: Value = .undefined) throws -> Value {
-    let cloudBridgeIds = options["cloudBridgeIds"]
-    target["artifactBridgeIds"] = unique(try remoteIdsOf(target).elements + (cloudBridgeIds.get(target["id"]) ?? []).elements.map(remoteId).filter { $0.truthy }).value
+    let opts = InventoryOptions(options)
+    let cloudBridgeIds = opts.cloudBridgeIds, dest = MoveTarget(target)
+    dest.artifactBridgeIds = unique(try remoteIdsOf(target).elements + (cloudBridgeIds.get(dest.id) ?? []).elements.map(remoteId).filter { $0.truthy }).value
     if !enabled.truthy { return .undefined }
     let priorIds = unique(try priorSessions(desktopRecordOf(target)).elements.filter { id in
         guard let s = id.asString else { return false }
-        return UUID.test(s) && id !== target["id"]
+        return UUID.test(s) && id !== dest.id
     })
-    let remembered = ([target["id"]] + priorIds).flatMap { id in flatPart(cloudBridgeIds.get(id) ?? []) }
+    let remembered = ([dest.id] + priorIds).flatMap { id in flatPart(cloudBridgeIds.get(id) ?? []) }
     if !remembered.isEmpty {
-        target["bridgeIds"] = unique((target["bridgeIds"] ?? []).elements + (try remembered.map(remoteId)).filter { $0.truthy }).value
+        dest.bridgeIds = unique((dest.bridgeIds ?? []).elements + (try remembered.map(remoteId)).filter { $0.truthy }).value
     }
     for id in priorIds {
-        let transcript = path.join(path.dirname(target["transcript"].description), "\(id).jsonl")
+        let transcript = path.join(path.dirname(dest.transcript.description), "\(id).jsonl")
         if !ctx["index"].get(id).includes(.string(transcript)) { continue }
         do {
             let canonicalTranscript = try mappedPath(.string(transcript))
@@ -373,15 +376,15 @@ func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, 
                     if owned { native.append(owner) }
                 }
             }
-            let cloud = options["cloud"]
+            let cloud = opts.cloud
             let bindings = native + (try (cloudBridgeIds.get(id) ?? []).elements.map(remoteId)).filter { $0.truthy }.map { bridgeId -> Value in
                 ["id": bridgeId, "account": cloud["account"], "org": cloud["org"]]
             }
             let bridgeIds = unique(bindings.map { $0["id"] })
             if bridgeIds.isEmpty { continue }
-            target["bridgeIds"] = unique((target["bridgeIds"] ?? []).elements + bridgeIds).value
-            if target["retainedHistories"].nullish { target["retainedHistories"] = [] }
-            target["retainedHistories"].push([
+            dest.bridgeIds = unique((dest.bridgeIds ?? []).elements + bridgeIds).value
+            if dest.retainedHistories.nullish { dest.retainedHistories = [] }
+            dest.retainedHistories.push([
                 "transcript": .string(transcript), "canonicalTranscript": canonicalTranscript, "fingerprint": before.signature,
                 "contentSha": detail["contentSha"], "conversation": detail["conversation"], "bindings": bindings.value,
             ])
@@ -392,22 +395,23 @@ func retainedHistories(_ target: Value = .undefined, _ ctx: Value = .undefined, 
 
 public func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ report: Value = .undefined, _ options: Value = .undefined) throws -> Value { try inventory(from, to, DataLayout(paths), report, options) }
 func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ report: Value = .undefined, _ options: Value = .undefined) throws -> Value {
+    let opts = InventoryOptions(options)
     let report = fnOr(report)
     let options: Value = options.isUndefined ? .newObject() : options
     let check = { () throws in
-        if !options["check"].nullish { try options["check"].call() }
+        if !opts.check.nullish { try opts.check.call() }
         try selectedMemory(options)["check"].call()
     }
     try check()
-    let requestedAt = options["requestedAt"] ?? .string(isoNow())
-    let cloudRequested = options["cloudRequested"] === true || options["cloud"].truthy
+    let requestedAt = opts.requestedAt ?? .string(isoNow())
+    let cloudRequested = opts.cloudRequested === true || opts.cloud.truthy
     let sources = from.elements.map(Account.init), target = Account(to)
     let workTotal = sources.reduce(0) { $0 + $1.sessions.count } + target.sessions.count
     var completed = 0
     try progress(report, "scan", Value(completed), Value(workTotal))
-    let cache = try openAnalysisCache(paths, Value(options["writeCache"] === true))
+    let cache = try openAnalysisCache(paths, Value(opts.writeCache === true))
     let ctxIndex = try index(Value(paths.pool))
-    let ctx: Value = ["index": ctxIndex, "scans": .newMap(), "workers": try workers(options["processes"]), "cache": cache]
+    let ctx: Value = ["index": ctxIndex, "scans": .newMap(), "workers": try workers(opts.processes), "cache": cache]
     try check()
     let soleRecord = { (s: Value) throws -> Bool in
         let record = MoveSource(s).desktopRecord
@@ -503,7 +507,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
                         "transcriptFingerprint": transcriptFingerprint, "sidecar": sidecar, "recordSha": recordSha, "recordSemantic": semantic,
                     ])
                     if try validDesktopRecord(target).truthy {
-                        _ = try retainedHistories(target, ctx, options, options["cloud"].truthy ? [options["cloud"]] : from, Value(cloudRequested))
+                        _ = try retainedHistories(target, ctx, options, opts.cloud.truthy ? [opts.cloud] : from, Value(cloudRequested))
                         targets.push(target)
                     } else { rejected.push(["id": Value(id), "title": session.title, "account": to, "target": true, "error": "Desktop record identity is invalid"]) }
                 }
@@ -522,8 +526,8 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         try check()
     }
     let forked = ValueSet((found.elements + targets.elements).flatMap { flatPart($0["lineage"] ?? []) })
-    for source in found.elements {
-        source["sole"] = Value(try soleRecord(source) && !source["lineage"]["length"].truthy && !forked.has(source["id"]))
+    for source in found.elements.map(MoveSource.init) {
+        source.sole = Value(try soleRecord(source.raw) && !source.lineage["length"].truthy && !forked.has(source.id))
     }
     let requiredParents = Value.newSet(found.elements.map { MoveSource($0).desktopRecord.forkedFromSessionId }.filter { $0.truthy })
     let ranked = stableSorted(found.elements) { a, b in
@@ -540,7 +544,7 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         search: for (i, candidate) in reps.enumerated() {
             if try !historyIncluded(source, candidate).truthy && !historyIncluded(candidate, source).truthy { continue }
             for member in candidate["members"].elements {
-                if try !canShareRecord(member, source, requiredParents).truthy || !sidecarsAgree(member["sidecar"], source["sidecar"]).truthy { continue search }
+                if try !canShareRecord(member, source, requiredParents).truthy || !sidecarsAgree(MoveSource(member).sidecar, MoveSource(source).sidecar).truthy { continue search }
             }
             at = i
             break
@@ -586,15 +590,15 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         }
     }
     let apart = divergent.size
-    let cloudCutoff = options["cloudCutoff"] ?? (cloudRequested ? requestedAt : .null)
+    let cloudCutoff = opts.cloudCutoff ?? (cloudRequested ? requestedAt : .null)
     let brokenTasks = (sources + [target]).first { $0.taskError.truthy }
-    if options["cloud"].truthy, let brokenTasks { throw EngineError(brokenTasks.taskError.description) }
-    let cloudPlan = try cloudInventory(options["cloud"], from, targets, options["cloudTargetOnly"].truthy ? [] : move, cache, report, cloudCutoff, found, options["cloudSessionIds"], options["cloudExcludedIds"], options)
+    if opts.cloud.truthy, let brokenTasks { throw EngineError(brokenTasks.taskError.description) }
+    let cloudPlan = try cloudInventory(opts.cloud, from, targets, opts.cloudTargetOnly.truthy ? [] : move, cache, report, cloudCutoff, found, opts.cloudSessionIds, opts.cloudExcludedIds, options)
     let retiring = Value.newSet((move.elements + there.elements).flatMap { MoveSource($0).members.map(\.file) })
     let links = try sourceCloudLinks(Value(move.elements + there.elements))
     var cloudCheckAccounts: [Value] = []
     for account in from.elements {
-        if try (cloudPlan["checked"].truthy && sameAccount(account, cloudPlan).truthy) || localCloudPending(account, retiring).truthy {
+        if try (CloudPlan(cloudPlan).checked.truthy && sameAccount(account, cloudPlan).truthy) || localCloudPending(account, retiring).truthy {
             cloudCheckAccounts.append(try accountRef(account))
             continue
         }
@@ -607,16 +611,16 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         try check()
     } catch {
         let errorValue = errorObject(error)
-        let isolatedId = cloudPlan["isolatedId"]
+        let checked = CloudPlan(cloudPlan), isolatedId = checked.isolatedId
         if errorValue["code"] === "CLOUD_MEMORY_BUDGET" && isolatedId.truthy {
             var hit = false
-            for match in cloudPlan["matches"].elements where try remoteId(match["session"]["id"]) === isolatedId { hit = true; break }
+            for match in checked.matches.elements where try remoteId(match["session"]["id"]) === isolatedId { hit = true; break }
             if !hit {
-                for row in cloudPlan["blocked"].elements where row["code"] === "CLOUD_MEMORY_BUDGET" {
+                for row in checked.blocked.elements where row["code"] === "CLOUD_MEMORY_BUDGET" {
                     if try remoteId(row["id"]) === isolatedId { hit = true; break }
                 }
             }
-            if hit { errorValue["budgetWork"] = ["id": isolatedId, "waiting": cloudPlan["waiting"]] }
+            if hit { errorValue["budgetWork"] = ["id": isolatedId, "waiting": checked.waiting] }
         }
         throw error
     }
@@ -634,20 +638,21 @@ func inventory(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Da
         "sources": found,
         "from": Value(sources.map { $0.raw["label"] }),
     ]
-    out["fromAccounts"] = Value(try from.elements.map { try accountRef($0) })
-    out["cloudCheckAccounts"] = cloudCheckAccounts.value
-    let cloudSettled = cloudPlan["checked"].truthy && !(cloudPlan["blocked"].length > 0) && !cloudPlan["waiting"]["length"].truthy
-    out["pendingCloud"] = cloudRequested ? Value(cloudCheckAccounts.count - (cloudSettled ? 1 : 0)) : 0
-    out["toAccount"] = try accountRef(to)
-    out["requestedAt"] = requestedAt
-    out["cloudRequested"] = Value(cloudRequested)
-    out["cloudError"] = options["cloudError"] ?? .null
-    out["cacheStats"] = cache["stats"]
-    out["cloud"] = cloudPlan
-    if options["inspect"].nullish {
-        out["inspect"] = Value { _ in try options["processes"] ?? processTable(Value(paths.claudeApp)) }
+    let result = MovePlan(out), checked = CloudPlan(cloudPlan)
+    result.fromAccounts = Value(try from.elements.map { try accountRef($0) })
+    result.cloudCheckAccounts = cloudCheckAccounts.value
+    let cloudSettled = checked.checked.truthy && !(checked.blocked.length > 0) && !checked.waiting["length"].truthy
+    result.pendingCloud = cloudRequested ? Value(cloudCheckAccounts.count - (cloudSettled ? 1 : 0)) : 0
+    result.toAccount = try accountRef(to)
+    result.requestedAt = requestedAt
+    result.cloudRequested = Value(cloudRequested)
+    result.cloudError = opts.cloudError ?? .null
+    result.cacheStats = cache["stats"]
+    result.cloud = cloudPlan
+    if opts.inspect.nullish {
+        result.inspect = Value { _ in try opts.processes ?? processTable(Value(paths.claudeApp)) }
     } else {
-        out["inspect"] = options["inspect"]
+        result.inspect = opts.inspect
     }
     return out
 }

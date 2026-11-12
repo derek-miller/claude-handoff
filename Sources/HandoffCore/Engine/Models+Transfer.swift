@@ -123,7 +123,10 @@ extension CloudCheck {
 }
 
 extension CloudPlan {
-    var isolatedId: Value { raw["isolatedId"] }
+    var isolatedId: Value {
+        get { raw["isolatedId"] }
+        nonmutating set { raw["isolatedId"] = newValue }
+    }
 }
 
 extension Receipt {
