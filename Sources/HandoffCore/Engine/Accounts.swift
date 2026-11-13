@@ -98,7 +98,7 @@ func mappedPath(_ file: Value = .undefined) throws -> Value {
 }
 
 func sameTree(_ expected: Value = .undefined, _ current: Value = .undefined) throws -> Value {
-    let expected = TreeFingerprint(expected), current = TreeFingerprint(current)
+    let expected = SidecarTree(expected), current = SidecarTree(current)
     return Value(current.raw.truthy && expected.fingerprint === current.fingerprint && (!expected.canonicalRoot.truthy || expected.canonicalRoot === current.canonicalRoot))
 }
 
@@ -153,7 +153,7 @@ func treeFingerprint(_ root: Value = .undefined) throws -> Value {
 
 func manifest(_ root: Value = .undefined, _ cache: Value = .undefined) throws -> Value {
     let cache = cache.isUndefined ? Value.null : cache
-    let before = TreeFingerprint(try treeFingerprint(root))
+    let before = SidecarTree(try treeFingerprint(root))
     let files = before.files
     let signature = Value(sha(stable([before.fingerprint, before.canonicalRoot])))
     let prior = cache.truthy ? try cacheLookup(cache, "manifests", root, signature) : Value.null

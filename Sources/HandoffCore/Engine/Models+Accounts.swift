@@ -3,14 +3,10 @@ import Foundation
 // Views over sidecar trees, the analysis cache, Desktop record folders, scheduled task families, login labels and the
 // claude.ai client's requests and responses.
 
-// A sidecar directory's files with their stat identities, and a fingerprint of the whole tree.
-struct TreeFingerprint {
-    let raw: Value
-    init(_ raw: Value) { self.raw = raw }
+// treeFingerprint() also lists the tree's files with the stat identity each had when read.
+extension SidecarTree {
     var files: Value { raw["files"] }
     var signatures: Value { raw["signatures"] }
-    var fingerprint: Value { raw["fingerprint"] }
-    var canonicalRoot: Value { raw["canonicalRoot"] }
 }
 
 // One file in a sidecar manifest; a symlink records where it pointed.
