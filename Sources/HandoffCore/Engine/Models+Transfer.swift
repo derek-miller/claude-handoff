@@ -98,7 +98,10 @@ extension RetirementItem {
 
 extension PlacedSession {
     var events: Value { raw["events"] }
-    var archived: Value { raw["archived"] }
+    var archived: Value {
+        get { raw["archived"] }
+        nonmutating set { raw["archived"] = newValue }
+    }
 }
 
 extension FailedSession {
@@ -107,7 +110,10 @@ extension FailedSession {
 
 extension CloudCheck {
     var label: Value { raw["label"] }
-    var later: Value { raw["later"] }
+    var later: Value {
+        get { raw["later"] }
+        nonmutating set { raw["later"] = newValue }
+    }
     var sessionIds: Value {
         get { raw["sessionIds"] }
         nonmutating set { raw["sessionIds"] = newValue }
