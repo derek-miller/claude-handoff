@@ -21,56 +21,58 @@ fileprivate func stdoutIsTTY() -> Bool { isatty(1) != 0 }
 
 // The files of a row's members, or the row's own file when it has none.
 fileprivate func memberFiles(_ row: Value) -> [Value] {
-    let members = row["members"]
-    return (members.nullish ? [row] : members.elements).map { $0["file"] }
+    MoveSource(row).members.map(\.file)
 }
 
 @discardableResult
 public func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: Value = .undefined, _ options: Value = .undefined) throws -> Value { try executeMove(from, to, DataLayout(paths), options) }
 @discardableResult
 func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
-    let options: Value = Value.spread(options, ["cloudRequested": Value(options["cloudRequested"] === true || options["cloud"].truthy)])
-    let report: Value = options["report"] ?? Value { _ in .undefined }
-    let approving = !options["approve"].nullish
+    let requested = WorkflowOptions(options)
+    let options: Value = Value.spread(options, ["cloudRequested": Value(requested.cloudRequested === true || requested.cloud.truthy)])
+    let option = WorkflowOptions(options)
+    let report: Value = option.report ?? Value { _ in .undefined }
+    let approving = !option.approve.nullish
     return try locked(paths, Value { _ in
         let inspect: Value = Value { _ in
-            try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(Value(paths.claudeApp)))
+            try optCall(option.io.inspect) ?? option.processes ?? (try processTable(Value(paths.claudeApp)))
         }
-        let kind: Value = options["recover"].truthy ? "recover" : options["undo"].truthy ? "undo" : from.truthy ? "move" : options["finish"].truthy ? "finish" : "refresh"
-        let receiptFile: Value = (options["resume"].truthy ? options["resumeFile"] : options["receiptFile"]) ?? .null
+        let kind: Value = option.recover.truthy ? "recover" : option.undo.truthy ? "undo" : from.truthy ? "move" : option.finish.truthy ? "finish" : "refresh"
+        let receiptFile: Value = (option.resume.truthy ? option.resumeFile : option.receiptFile) ?? .null
         let planFile = path.join(paths.state, "restart-plan.json")
-        let saved: Value = approving ? orNull { try readJson(Value(planFile)) } : .null
+        let saved = RestartApproval(approving ? orNull { try readJson(Value(planFile)) } : .null)
         if approving {
-            var bad = !saved.truthy || saved["token"] !== options["approve"]
-            if !bad { bad = Value(sha(stable(try without(saved, .strings(["token"]))))) !== saved["token"] }
-            if !bad { bad = saved["kind"] !== kind }
+            var bad = !saved.raw.truthy || saved.token !== option.approve
+            if !bad { bad = Value(sha(stable(try without(saved.raw, .strings(["token"]))))) !== saved.token }
+            if !bad { bad = saved.kind !== kind }
             if bad {
                 return ["ok": false, "code": "RESTART_APPROVAL_CHANGED", "reason": "Restart approval is missing or does not match the saved plan"]
             }
         }
-        if saved.truthy && (saved["receiptFile"] ?? .null) !== receiptFile { return ["ok": false, "reason": "The approved pending receipt changed"] }
-        if options["undo"].truthy || options["recover"].truthy || saved["receiptFile"].truthy {
-            if try latestReceipt(paths)["file"] !== receiptFile { return ["ok": false, "reason": "The operation receipt changed"] }
+        if saved.raw.truthy && (saved.receiptFile ?? .null) !== receiptFile { return ["ok": false, "reason": "The approved pending receipt changed"] }
+        if option.undo.truthy || option.recover.truthy || saved.receiptFile.truthy {
+            if try LatestReceipt(latestReceipt(paths)).file !== receiptFile { return ["ok": false, "reason": "The operation receipt changed"] }
         }
         var selection: Value = .null
         if from.truthy {
             var fromRows: [Value] = []
             for account in from.elements {
-                let files: [Value] = try (account["sessions"].elements + account["unreadable"].elements).map { try desktopFileOf($0) }
+                let files: [Value] = try (Account(account).sessions.map(\.raw) + Account(account).unreadable).map { try desktopFileOf($0) }
                 fromRows.append(Value.spread(try accountRef(account), ["files": Value(files)]))
             }
             selection = ["from": Value(fromRows), "to": try accountRef(to)]
         }
-        if saved.truthy {
-            var changed = saved["selection"].truthy != selection.truthy
+        if saved.raw.truthy {
+            var changed = saved.selection.truthy != selection.truthy
             if !changed && selection.truthy {
-                changed = try !sameAccount(saved["selection"]["to"], selection["to"]).truthy
-                if !changed { changed = saved["selection"]["from"]["length"] !== selection["from"]["length"] }
+                let (prior, current) = (MoveSelection(saved.selection), MoveSelection(selection))
+                changed = try !sameAccount(prior.to.raw, current.to.raw).truthy
+                if !changed { changed = prior.from["length"] !== current.from["length"] }
                 if !changed {
                     var every = true
-                    for source in saved["selection"]["from"].elements {
+                    for source in prior.from.elements {
                         var some = false
-                        for row in selection["from"].elements where try sameAccount(row, source).truthy { some = true; break }
+                        for row in current.from.elements where try sameAccount(row, source).truthy { some = true; break }
                         if !some { every = false; break }
                     }
                     changed = !every
@@ -78,32 +80,32 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
             }
             if changed { return ["ok": false, "code": "RESTART_APPROVAL_CHANGED", "reason": "The selected accounts changed after the restart plan"] }
         }
-        let recovery: Value = options["recover"].truthy ? try recoveryPending(paths) : .null
-        let taskTransfers: Value = recovery["receipt"].truthy ? try recoveryFamilies(Receipt(recovery["receipt"])) : []
-        if options["recover"].truthy && (taskTransfers.length == 0 || recovery["file"] !== options["receiptFile"] || recovery["receipt"]["remotePending"].truthy || recovery["receipt"]["remoteUndoing"]["length"].truthy) {
+        let recovery = PendingRecovery(option.recover.truthy ? try recoveryPending(paths) : .null)
+        let taskTransfers: Value = recovery.receipt.isPresent ? try recoveryFamilies(recovery.receipt) : []
+        if option.recover.truthy && (taskTransfers.length == 0 || recovery.file !== option.receiptFile || recovery.receipt.remotePending.truthy || recovery.receipt.remoteUndoing["length"].truthy) {
             return ["ok": false, "reason": "Task recovery changed or still needs cloud restoration"]
         }
-        if recovery.truthy {
+        if recovery.isPresent {
             let problems = try taskTransferProblems(taskTransfers, paths, inspect, true).elements.filter { $0 !== Value(SCHEDULER_OWNS) }
             if !problems.isEmpty { return ["ok": false, "reason": Value(Value(problems).join(", "))] }
         }
-        let reconciled: Value = options["recover"].truthy ? .null : try reconcile(paths, options)
+        let reconciled: Value = option.recover.truthy ? .null : try reconcile(paths, options)
         if reconciled.truthy { return ["reconciled": reconciled, "recoveryRequired": true, "ok": false] }
-        let deferred = try deferredWorkflow(paths)
-        if options["resume"].truthy && (deferred["mode"] !== "local" || deferred["file"] !== options["resumeFile"]) {
+        let deferred = DeferredWorkflow(try deferredWorkflow(paths))
+        if option.resume.truthy && (deferred.mode !== "local" || deferred.file !== option.resumeFile) {
             return ["ok": false, "reason": "The pending move changed. No stale continuation was run."]
         }
-        var existing: Value = options["resume"].truthy ? deferred : .null
-        if from.truthy && deferred.truthy && !existing.truthy {
-            return ["deferred": deferred, "ok": false, "complete": false, "pendingCloud": deferred["mode"] === "cloud" ? Value(deferred["sources"].length) : 0]
+        var existing = DeferredWorkflow(option.resume.truthy ? deferred.raw : .null)
+        if from.truthy && deferred.isPresent && !existing.isPresent {
+            return ["deferred": deferred.raw, "ok": false, "complete": false, "pendingCloud": deferred.mode === "cloud" ? Value(deferred.raw["sources"].length) : 0]
         }
-        let drift = try inspectPlaced(paths)
-        if drift["changed"].length > 0 {
-            _ = try report.call("changed", Value("\(quantity(drift["changed"].length, "moved session")) now has different metadata. Evidence saved with the receipt."))
+        let drift = Verification(try inspectPlaced(paths))
+        if drift.changed.length > 0 {
+            _ = try report.call("changed", Value("\(quantity(drift.changed.length, "moved session")) now has different metadata. Evidence saved with the receipt."))
         }
-        if options["finish"].truthy && deferred["file"] !== options["receiptFile"] { return ["ok": false, "reason": "The pending move changed before its restart"] }
-        var chosen: Value = saved["selection"] ?? selection
-        let sessionFiles: Value = .newSet(try receiptSummary(existing["receipt"] ?? .newObject())["notMoved"].elements.map { $0["file"] }.filter { $0.truthy })
+        if option.finish.truthy && deferred.file !== option.receiptFile { return ["ok": false, "reason": "The pending move changed before its restart"] }
+        var chosen: Value = saved.selection ?? selection
+        let sessionFiles: Value = .newSet(try ReceiptSummary(receiptSummary(existing.receipt.raw ?? .newObject())).notMoved.elements.map { SessionRow($0).file }.filter { $0.truthy })
         let sessionProgress: Value = Value { args in
             let receipt = Receipt(args.first ?? .undefined)
             let retired = try retiredFiles(Receipt(receipt.raw ?? .newObject()))
@@ -111,12 +113,12 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
             _ = try report.call("sessions", "Remaining sessions", ["live": true, "sessionTotal": Value(sessionFiles.length), "remainingCount": Value(remaining)])
             return .undefined
         }
-        let requestedAt: Value = saved["requestedAt"] ?? existing["receipt"]["startedAt"] ?? options["requestedAt"] ?? Value(isoNow())
+        let requestedAt: Value = saved.requestedAt ?? existing.receipt.startedAt ?? option.requestedAt ?? Value(isoNow())
         let prepareReport: Value = Value { args in
             let stage = args.count > 0 ? args[0] : .undefined
             let text = args.count > 1 ? args[1] : .undefined
             let extra: Value = args.count > 2 && !args[2].isUndefined ? args[2] : .newObject()
-            return try report.call(stage, text, extra["live"].truthy ? Value.spread(extra, ["preparatory": true]) : extra)
+            return try report.call(stage, text, ProgressExtra(extra).live.truthy ? Value.spread(extra, ["preparatory": true]) : extra)
         }
         let replan = { (cloudArg: Value, checkArg: Value, preparatoryArg: Value) throws -> Value in
             let cloud: Value = cloudArg.isUndefined ? .null : cloudArg
@@ -125,57 +127,60 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
             _ = try check.call()
             let latest = try accounts(paths)
             var sources: [Value] = []
-            for selected in chosen["from"].elements {
+            for selected in MoveSelection(chosen).from.elements.map(AccountRef.init) {
                 var current: Value = .undefined
-                for account in latest.elements where try sameAccount(account, selected).truthy { current = account; break }
-                if !current.truthy { throw EngineError("\(selected["label"]) is no longer available") }
-                let known: Value = .newSet(try (current["sessions"].elements + current["unreadable"].elements).map { try desktopFileOf($0) })
-                let files = selected["files"]
-                let sessions = current["sessions"].elements.filter { files.includes($0["file"]) }
+                for account in latest.elements where try sameAccount(account, selected.raw).truthy { current = account; break }
+                if !current.truthy { throw EngineError("\(selected.label) is no longer available") }
+                let account = Account(current)
+                let known: Value = .newSet(try (account.sessions.map(\.raw) + account.unreadable).map { try desktopFileOf($0) })
+                let files = selected.files
+                let sessions = try account.sessions.map(\.raw).filter { files.includes(try desktopFileOf($0)) }
                 var unreadable: [Value] = []
-                for row in current["unreadable"].elements where files.includes(try desktopFileOf(row)) { unreadable.append(row) }
+                for row in account.unreadable where files.includes(try desktopFileOf(row)) { unreadable.append(row) }
                 unreadable += files.elements.filter { !known.has($0) }
                 sources.append(Value.spread(current, ["sessions": Value(sessions), "unreadable": Value(unreadable)]))
             }
             var target: Value = .undefined
-            for account in latest.elements where try sameAccount(account, chosen["to"]).truthy { target = account; break }
+            for account in latest.elements where try sameAccount(account, MoveSelection(chosen).to.raw).truthy { target = account; break }
             if !target.truthy { throw EngineError("Destination account is no longer available") }
             let inventoryOptions: Value = [
-                "cloud": cloud, "cloudRequested": options["cloudRequested"], "cloudError": options["cloudError"], "requestedAt": requestedAt,
+                "cloud": cloud, "cloudRequested": option.cloudRequested, "cloudError": option.cloudError, "requestedAt": requestedAt,
                 "writeCache": true, "processes": try inspect.call(), "inspect": inspect, "check": check,
             ]
             let inv = try inventory(Value(sources), target, paths, preparatory.truthy ? prepareReport : report, inventoryOptions)
-            let failedFiles = try receiptSummary(["failed": try inventoryFailures(inv)])["notMoved"].elements.map { $0["file"] }
-            for file in MovePlan(inv).sources.elements.map({ $0["file"] }) + failedFiles { sessionFiles.add(file) }
-            _ = try sessionProgress.call(existing["receipt"])
+            let failedFiles = try ReceiptSummary(receiptSummary(["failed": try inventoryFailures(inv)])).notMoved.elements.map { SessionRow($0).file }
+            for file in MovePlan(inv).sources.elements.map({ MoveSource($0).file }) + failedFiles { sessionFiles.add(file) }
+            _ = try sessionProgress.call(existing.receipt.raw)
             return ["inv": inv, "target": target]
         }
-        let initialCloud: Value = saved.truthy || existing.truthy ? .null : options["cloud"]
-        let initial: Value = chosen.truthy ? try replan(initialCloud, .undefined, Value(approving)) : .null
-        if options["finish"].truthy {
-            let finishAccount = saved["finishAccount"] ?? options["finishAccount"]
+        let initialCloud: Value = saved.raw.truthy || existing.isPresent ? .null : option.cloud
+        let initial = Replan(chosen.truthy ? try replan(initialCloud, .undefined, Value(approving)) : .null)
+        if option.finish.truthy {
+            let finishAccount = saved.finishAccount ?? option.finishAccount
             var checks: [Value] = []
-            for check in deferred["receipt"]["cloudChecks"].elements where try sameAccount(check, finishAccount).truthy { checks.append(check) }
+            for check in deferred.receipt.cloudChecks.elements where try sameAccount(check, finishAccount).truthy { checks.append(check) }
             if try !canRestartWaiting(Receipt(["cloudChecks": Value(checks)]), try inspect.call()).truthy { return ["nothing": true, "ok": true] }
         }
-        let plan: Value = try saved ?? (try restartPlan(MovePlan(initial["inv"] ?? .null), paths, try inspect.call()))
-        if plan.truthy && options["background"].truthy { return ["pendingLocal": true, "ok": true] }
-        if plan.truthy && !options["moveOnly"].truthy {
-            if !saved.truthy || saved["fingerprint"] !== plan["fingerprint"] {
-                let active: Value = try options["cloud"] ?? (try signedIn(paths))
+        let plan = RestartPlan(try saved.raw ?? (try restartPlan(MovePlan(initial.inv.raw ?? .null), paths, try inspect.call())))
+        if plan.raw.truthy && option.background.truthy { return ["pendingLocal": true, "ok": true] }
+        if plan.raw.truthy && !option.moveOnly.truthy {
+            if !saved.raw.truthy || saved.fingerprint !== plan.fingerprint {
+                let active: Value = try option.cloud ?? (try signedIn(paths))
                 var deferredCloudSources: Value = []
-                if options["cloudRequested"].truthy {
+                if option.cloudRequested.truthy {
                     if chosen.nullish {
                         deferredCloudSources = []
                     } else {
-                        let picked = chosen["from"].elements.filter { source in
-                            (!active["account"].truthy || source["account"] === active["account"]) && (!active["org"].truthy || source["org"] === active["org"])
+                        let active = AccountRef(active)
+                        let picked = MoveSelection(chosen).from.elements.filter { source in
+                            let source = AccountRef(source)
+                            return (!active.accountId.truthy || source.accountId === active.accountId) && (!active.orgId.truthy || source.orgId === active.orgId)
                         }
                         deferredCloudSources = Value(try picked.map { try accountRef($0) })
                     }
                 }
-                let proposal: Value = Value.spread(["version": 1], plan, [
-                    "kind": kind, "resume": Value(existing.truthy), "receiptFile": receiptFile, "finishAccount": options["finishAccount"] ?? .null,
+                let proposal: Value = Value.spread(["version": 1], plan.raw, [
+                    "kind": kind, "resume": Value(existing.isPresent), "receiptFile": receiptFile, "finishAccount": option.finishAccount ?? .null,
                     "selection": chosen, "remainingCount": chosen.truthy ? Value(sessionFiles.length) : .null, "requestedAt": requestedAt,
                     "createdAt": Value(isoNow()), "nonce": Value(randomUUID()), "deferredCloudSources": deferredCloudSources,
                 ])
@@ -183,38 +188,38 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
                 _ = try saveJson(Value(planFile), proposal)
                 return ["plan": proposal, "ok": true]
             }
-            var prepared: Value = .null
-            var pendingPlan: Value = plan
-            if initial.truthy {
+            var prepared = WorkflowResult(.null)
+            var pendingPlan: Value = plan.raw
+            if initial.raw.truthy {
                 let live = try inspect.call()
                 let desktop = try appProcess(paths, live)
-                if try !desktop.truthy || restartFingerprint(desktop, live) !== plan["fingerprint"] {
+                if try !desktop.truthy || restartFingerprint(desktop, live) !== plan.fingerprint {
                     return ["ok": false, "code": "RESTART_PLAN_CHANGED", "reason": "Open Claude sessions changed. Review the restart plan again."]
                 }
-                let current = try restartPlan(MovePlan(initial["inv"]), paths, live)
-                var held: [Value] = (current["held"] ?? []).elements
-                let ready: Value = .newSet((initial["inv"]["move"].elements + initial["inv"]["there"].elements).flatMap(memberFiles))
-                for row in plan["held"].elements {
-                    if row["sources"].elements.contains(where: { !ready.has($0["file"]) }) && !held.contains(where: { $0["record"] === row["record"] }) { held.append(row) }
+                let current = RestartPlan(try restartPlan(initial.inv, paths, live))
+                var held: [Value] = (current.held ?? []).elements
+                let ready: Value = .newSet((initial.inv.move.elements + initial.inv.there.elements).flatMap(memberFiles))
+                for row in plan.held.elements.map(HeldRow.init) {
+                    if row.heldSources.contains(where: { !ready.has($0.file) }) && !held.contains(where: { HeldRow($0).record === row.record }) { held.append(row.raw) }
                 }
-                pendingPlan = Value.spread(plan, ["held": Value(held)])
-                let heldFiles: Value = .newSet(held.flatMap { $0["sources"].elements.map { $0["file"] } })
-                let regular: Value = Value.spread(initial["inv"], [
+                pendingPlan = Value.spread(plan.raw, ["held": Value(held)])
+                let heldFiles: Value = .newSet(held.flatMap { HeldRow($0).heldSources.map(\.file) })
+                let regular = MovePlan(Value.spread(initial.inv.raw, [
                     "held": Value(held),
                     "cloud": ["checked": false, "matches": [], "blocked": [], "waiting": [], "later": []],
-                    "move": Value(initial["inv"]["move"].elements.filter { !memberFiles($0).contains(where: { heldFiles.has($0) }) }),
-                ])
-                if regular["move"].length > 0 || regular["there"].length > 0 {
-                    let at: Value = existing["receipt"]["at"] ?? Value(stamp())
-                    _ = existing["file"] ?? Value(path.join(paths.state, "\(at).json"))
-                    prepared = try transfer(MovePlan(regular), initial["target"], paths, prepareReport, ["existing": existing, "at": at, "sessionProgress": sessionProgress])
-                    if prepared["recoveryRequired"].truthy || prepared["deferred"].truthy { return prepared }
-                    if prepared["receipt"].truthy, try needsRecovery(prepared["receipt"]).truthy { return prepared }
-                    if prepared["file"].truthy {
-                        existing = ["file": prepared["file"], "receipt": prepared["receipt"]]
-                        let retired = try retiredFiles(Receipt(prepared["receipt"]))
-                        let fromRows: [Value] = chosen["from"].elements.map { source in
-                            Value.spread(source, ["files": Value(source["files"].elements.filter { !retired.has($0) })])
+                    "move": Value(initial.inv.move.elements.filter { !memberFiles($0).contains(where: { heldFiles.has($0) }) }),
+                ]))
+                if regular.move.length > 0 || regular.there.length > 0 {
+                    let at: Value = existing.receipt.at ?? Value(stamp())
+                    _ = existing.file ?? Value(path.join(paths.state, "\(at).json"))
+                    prepared = WorkflowResult(try transfer(regular, initial.target, paths, prepareReport, ["existing": existing.raw, "at": at, "sessionProgress": sessionProgress]))
+                    if prepared.recoveryRequired.truthy || prepared.deferred.truthy { return prepared.raw }
+                    if prepared.receipt.truthy, try needsRecovery(prepared.receipt).truthy { return prepared.raw }
+                    if prepared.file.truthy {
+                        existing = DeferredWorkflow(["file": prepared.file, "receipt": prepared.receipt])
+                        let retired = try retiredFiles(Receipt(prepared.receipt))
+                        let fromRows: [Value] = MoveSelection(chosen).from.elements.map { source in
+                            Value.spread(source, ["files": Value(AccountRef(source).files.elements.filter { !retired.has($0) })])
                         }
                         chosen = Value.spread(chosen, ["from": Value(fromRows)])
                     }
@@ -223,59 +228,60 @@ func executeMove(_ from: Value = .undefined, _ to: Value = .undefined, _ paths: 
             let work: Value = Value { args in
                 let context = args.first ?? .undefined
                 try fs.unlink(planFile)
-                if options["recover"].truthy {
-                    let reconciled = try reconcileFiles(paths, Value.spread(options, ["inspect": inspect, "check": context["check"]]))
-                    return reconciled["undo"].truthy
-                        ? Value.spread(reconciled["undo"], ["ok": true, "complete": true])
-                        : ["reconciled": reconciled, "recoveryRequired": true, "ok": false]
+                if option.recover.truthy {
+                    let reconciled = RecoveryNote(try reconcileFiles(paths, Value.spread(options, ["inspect": inspect, "check": WorkflowOptions(context).check])))
+                    return reconciled.undo.truthy
+                        ? Value.spread(reconciled.undo, ["ok": true, "complete": true])
+                        : ["reconciled": reconciled.raw, "recoveryRequired": true, "ok": false]
                 }
-                if options["undo"].truthy {
-                    let result = try undoFiles(paths, Value.spread(options, ["inspect": inspect, "check": context["check"]]))
-                    return Value.spread(result, ["ok": Value(result["dest"].truthy), "complete": Value(result["dest"].truthy)])
+                if option.undo.truthy {
+                    let result = WorkflowResult(try undoFiles(paths, Value.spread(options, ["inspect": inspect, "check": WorkflowOptions(context).check])))
+                    return Value.spread(result.raw, ["ok": Value(result.dest.truthy), "complete": Value(result.dest.truthy)])
                 }
                 if !chosen.truthy { return .null }
-                let planned = try replan(.null, context["check"], .undefined)
-                let inv = MovePlan(planned["inv"]), target = planned["target"]
-                _ = try context["check"].call()
+                let check = WorkflowOptions(context).check
+                let planned = Replan(try replan(.null, check, .undefined))
+                let inv = planned.inv, target = planned.target
+                _ = try check.call()
                 let ready: Value = .newSet((inv.move.elements + inv.there.elements).flatMap(memberFiles))
-                inv.held = Value(pendingPlan["held"].elements.filter { $0["sources"].elements.contains(where: { !ready.has($0["file"]) }) })
-                inv.deferredCloudSources = saved["deferredCloudSources"]
-                _ = try optCall(options["summary"], inv.raw)
-                let result = try transfer(inv, target, paths, report, Value.spread(context, [
-                    "existing": existing, "sessionProgress": sessionProgress,
-                    "refreshCloudChecks": and(prepared, Value(!options["resume"].truthy)),
-                ]))
-                if prepared.truthy && result.truthy {
-                    return Value.spread(result, [
-                        "added": Value(toNumber(prepared["added"] ?? 0) + toNumber(result["added"] ?? 0)),
-                        "targetChanged": or(prepared["targetChanged"], result["targetChanged"]),
+                inv.held = Value(RestartPlan(pendingPlan).held.elements.filter { HeldRow($0).heldSources.contains(where: { !ready.has($0.file) }) })
+                inv.deferredCloudSources = saved.deferredCloudSources
+                _ = try optCall(option.summary, inv.raw)
+                let result = WorkflowResult(try transfer(inv, target, paths, report, Value.spread(context, [
+                    "existing": existing.raw, "sessionProgress": sessionProgress,
+                    "refreshCloudChecks": and(prepared.raw, Value(!option.resume.truthy)),
+                ])))
+                if prepared.isPresent && result.isPresent {
+                    return Value.spread(result.raw, [
+                        "added": Value(toNumber(prepared.added ?? 0) + toNumber(result.added ?? 0)),
+                        "targetChanged": or(prepared.targetChanged, result.targetChanged),
                     ])
                 }
-                return result
+                return result.raw
             }
-            let restarted = try withDesktopRestart(RestartPlan(Value.spread(pendingPlan, ["receiptFile": existing["file"] ?? plan["receiptFile"]])), paths, work, report, options["io"])
-            let code: Value = restarted["code"] === "WORK_REFUSED" ? restarted["result"]["code"] ?? restarted["code"] : restarted["code"]
-            return Value.spread(restarted["result"] ?? prepared ?? .newObject(), [
-                "ok": and(restarted["ok"], Value(restarted["result"]["ok"] !== false)),
-                "restartOutcome": restarted["restart"], "restarted": Value(restarted["restart"]["outcome"] === "reopened"),
-                "code": code, "reason": restarted["error"] ?? restarted["result"]["reason"],
+            let restarted = RestartedWork(try withDesktopRestart(RestartPlan(Value.spread(pendingPlan, ["receiptFile": existing.file ?? plan.receiptFile])), paths, work, report, option.io.raw))
+            let code: Value = restarted.code === "WORK_REFUSED" ? restarted.result.code ?? restarted.code : restarted.code
+            return Value.spread(restarted.result.raw ?? prepared.raw ?? .newObject(), [
+                "ok": and(restarted.ok, Value(restarted.result.ok !== false)),
+                "restartOutcome": restarted.restart.raw, "restarted": Value(restarted.restart.outcome === "reopened"),
+                "code": code, "reason": restarted.error ?? restarted.result.reason,
             ])
         }
-        if !chosen.truthy && options["recover"].truthy {
+        if !chosen.truthy && option.recover.truthy {
             return ["reconciled": try reconcileFiles(paths, Value.spread(options, ["inspect": inspect])), "recoveryRequired": true, "ok": false]
         }
-        if !chosen.truthy && options["undo"].truthy { return try undoFiles(paths, Value.spread(options, ["inspect": inspect])) }
+        if !chosen.truthy && option.undo.truthy { return try undoFiles(paths, Value.spread(options, ["inspect": inspect])) }
         if !chosen.truthy {
             return try processRows(inspect.call()).filter(\.isDesktop).count > 1
                 ? ["ok": false, "reason": "More than one Claude Desktop instance is running. Close the extra instance before restarting."]
                 : ["nothing": true, "ok": true]
         }
-        let inv = MovePlan(initial["inv"]), target = initial["target"]
-        inv.held = plan["held"] ?? []
-        let heldFiles: Value = .newSet(inv.held.elements.flatMap { $0["sources"].elements.map { $0["file"] } })
+        let inv = initial.inv, target = initial.target
+        inv.held = plan.held ?? []
+        let heldFiles: Value = .newSet(inv.held.elements.flatMap { HeldRow($0).heldSources.map(\.file) })
         inv.move = Value(inv.move.elements.filter { !memberFiles($0).contains(where: { heldFiles.has($0) }) })
-        _ = try optCall(options["summary"], inv.raw)
-        let result = try transfer(inv, target, paths, report, ["existing": existing, "sessionProgress": sessionProgress])
+        _ = try optCall(option.summary, inv.raw)
+        let result = try transfer(inv, target, paths, report, ["existing": existing.raw, "sessionProgress": sessionProgress])
         return result ?? ["nothing": true, "ok": true]
     })
 }
@@ -285,48 +291,54 @@ public func finishHeld(_ paths: Value = .undefined, _ options: Value = .undefine
 @discardableResult
 func finishHeld(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
-    let latest = try latestReceipt(paths)
-    if !latest.truthy || latest["corrupt"].truthy || !latest["receipt"]["held"]["length"].truthy { return ["nothing": true, "ok": true] }
-    if options["background"].truthy {
-        let rows: Value = try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(Value(paths.claudeApp)))
-        for held in latest["receipt"]["held"].elements {
-            for row in rows.elements where row["worker"].truthy {
-                if try ownsWorker(.newSet(row["ids"].elements), held["id"], held["recordId"]).truthy { return ["pendingLocal": true, "ok": true] }
+    let option = WorkflowOptions(options)
+    let latest = LatestReceipt(try latestReceipt(paths))
+    let receipt = latest.receipt
+    if !latest.isPresent || latest.corrupt.truthy || !receipt.held["length"].truthy { return ["nothing": true, "ok": true] }
+    let held = receipt.held.elements.map(HeldRow.init)
+    if option.background.truthy {
+        let rows: Value = try optCall(option.io.inspect) ?? option.processes ?? (try processTable(Value(paths.claudeApp)))
+        for row in held {
+            for process in rows.elements.map(ProcessRow.init) where process.isWorker {
+                if try ownsWorker(.newSet(process.ids), row.id, row.recordId).truthy { return ["pendingLocal": true, "ok": true] }
             }
         }
     }
     let all = try accounts(paths)
-    let files: Value = .newSet(latest["receipt"]["held"].elements.flatMap { $0["sources"].elements.map { $0["file"] } })
+    let files: Value = .newSet(held.flatMap { $0.heldSources.map(\.file) })
     var from: [Value] = []
-    for ref in latest["receipt"]["fromAccounts"].elements {
-        var account: Value = .undefined
-        for row in all.elements where try sameAccount(row, ref).truthy { account = row; break }
-        if !account.truthy { throw EngineError("\(ref["label"]) is no longer available") }
+    for ref in receipt.fromAccounts.elements {
+        var row: Value = .undefined
+        for candidate in all.elements where try sameAccount(candidate, ref).truthy { row = candidate; break }
+        if !row.truthy { throw EngineError("\(AccountRef(ref).label) is no longer available") }
+        let account = Account(row)
         var unreadable: [Value] = []
-        for row in account["unreadable"].elements where files.has(try desktopFileOf(row)) { unreadable.append(row) }
-        from.append(Value.spread(account, ["sessions": Value(account["sessions"].elements.filter { files.has($0["file"]) }), "unreadable": Value(unreadable)]))
+        for entry in account.unreadable where files.has(try desktopFileOf(entry)) { unreadable.append(entry) }
+        from.append(Value.spread(row, ["sessions": Value(try account.sessions.map(\.raw).filter { files.has(try desktopFileOf($0)) }), "unreadable": Value(unreadable)]))
     }
     var to: Value = .undefined
-    for row in all.elements where try sameAccount(row, latest["receipt"]["toAccount"]).truthy { to = row; break }
+    for row in all.elements where try sameAccount(row, receipt.toAccount).truthy { to = row; break }
     if !to.truthy { throw EngineError("Destination account is no longer available") }
-    let found: Value = .newSet(try from.flatMap { account in try (account["sessions"].elements + account["unreadable"].elements).map { try desktopFileOf($0) } })
+    let found: Value = .newSet(try from.map(Account.init).flatMap { account in try (account.sessions.map(\.raw) + account.unreadable).map { try desktopFileOf($0) } })
     if files.elements.contains(where: { !found.has($0) }) { return ["ok": false, "reason": "A held source record disappeared. Its move was not marked complete."] }
-    var prior: [Value] = latest["receipt"]["failed"].elements
-    let retryIds: Value = .newSet(latest["receipt"]["held"].elements.flatMap { $0["sources"].elements.map { $0["id"] } })
-    let result = try executeMove(Value(from), to, paths, Value.spread(options, [
-        "resume": true, "resumeFile": latest["file"], "cloudRequested": Value(latest["receipt"]["cloudChecks"].length > 0),
-    ]))
-    if !result["receipt"].truthy || result["plan"].truthy || result["recoveryRequired"].truthy || result["reason"].truthy { return result }
+    var prior: [Value] = receipt.failed.elements
+    let retryIds: Value = .newSet(held.flatMap { $0.heldSources.map(\.id) })
+    let result = WorkflowResult(try executeMove(Value(from), to, paths, Value.spread(options, [
+        "resume": true, "resumeFile": latest.file, "cloudRequested": Value(receipt.cloudChecks.length > 0),
+    ])))
+    if !result.receipt.truthy || result.plan.truthy || result.recoveryRequired.truthy || result.reason.truthy { return result.raw }
+    let after = Receipt(result.receipt)
     var failed: [Value] = []
-    for row in result["receipt"]["failed"].elements {
+    for row in after.failed.elements {
         let at = prior.firstIndex(where: { stable($0) == stable(row) }) ?? -1
         if at >= 0 { prior.remove(at: at) }
-        let keep = row["cloudAccount"].truthy ? try actionableCloudFailure(Receipt(result["receipt"]), row).truthy : retryIds.has(row["id"]) || at < 0
+        let session = FailedSession(row)
+        let keep = session.cloudAccount.truthy ? try actionableCloudFailure(after, row).truthy : retryIds.has(session.id) || at < 0
         if keep { failed.append(row) }
     }
-    return Value.spread(result, [
-        "ok": and(try finishOkay(result["receipt"]), Value(failed.isEmpty)), "failed": Value(failed),
-        "notMoved": Value(result["receipt"]["failed"].elements.filter { row in !failed.contains(where: { $0 === row }) }),
+    return Value.spread(result.raw, [
+        "ok": and(try finishOkay(after.raw), Value(failed.isEmpty)), "failed": Value(failed),
+        "notMoved": Value(after.failed.elements.filter { row in !failed.contains(where: { $0 === row }) }),
     ])
 }
 
@@ -335,23 +347,25 @@ public func completeActiveCloud(_ result: Value = .undefined, _ paths: Value = .
 @discardableResult
 func completeActiveCloud(_ result: Value = .undefined, _ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
-    if result["plan"].truthy || !result["file"].truthy || !result["receipt"].truthy || result["cloudChecked"].truthy || result["receipt"]["held"]["length"].truthy { return result }
-    if try openCloudChecks(Receipt(result["receipt"])).length == 0 || result["recoveryRequired"].truthy || result["restartOutcome"].truthy && !result["ok"].truthy { return result }
+    let option = WorkflowOptions(options)
+    let workflow = WorkflowResult(result), receipt = Receipt(workflow.receipt)
+    if workflow.plan.truthy || !workflow.file.truthy || !workflow.receipt.truthy || workflow.cloudChecked.truthy || receipt.held["length"].truthy { return result }
+    if try openCloudChecks(receipt).length == 0 || workflow.recoveryRequired.truthy || workflow.restartOutcome.truthy && !workflow.ok.truthy { return result }
     do {
         let active = try cloudIdentity(paths, options)
         var matched = false
-        for check in try openCloudChecks(Receipt(result["receipt"])).elements {
-            if try sameLogin(check, active).truthy && cloudScope(options["cloud"], check).truthy { matched = true; break }
+        for check in try openCloudChecks(receipt).elements {
+            if try sameLogin(check, active).truthy && cloudScope(option.cloud, check).truthy { matched = true; break }
         }
         if !matched { return result }
-        let finished = try finishPending(paths, Value.spread(options, ["active": active, "receiptFile": result["file"]]))
-        return Value.spread(result, finished, [
-            "restarted": result["restarted"], "restartOutcome": result["restartOutcome"],
-            "added": result["added"] ?? 0, "targetChanged": or(result["targetChanged"], finished["restart"]), "reason": finished["reason"],
+        let finished = WorkflowResult(try finishPending(paths, Value.spread(options, ["active": active, "receiptFile": workflow.file])))
+        return Value.spread(result, finished.raw, [
+            "restarted": workflow.restarted, "restartOutcome": workflow.restartOutcome,
+            "added": workflow.added ?? 0, "targetChanged": or(workflow.targetChanged, finished.restart), "reason": finished.reason,
         ])
     } catch {
-        let error = errorObject(error)
-        return Value.spread(result, ["ok": false, "complete": false, "code": error["code"], "reason": error["message"]])
+        let error = ThrownError(object: errorObject(error))
+        return Value.spread(result, ["ok": false, "complete": false, "code": error.code, "reason": error.message])
     }
 }
 
@@ -360,57 +374,59 @@ public func finishWorkflow(_ paths: Value = .undefined, _ options: Value = .unde
 @discardableResult
 func finishWorkflow(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
-    let approving = !options["approve"].nullish
-    if approving && (!options["approve"].isString || !re("^[a-f0-9]{64}$").test(options["approve"].asString!)) {
+    let option = WorkflowOptions(options)
+    let approving = !option.approve.nullish
+    if approving && (!option.approve.isString || !re("^[a-f0-9]{64}$").test(option.approve.asString!)) {
         return ["ok": false, "code": "RESTART_APPROVAL_CHANGED", "reason": "Restart approval is missing or does not match the saved plan"]
     }
-    let recovery = try recoveryPending(paths)
-    if recovery.truthy {
-        if options["background"].truthy && recovery["receipt"]["localRecovery"]["blocked"].truthy {
-            return Value.spread(recovery, [
-                "summary": try receiptSummary(recovery["receipt"]), "code": "LOCAL_RECOVERY_BLOCKED", "recoveryRequired": true, "ok": false,
-                "reconciled": ["title": "Move recovery blocked", "error": recovery["receipt"]["localRecovery"]["blocked"]],
+    let recovery = PendingRecovery(try recoveryPending(paths))
+    if recovery.isPresent {
+        let receipt = recovery.receipt
+        if option.background.truthy && receipt.localRecoveryBlocked.truthy {
+            return Value.spread(recovery.raw, [
+                "summary": try receiptSummary(receipt.raw), "code": "LOCAL_RECOVERY_BLOCKED", "recoveryRequired": true, "ok": false,
+                "reconciled": ["title": "Move recovery blocked", "error": receipt.localRecoveryBlocked],
             ])
         }
-        let taskTransfers: Value = recovery["receipt"].truthy ? try recoveryFamilies(Receipt(recovery["receipt"])) : []
-        if !options["background"].truthy && taskTransfers.length > 0 && !recovery["receipt"]["remotePending"].truthy && !recovery["receipt"]["remoteUndoing"]["length"].truthy {
+        let taskTransfers: Value = receipt.isPresent ? try recoveryFamilies(receipt) : []
+        if !option.background.truthy && taskTransfers.length > 0 && !receipt.remotePending.truthy && !receipt.remoteUndoing["length"].truthy {
             var go = approving
             if !go {
-                let namespaces = Value(taskTransfers.elements.flatMap { [$0["from"], $0["to"]] })
-                go = try schedulerBusy(paths, namespaces, try optCall(options["io"]["inspect"]) ?? options["processes"]).truthy
+                let namespaces = Value(taskTransfers.elements.map(TaskFamily.init).flatMap { [$0.from, $0.to] })
+                go = try schedulerBusy(paths, namespaces, try optCall(option.io.inspect) ?? option.processes).truthy
             }
-            if go { return try executeMove(.null, .null, paths, Value.spread(options, ["recover": true, "receiptFile": recovery["file"]])) }
+            if go { return try executeMove(.null, .null, paths, Value.spread(options, ["recover": true, "receiptFile": recovery.file])) }
         }
         return try finishPending(paths, options)
     }
     if !(try latestReceipt(paths)).truthy { return ["nothing": true, "ok": true] }
-    let deferred = try deferredWorkflow(paths)
-    if deferred["mode"] === "local" { return try completeActiveCloud(try finishHeld(paths, options), paths, options) }
-    if deferred["mode"] === "undo" { return try finishPending(paths, options) }
-    if deferred["mode"] === "partial" { return Value.spread(deferred, ["summary": try receiptSummary(deferred["receipt"]), "ok": false, "complete": false]) }
+    let deferred = DeferredWorkflow(try deferredWorkflow(paths))
+    if deferred.mode === "local" { return try completeActiveCloud(try finishHeld(paths, options), paths, options) }
+    if deferred.mode === "undo" { return try finishPending(paths, options) }
+    if deferred.mode === "partial" { return Value.spread(deferred.raw, ["summary": try receiptSummary(deferred.receipt.raw), "ok": false, "complete": false]) }
     if approving {
-        if !deferred.truthy || deferred["mode"] !== "cloud" { return ["ok": false, "reason": "The pending move changed before its restart"] }
-        let restarted = try executeMove(.null, .null, paths, Value.spread(options, ["finish": true, "receiptFile": deferred["file"]]))
-        if !restarted["ok"].truthy || restarted["plan"].truthy { return restarted }
-        return try completeActiveCloud(Value.spread(restarted, ["file": deferred["file"], "receipt": deferred["receipt"]]), paths, options)
+        if !deferred.isPresent || deferred.mode !== "cloud" { return ["ok": false, "reason": "The pending move changed before its restart"] }
+        let restarted = WorkflowResult(try executeMove(.null, .null, paths, Value.spread(options, ["finish": true, "receiptFile": deferred.file])))
+        if !restarted.ok.truthy || restarted.plan.truthy { return restarted.raw }
+        return try completeActiveCloud(Value.spread(restarted.raw, ["file": deferred.file, "receipt": deferred.receipt.raw]), paths, options)
     }
     let report: Value = Value { args in
         let stage = args.count > 0 ? args[0] : .undefined
         let text = args.count > 1 ? args[1] : .undefined
         let extra: Value = args.count > 2 && !args[2].isUndefined ? args[2] : .newObject()
-        return try optCall(options["report"], stage, text, extra["live"].truthy ? Value.spread(extra, ["preparatory": true]) : extra)
+        return try optCall(option.report, stage, text, ProgressExtra(extra).live.truthy ? Value.spread(extra, ["preparatory": true]) : extra)
     }
-    let result = try finishPending(paths, Value.spread(options, ["report": report]))
-    let table: Value = try optCall(options["io"]["inspect"]) ?? options["processes"] ?? (try processTable(Value(paths.claudeApp)))
+    let result = WorkflowResult(try finishPending(paths, Value.spread(options, ["report": report])))
+    let table: Value = try optCall(option.io.inspect) ?? option.processes ?? (try processTable(Value(paths.claudeApp)))
     var checked: Value = .undefined
-    if result["receipt"].truthy {
-        for check in result["receipt"]["cloudChecks"].elements where try sameAccount(check, result["checkedAccount"]).truthy { checked = check; break }
+    if result.receipt.truthy {
+        for check in Receipt(result.receipt).cloudChecks.elements where try sameAccount(check, result.checkedAccount).truthy { checked = check; break }
     }
-    if !options["background"].truthy && checked["waiting"]["length"].truthy, try canRestartWaiting(Receipt(["cloudChecks": [checked]]), table).truthy {
-        let plan = try executeMove(.null, .null, paths, Value.spread(options, ["finish": true, "finishAccount": result["checkedAccount"], "receiptFile": result["file"]]))
-        if plan["plan"].truthy || !plan["ok"].truthy { return plan }
+    if !option.background.truthy && CloudCheck(checked).waiting["length"].truthy, try canRestartWaiting(Receipt(["cloudChecks": [checked]]), table).truthy {
+        let plan = WorkflowResult(try executeMove(.null, .null, paths, Value.spread(options, ["finish": true, "finishAccount": result.checkedAccount, "receiptFile": result.file])))
+        if plan.plan.truthy || !plan.ok.truthy { return plan.raw }
     }
-    return result
+    return result.raw
 }
 
 func observedRecord(_ record: Value = .undefined) throws -> Value {
@@ -418,22 +434,22 @@ func observedRecord(_ record: Value = .undefined) throws -> Value {
 }
 
 func inspectPlaced(_ paths: DataLayout) throws -> Value {
-    let latest = try latestReceipt(paths)
-    if !latest.truthy { return ["changed": []] }
-    if latest["corrupt"].truthy { return ["changed": [], "error": "Latest move receipt is unreadable"] }
-    let receipt = Receipt(latest["receipt"]), file = latest["file"]
+    let latest = LatestReceipt(try latestReceipt(paths))
+    if !latest.isPresent { return ["changed": []] }
+    if latest.corrupt.truthy { return ["changed": [], "error": "Latest move receipt is unreadable"] }
+    let receipt = latest.receipt, file = latest.file
     if receipt.finalizing.truthy || receipt.undoing.truthy || receipt.retiring.truthy || receipt.pending.truthy { return ["changed": [], "recoveryRequired": true] }
     var changed: [Value] = []
     let destination: Value = receipt.toAccount.truthy
-        ? Value(path.join(paths.records, receipt.toAccount["account"].description, receipt.toAccount["org"].description))
+        ? Value(path.join(paths.records, AccountRef(receipt.toAccount).accountId.description, AccountRef(receipt.toAccount).orgId.description))
         : receipt.toAccount
-    for row in (receipt.sessions ?? []).elements {
-        if !row["recordSnapshot"].truthy || !destination.truthy || Value(path.dirname(row["record"].description)) !== destination || !UUID.test(row["targetId"].description) { continue }
-        let raw: Value = orNull { try readFile(row["record"]) }
-        if raw.truthy && Value(sha(raw)) === row["recordSha"] { continue }
+    for row in (receipt.sessions ?? []).elements.map(PlacedSession.init) {
+        if !row.recordSnapshot.truthy || !destination.truthy || Value(path.dirname(row.record.description)) !== destination || !UUID.test(row.targetId.description) { continue }
+        let raw: Value = orNull { try readFile(row.record) }
+        if raw.truthy && Value(sha(raw)) === row.recordSha { continue }
         var record: Value = .undefined
         if raw.truthy, let data = raw.asData { record = (try? JSON.parse(data)) ?? .undefined }
-        let before = try observedRecord(row["recordSnapshot"])
+        let before = try observedRecord(row.recordSnapshot)
         let after: Value = record.truthy ? try observedRecord(record) : .null
         if after.truthy && stable(before) == stable(after) { continue }
         let fields: Value = after.truthy
@@ -442,14 +458,14 @@ func inspectPlaced(_ paths: DataLayout) throws -> Value {
         let found: String = after.truthy ? sha(stable(after)) : raw.truthy ? sha(raw) : "missing"
         let directory = path.join(paths.state, "drift", path.basename(file.description, ".json"))
         try fs.mkdirp(directory, mode: 0o700)
-        let placedFile = path.join(directory, "\(row["targetId"]).placed.json")
-        let foundFile = path.join(directory, "\(row["targetId"]).\(found).found.json")
-        if !exists(Value(placedFile)) { _ = try writeNew(Value(placedFile), Value(jsonText(row["recordSnapshot"]))) }
+        let placedFile = path.join(directory, "\(row.targetId).placed.json")
+        let foundFile = path.join(directory, "\(row.targetId).\(found).found.json")
+        if !exists(Value(placedFile)) { _ = try writeNew(Value(placedFile), Value(jsonText(row.recordSnapshot))) }
         if raw.truthy && !exists(Value(foundFile)) { _ = try writeNew(Value(foundFile), raw) }
-        changed.append(["id": row["targetId"], "title": record["title"] ?? row["title"], "fields": fields, "placed": Value(placedFile), "found": raw.truthy ? Value(foundFile) : .null])
+        changed.append(["id": row.targetId, "title": DesktopRecord(record).title ?? row.title, "fields": fields, "placed": Value(placedFile), "found": raw.truthy ? Value(foundFile) : .null])
     }
     let changedValue = Value(changed)
-    if latest["projected"].truthy || stable(receipt.metadataDrift ?? []) != stable(changedValue) {
+    if latest.projected.truthy || stable(receipt.metadataDrift ?? []) != stable(changedValue) {
         receipt.metadataDrift = changedValue
         _ = try projectLocalFailures(receipt, paths, false)
         _ = try saveJson(file, receipt.raw)
@@ -458,7 +474,7 @@ func inspectPlaced(_ paths: DataLayout) throws -> Value {
     for row in (receipt.failed ?? []).elements where try actionableCloudFailure(receipt, row).truthy { failed.append(row) }
     return [
         "changed": changedValue, "receipt": file, "summary": try receiptSummary(receipt), "ok": try finishOkay(receipt), "failed": Value(failed),
-        "notMoved": Value((receipt.failed ?? []).elements.filter { !$0["cloudAccount"].truthy }), "problems": receipt.verification["problems"] ?? [],
+        "notMoved": Value((receipt.failed ?? []).elements.filter { !FailedSession($0).cloudAccount.truthy }), "problems": Verification(receipt.verification).problems ?? [],
     ]
 }
 
@@ -474,41 +490,44 @@ public func sweep(_ paths: Value = .undefined, _ options: Value = .undefined) th
 @discardableResult
 func sweep(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
-    let recovered = try locked(paths, Value { _ in try reconcile(paths, Value.spread(options, ["background": true])) })
-    if recovered["pendingUndo"].truthy { return ["pending": true, "pendingUndo": recovered["pendingUndo"], "ok": true, "complete": false] }
-    if recovered.truthy { return ["recovered": recovered, "error": Value("\(recovered["title"]): \(recovered["error"])"), "ok": false] }
+    let option = WorkflowOptions(options)
+    let recovered = RecoveryNote(try locked(paths, Value { _ in try reconcile(paths, Value.spread(options, ["background": true])) }))
+    if recovered.pendingUndo.truthy { return ["pending": true, "pendingUndo": recovered.pendingUndo, "ok": true, "complete": false] }
+    if recovered.isPresent { return ["recovered": recovered.raw, "error": Value("\(recovered.title): \(recovered.error)"), "ok": false] }
     let verification = try verifyPlaced(paths)
-    let deferred = try deferredWorkflow(paths)
-    if deferred["mode"] === "local" {
-        let result = try finishHeld(paths, Value.spread(options, ["background": true]))
-        let problems: Value = result["problems"].nullish ? .undefined : Value(result["problems"].elements.map { row in Value("\(row["title"]): \(row["check"])") }.map { $0.description }.joined(separator: ", "))
-        let failedText: Value = result["receipt"].nullish ? .undefined : Value(result["receipt"]["failed"].elements.map { row in "\(row["title"]): \(row["error"])" }.joined(separator: ", "))
-        let error: Value = result["reason"] ?? problems ?? failedText
-        var refreshRequired: Value = Value(!result["receipt"]["held"]["length"].truthy)
-        if refreshRequired.truthy { refreshRequired = Value(toNumber(result["added"]) > 0) }
-        if refreshRequired.truthy { refreshRequired = try sameAccount(try signedIn(paths), result["receipt"]["toAccount"]) }
+    let verified = WorkflowResult(verification)
+    let deferred = DeferredWorkflow(try deferredWorkflow(paths))
+    if deferred.mode === "local" {
+        let result = WorkflowResult(try finishHeld(paths, Value.spread(options, ["background": true])))
+        let receipt = Receipt(result.receipt)
+        let problems: Value = result.problems.nullish ? .undefined : Value(result.problems.elements.map(ProblemRow.init).map { row in Value("\(row.title): \(row.check)") }.map { $0.description }.joined(separator: ", "))
+        let failedText: Value = result.receipt.nullish ? .undefined : Value(receipt.failed.elements.map(FailedSession.init).map { row in "\(row.title): \(row.error)" }.joined(separator: ", "))
+        let error: Value = result.reason ?? problems ?? failedText
+        var refreshRequired: Value = Value(!receipt.held["length"].truthy)
+        if refreshRequired.truthy { refreshRequired = Value(toNumber(result.added) > 0) }
+        if refreshRequired.truthy { refreshRequired = try sameAccount(try signedIn(paths), receipt.toAccount) }
         return [
-            "verification": verification, "result": result,
-            "error": result["ok"] === false ? or(error, "Pending local work needs attention") : .null,
-            "refreshRequired": refreshRequired, "ok": Value(result["ok"] !== false),
+            "verification": verification, "result": result.raw,
+            "error": result.ok === false ? or(error, "Pending local work needs attention") : .null,
+            "refreshRequired": refreshRequired, "ok": Value(result.ok !== false),
         ]
     }
-    if !deferred.truthy || deferred["mode"] !== "cloud" {
-        return ["verification": verification, "ok": Value(!verification["error"].truthy && verification["ok"] !== false), "complete": Value(!deferred.truthy && verification["ok"] === true)]
+    if !deferred.isPresent || deferred.mode !== "cloud" {
+        return ["verification": verification, "ok": Value(!Verification(verification).error.truthy && verified.ok !== false), "complete": Value(!deferred.isPresent && verified.ok === true)]
     }
-    let active: Value = try options["active"] ?? (try signedIn(paths, options["processes"]))
+    let active: Value = try option.active ?? (try signedIn(paths, option.processes))
     do {
-        let result = try finishPending(paths, Value.spread(options, ["active": active, "receiptFile": deferred["file"], "automatic": true]))
-        var refresh = result["restart"].truthy
-        if refresh { refresh = try sameAccount(active, result["receipt"]["toAccount"]).truthy }
-        let failedText: Value = result["failed"].nullish ? .undefined : Value(result["failed"].elements.map { row in "\(row["title"]): \(row["error"])" }.joined(separator: ", "))
+        let result = WorkflowResult(try finishPending(paths, Value.spread(options, ["active": active, "receiptFile": deferred.file, "automatic": true])))
+        var refresh = result.restart.truthy
+        if refresh { refresh = try sameAccount(active, Receipt(result.receipt).toAccount).truthy }
+        let failedText: Value = result.failed.nullish ? .undefined : Value(result.failed.elements.map(FailedSession.init).map { row in "\(row.title): \(row.error)" }.joined(separator: ", "))
         return [
-            "verification": verification, "result": result, "pending": result["pending"], "refreshRequired": Value(refresh),
-            "error": result["ok"] === false ? or(failedText, "Pending cloud work needs attention") : .null, "ok": Value(result["ok"] !== false),
+            "verification": verification, "result": result.raw, "pending": result.pending, "refreshRequired": Value(refresh),
+            "error": result.ok === false ? or(failedText, "Pending cloud work needs attention") : .null, "ok": Value(result.ok !== false),
         ]
     } catch {
-        let error = errorObject(error)
-        return ["verification": verification, "pending": true, "ok": false, "code": error["code"], "error": error["message"]]
+        let error = ThrownError(object: errorObject(error))
+        return ["verification": verification, "pending": true, "ok": false, "code": error.code, "error": error.message]
     }
 }
 
@@ -517,54 +536,57 @@ public func undo(_ paths: Value = .undefined, _ options: Value = .undefined) thr
 @discardableResult
 func undo(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
-    if !options["approve"].nullish {
-        let recovery = try recoveryPending(paths)
-        let recover = recovery["receipt"]["taskTransfers"]["length"].truthy
-        let latest: Value = try recovery ?? (try latestReceipt(paths))
-        return try executeMove(.null, .null, paths, Value.spread(options, ["undo": Value(!recover), "recover": Value(recover), "receiptFile": latest["file"]]))
+    let option = WorkflowOptions(options)
+    if !option.approve.nullish {
+        let recovery = PendingRecovery(try recoveryPending(paths))
+        let recover = recovery.receipt.taskTransfers["length"].truthy
+        let latest = LatestReceipt(try recovery.raw ?? (try latestReceipt(paths)))
+        return try executeMove(.null, .null, paths, Value.spread(options, ["undo": Value(!recover), "recover": Value(recover), "receiptFile": latest.file]))
     }
-    let result = try locked(paths, Value { _ in try undoFiles(paths, options) })
-    if !result["restartNeeded"].truthy { return result }
+    let result = WorkflowResult(try locked(paths, Value { _ in try undoFiles(paths, options) }))
+    if !result.restartNeeded.truthy { return result.raw }
+    let undoing = Receipt(result.receipt).undoing.truthy
     return try executeMove(.null, .null, paths, Value.spread(options, [
-        "undo": Value(!result["receipt"]["undoing"].truthy), "recover": Value(result["receipt"]["undoing"].truthy), "receiptFile": result["file"],
+        "undo": Value(!undoing), "recover": Value(undoing), "receiptFile": result.file,
     ]))
 }
 
 func undoFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -> Value {
     let options: Value = options.isUndefined ? .newObject() : options
-    if options["receiptFile"].truthy, try latestReceipt(paths)["file"] !== options["receiptFile"] { return ["ok": false, "reason": "The operation receipt changed"] }
-    let reconciled: Value = options["check"].truthy ? .null : try reconcile(paths, options)
-    if reconciled["undo"].truthy { return reconciled["undo"] }
-    if reconciled["pendingUndo"].truthy {
-        return ["receipt": reconciled["receipt"], "pendingUndo": reconciled["pendingUndo"], "remoteRestored": reconciled["remoteRestored"] ?? 0]
+    let option = WorkflowOptions(options)
+    if option.receiptFile.truthy, try LatestReceipt(latestReceipt(paths)).file !== option.receiptFile { return ["ok": false, "reason": "The operation receipt changed"] }
+    let reconciled = RecoveryNote(option.check.truthy ? .null : try reconcile(paths, options))
+    if reconciled.undo.truthy { return reconciled.undo }
+    if reconciled.pendingUndo.truthy {
+        return ["receipt": reconciled.receipt, "pendingUndo": reconciled.pendingUndo, "remoteRestored": reconciled.remoteRestored ?? 0]
     }
-    if reconciled.truthy { return ["reconciled": reconciled] }
-    let latest = try latestReceipt(paths)
-    if options["receiptFile"].truthy && latest["file"] !== options["receiptFile"] { return ["ok": false, "reason": "The operation receipt changed"] }
-    if !latest.truthy { return ["nothing": true] }
-    let file = latest["file"], receipt = Receipt(latest["receipt"])
+    if reconciled.isPresent { return ["reconciled": reconciled.raw] }
+    let latest = LatestReceipt(try latestReceipt(paths))
+    if option.receiptFile.truthy && latest.file !== option.receiptFile { return ["ok": false, "reason": "The operation receipt changed"] }
+    if !latest.isPresent { return ["nothing": true] }
+    let file = latest.file, receipt = latest.receipt
     if receipt.retained["length"].truthy { return ["receipt": receipt.raw, "retained": receipt.retained] }
     var kept: [Value] = []
     let inspect = try inspector(paths, options)
     let liveWorkers = try workers(try inspect.call())
-    for r in receipt.sessions.elements {
-        let changes = try targetChanges(r, liveWorkers, Value(r["strategy"] !== "rehome"))
-        if changes.length > 0 { kept.append(Value("\(r["title"]) | \(short(r["targetId"])) | \(changes.join(", ")) changed")) }
+    for r in receipt.sessions.elements.map(PlacedSession.init) {
+        let changes = try targetChanges(r.raw, liveWorkers, Value(r.strategy !== "rehome"))
+        if changes.length > 0 { kept.append(Value("\(r.title) | \(short(r.targetId)) | \(changes.join(", ")) changed")) }
     }
     if !kept.isEmpty { return ["receipt": receipt.raw, "changed": Value(kept)] }
     let root = path.join(paths.state, "quarantine")
     let blocked: [Value] = try restoreProblems(receipt.superseded ?? [], Value(root)).elements
         + (try bridgeProblems(receipt.sessions, true)).elements
         + (try taskTransferProblems(receipt.taskTransfers, paths, inspect)).elements
-    let schedulerHeld = !blocked.isEmpty && blocked.allSatisfy { $0 === Value(SCHEDULER_OWNS) } && !options["check"].truthy
+    let schedulerHeld = !blocked.isEmpty && blocked.allSatisfy { $0 === Value(SCHEDULER_OWNS) } && !option.check.truthy
     if schedulerHeld && !receipt.remote["length"].truthy { return ["restartNeeded": true, "file": file, "receipt": receipt.raw] }
     if !blocked.isEmpty && !schedulerHeld { return ["receipt": receipt.raw, "restoreProblems": Value(blocked)] }
     let plan = try prepareUndo(receipt, paths)
     var changedAfterSnapshot: [Value] = []
     let finalWorkers = try workers(try inspect.call())
-    for r in receipt.sessions.elements {
-        let changes = try targetChanges(r, finalWorkers, Value(r["strategy"] !== "rehome"))
-        if changes.length > 0 { changedAfterSnapshot.append(Value("\(r["title"]) | \(short(r["targetId"])) | \(changes.join(", ")) changed")) }
+    for r in receipt.sessions.elements.map(PlacedSession.init) {
+        let changes = try targetChanges(r.raw, finalWorkers, Value(r.strategy !== "rehome"))
+        if changes.length > 0 { changedAfterSnapshot.append(Value("\(r.title) | \(short(r.targetId)) | \(changes.join(", ")) changed")) }
     }
     if !changedAfterSnapshot.isEmpty { return ["receipt": receipt.raw, "changed": Value(changedAfterSnapshot)] }
     let activationBlocked = try activationProblems(receipt)
@@ -576,34 +598,39 @@ func undoFiles(_ paths: DataLayout, _ options: Value = .undefined) throws -> Val
     if receipt.remote["length"].truthy { receipt.remoteUndoing = receipt.remote.deepClone() }
     _ = try cancelCloudChecks(receipt)
     _ = try saveJson(file, receipt.raw)
-    let remote = try restoreRemote(receipt, file, paths, options)
-    if remote["problems"].length > 0 { return ["receipt": receipt.raw, "restoreProblems": remote["problems"]] }
-    if remote["pending"].length > 0 { return ["receipt": receipt.raw, "pendingUndo": remote["pending"], "remoteRestored": remote["restored"]] }
+    let remote = RemoteRestore(try restoreRemote(receipt, file, paths, options))
+    if remote.problems.length > 0 { return ["receipt": receipt.raw, "restoreProblems": remote.problems] }
+    if remote.pending.length > 0 { return ["receipt": receipt.raw, "pendingUndo": remote.pending, "remoteRestored": remote.restored] }
     if schedulerHeld { return ["restartNeeded": true, "file": file, "receipt": receipt.raw] }
     return try finishUndo(receipt, file, paths, Value.spread(options, ["inspect": inspect]))
 }
 
 public func describe(_ list: Value = .undefined) throws -> Value {
-    let emails: Value = .newSet(list.elements.map { $0["email"] ?? Value(short($0["account"])) })
+    let accounts = list.elements.map(Account.init)
+    let emails: Value = .newSet(accounts.map { $0.email ?? Value(short($0.accountId)) })
     if emails.length == 1 {
-        return Value("\(emails.elements[0]) · \(list.elements.map { ($0["orgName"] ?? Value(short($0["org"]))).description }.joined(separator: " + "))")
+        return Value("\(emails.elements[0]) · \(accounts.map { ($0.orgName ?? Value(short($0.orgId))).description }.joined(separator: " + "))")
     }
-    return Value(list.elements.map { $0["label"].description }.joined(separator: ", "))
+    return Value(accounts.map(\.label).joined(separator: ", "))
 }
 
 public func find(_ all: Value = .undefined, _ sel: Value = .undefined) throws -> Value {
-    func hay(_ a: Value) -> String { "\(a["email"] ?? "") \(a["account"]) \(a["orgName"] ?? "") \(a["org"])".lowercased() }
+    func hay(_ a: Value) -> String {
+        let a = Account(a)
+        return "\(a.email ?? "") \(a.accountId) \(a.orgName ?? "") \(a.orgId)".lowercased()
+    }
     let terms = re(#"\s+"#).split(sel.description.lowercased())
     let hits = all.elements.filter { a in
         let text = hay(a)
         return terms.allSatisfy { $0.isEmpty || text.contains($0) }
     }
     if hits.count == 1 { return hits[0] }
-    throw EngineError(!hits.isEmpty ? "\"\(sel)\" matches \(hits.map { $0["label"].description }.joined(separator: ", "))" : "\"\(sel)\" matches no account")
+    throw EngineError(!hits.isEmpty ? "\"\(sel)\" matches \(hits.map { Account($0).label }.joined(separator: ", "))" : "\"\(sel)\" matches no account")
 }
 
 public func step(_ state: Value = .undefined, _ key: Value = .undefined) throws -> Value {
-    let cursor = state["cursor"], chosen = state["chosen"], size = state["size"], multi = state["multi"]
+    let picker = PickerState(state)
+    let cursor = picker.cursor, chosen = picker.chosen, size = picker.size, multi = picker.multi
     if key === "up" { return Value.spread(state, ["cursor": Value((toNumber(cursor) + toNumber(size) - 1).truncatingRemainder(dividingBy: toNumber(size)))]) }
     if key === "down" { return Value.spread(state, ["cursor": Value((toNumber(cursor) + 1).truncatingRemainder(dividingBy: toNumber(size)))]) }
     if key === "space" && multi.truthy {
@@ -680,13 +707,14 @@ public func pick(_ title: Value = .undefined, _ rows: Value = .undefined, _ mult
     let rowList = rows.elements
     if rowList.isEmpty { throw EngineError("no accounts to choose from") }
     let hint = multi.truthy ? "↑↓ move · space select · enter next" : "↑↓ move · enter confirm"
-    let width = rowList.map { $0["label"].length }.max() ?? 0
+    let width = rowList.map { Value(Account($0).label).length }.max() ?? 0
     var state: Value = ["cursor": 0, "chosen": .newSet(), "size": Value(rowList.count), "multi": multi]
     func lines() -> [String] {
         ["\(title)  \(hint)"] + rowList.enumerated().map { (i, r) in
-            let cursor = Value(i) === state["cursor"] ? "❯" : " "
-            let choice = multi.truthy ? (state["chosen"].has(Value(i)) ? "◉" : "○") : Value(i) === state["cursor"] ? "●" : "○"
-            return "  \(cursor) \(choice) \(padEnd(r["label"].description, width))  \(r["stats"])"
+            let picker = PickerState(state), row = Account(r)
+            let cursor = Value(i) === picker.cursor ? "❯" : " "
+            let choice = multi.truthy ? (picker.chosen.has(Value(i)) ? "◉" : "○") : Value(i) === picker.cursor ? "●" : "○"
+            return "  \(cursor) \(choice) \(padEnd(row.label, width))  \(row.stats)"
         }
     }
     let erase = "\u{1b}[\(rowList.count + 1)A\u{1b}[J"
@@ -721,11 +749,11 @@ public func pick(_ title: Value = .undefined, _ rows: Value = .undefined, _ mult
                 throw EngineError("aborted", code: 130)
             }
             state = try step(state, key.name.map { Value($0) } ?? .undefined)
-            if state["done"].truthy { break reading }
+            if PickerState(state).done.truthy { break reading }
             process.stdout("\(erase)\(lines().joined(separator: "\n"))\n")
         }
     }
-    let indices = state["chosen"].elements.map { toNumber($0) }.sorted()
+    let indices = PickerState(state).chosen.elements.map { toNumber($0) }.sorted()
     return Value(indices.map { rowList[Int($0)] })
 }
 
@@ -734,34 +762,34 @@ public func reporter(_ json: Value = .undefined) throws -> Value {
     return Value { args in
         let stage = args.count > 0 ? args[0] : .undefined
         let text = args.count > 1 ? args[1] : .undefined
-        let extra: Value = args.count > 2 && !args[2].isUndefined ? args[2] : .newObject()
+        let extra = ProgressExtra(args.count > 2 && !args[2].isUndefined ? args[2] : .newObject())
         let now = dateNow()
-        let edge = stage === "sessions" || extra["completed"] === 0 || extra["completed"] === extra["total"]
-        if extra["live"].truthy && !edge && now - lastLive < 100 { return .undefined }
-        if extra["live"].truthy { lastLive = now }
+        let edge = stage === "sessions" || extra.completed === 0 || extra.completed === extra.total
+        if extra.live.truthy && !edge && now - lastLive < 100 { return .undefined }
+        if extra.live.truthy { lastLive = now }
         let fields = ValueObject()
         fields["stage"] = stage
         fields["text"] = text
-        if extra["live"].truthy { fields["live"] = true }
-        if extra["preparatory"].truthy { fields["preparatory"] = true }
-        if extra["activity"].isString { fields["activity"] = extra["activity"] }
-        if extra["sourceId"].isString { fields["sourceId"] = extra["sourceId"] }
-        if extra["sourceLabel"].isString { fields["sourceLabel"] = extra["sourceLabel"] }
-        let total = extra["sessionTotal"], remaining = extra["remainingCount"]
+        if extra.live.truthy { fields["live"] = true }
+        if extra.preparatory.truthy { fields["preparatory"] = true }
+        if extra.activity.isString { fields["activity"] = extra.activity }
+        if extra.sourceId.isString { fields["sourceId"] = extra.sourceId }
+        if extra.sourceLabel.isString { fields["sourceLabel"] = extra.sourceLabel }
+        let total = extra.sessionTotal, remaining = extra.remainingCount
         if isSafeInteger(total) && toNumber(total) >= 0 && isSafeInteger(remaining) && toNumber(remaining) >= 0 && toNumber(remaining) <= toNumber(total) {
             fields["sessionTotal"] = total
             fields["remainingCount"] = remaining
         }
-        if isInteger(extra["moved"]) { fields["moved"] = extra["moved"] }
-        if isInteger(extra["completed"]) { fields["completed"] = extra["completed"] }
-        if isInteger(extra["total"]) { fields["total"] = extra["total"] }
+        if isInteger(extra.moved) { fields["moved"] = extra.moved }
+        if isInteger(extra.completed) { fields["completed"] = extra.completed }
+        if isInteger(extra.total) { fields["total"] = extra.total }
         if json.truthy {
             process.stdout("\(JSON.text(.object(fields)))\n")
             return true
         }
         let tty = stdoutIsTTY()
-        if extra["live"].truthy && !tty { return .undefined }
-        process.stdout("\(tty ? "\r\u{1b}[K" : "")  \(padEnd(stage.description, 11)) \(text)\(extra["live"].truthy ? "" : "\n")")
+        if extra.live.truthy && !tty { return .undefined }
+        process.stdout("\(tty ? "\r\u{1b}[K" : "")  \(padEnd(stage.description, 11)) \(text)\(extra.live.truthy ? "" : "\n")")
         return true
     }
 }
