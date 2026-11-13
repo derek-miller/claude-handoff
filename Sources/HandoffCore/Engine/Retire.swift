@@ -754,7 +754,7 @@ func restoreRemote(_ receipt: Receipt, _ file: Value = .undefined, _ paths: Data
     for source in bySource.values {
         let cloud: Value
         do { cloud = try sourceCloud(paths, source, supplied) }
-        catch { errorMessage = ThrownError(object: errorObject(error)).message; continue }
+        catch { errorMessage = ThrownError(error).message; continue }
         let client = CloudClient(cloud)
         for row in try receipt.remoteUndoing.elements.filter({ try sameAccount($0, source).truthy }) {
             let archive = PendingArchive(row)
