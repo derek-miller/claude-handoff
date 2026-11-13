@@ -308,8 +308,14 @@ struct CloudCheck: AccountKey {
         get { raw["status"] }
         nonmutating set { raw["status"] = newValue }
     }
-    var waiting: Value { raw["waiting"] }
-    var checkedAt: Value { raw["checkedAt"] }
+    var waiting: Value {
+        get { raw["waiting"] }
+        nonmutating set { raw["waiting"] = newValue }
+    }
+    var checkedAt: Value {
+        get { raw["checkedAt"] }
+        nonmutating set { raw["checkedAt"] = newValue }
+    }
 
     @available(*, unavailable, message: "declare the field on CloudCheck")
     subscript(dynamicMember name: String) -> Value { raw[name] }
