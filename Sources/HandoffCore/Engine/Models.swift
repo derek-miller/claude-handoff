@@ -132,6 +132,11 @@ extension RecordHolder {
 struct MoveSource: RecordHolder {
     let raw: Value
     init(_ raw: Value) { self.raw = raw }
+    var sole: Value {
+        get { raw["sole"] }
+        nonmutating set { raw["sole"] = newValue }
+    }
+    var lineage: Value { raw["lineage"] }
     var id: Value { raw["id"] }
     var file: Value { raw["file"] }
     var account: Account { Account(raw["account"]) }
@@ -165,6 +170,18 @@ struct MoveSource: RecordHolder {
 struct MoveTarget: RecordHolder {
     let raw: Value
     init(_ raw: Value) { self.raw = raw }
+    var artifactBridgeIds: Value {
+        get { raw["artifactBridgeIds"] }
+        nonmutating set { raw["artifactBridgeIds"] = newValue }
+    }
+    var bridgeIds: Value {
+        get { raw["bridgeIds"] }
+        nonmutating set { raw["bridgeIds"] = newValue }
+    }
+    var retainedHistories: Value {
+        get { raw["retainedHistories"] }
+        nonmutating set { raw["retainedHistories"] = newValue }
+    }
     var recordId: Value { raw["record"] }
 }
 
@@ -341,6 +358,10 @@ struct Receipt {
 struct MovePlan {
     let raw: Value
     init(_ raw: Value) { self.raw = raw }
+    var cacheStats: Value {
+        get { raw["cacheStats"] }
+        nonmutating set { raw["cacheStats"] = newValue }
+    }
     var isPresent: Bool { raw.truthy }
     var blocked: Value {
         get { raw["blocked"] }
