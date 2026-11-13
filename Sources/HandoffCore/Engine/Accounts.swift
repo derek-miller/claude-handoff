@@ -98,7 +98,8 @@ func mappedPath(_ file: Value = .undefined) throws -> Value {
 }
 
 func sameTree(_ expected: Value = .undefined, _ current: Value = .undefined) throws -> Value {
-    Value(current.truthy && expected["fingerprint"] === current["fingerprint"] && (!expected["canonicalRoot"].truthy || expected["canonicalRoot"] === current["canonicalRoot"]))
+    let expected = SidecarTree(expected), current = SidecarTree(current)
+    return Value(current.raw.truthy && expected.fingerprint === current.fingerprint && (!expected.canonicalRoot.truthy || expected.canonicalRoot === current.canonicalRoot))
 }
 
 func tree(_ root: Value = .undefined, _ canonicalRoot: Value = .undefined) throws -> Value {
@@ -124,7 +125,7 @@ func tree(_ root: Value = .undefined, _ canonicalRoot: Value = .undefined) throw
     var present = false
     do { _ = try fs.lstat(canonical, bigint: false); present = true } catch {
         let error = errorObject(error)
-        if error["code"] !== "ENOENT" { throw EngineError(error) }
+        if ThrownError(object: error).code !== "ENOENT" { throw EngineError(error) }
     }
     if present { try walk(canonical) }
     if try mappedPath(root) !== canonicalRoot { throw EngineError("sidecar root mapping changed while reading") }
@@ -152,41 +153,42 @@ func treeFingerprint(_ root: Value = .undefined) throws -> Value {
 
 func manifest(_ root: Value = .undefined, _ cache: Value = .undefined) throws -> Value {
     let cache = cache.isUndefined ? Value.null : cache
-    let before = try treeFingerprint(root)
-    let files = before["files"]
-    let signature = Value(sha(stable([before["fingerprint"], before["canonicalRoot"]])))
+    let before = SidecarTree(try treeFingerprint(root))
+    let files = before.files
+    let signature = Value(sha(stable([before.fingerprint, before.canonicalRoot])))
     let prior = cache.truthy ? try cacheLookup(cache, "manifests", root, signature) : Value.null
-    let rows = prior["rows"] ?? Value.newArray()
+    let rows = SidecarTree(prior).rows ?? Value.newArray()
     if !prior.truthy {
         for file in files.elements {
             let f = file.description
             let detail = try fs.lstat(f, bigint: true)
-            if statIdentity(detail) !== before["signatures"].get(file) { throw EngineError("sidecars changed while reading") }
-            let rel = Value(path.relative(before["canonicalRoot"].description, f))
+            if statIdentity(detail) !== before.signatures.get(file) { throw EngineError("sidecars changed while reading") }
+            let rel = Value(path.relative(before.canonicalRoot.description, f))
             if detail.isSymbolicLink {
                 let data = try fs.readlink(f)
                 rows.push(["rel": rel, "bytes": Value(data.count), "sha": Value(sha(data)), "type": "symlink",
                            "resolved": Value(path.resolve(path.dirname(f), String(decoding: data, as: UTF8.self)))])
             } else {
-                let data = try readRegular(file, before["signatures"].get(file))
+                let data = try readRegular(file, before.signatures.get(file))
                 rows.push(["rel": rel, "bytes": data["length"], "sha": Value(sha(data))])
             }
         }
     }
-    if try !sameTree(before, treeFingerprint(root)).truthy { throw EngineError("sidecars changed while reading") }
+    if try !sameTree(before.raw, treeFingerprint(root)).truthy { throw EngineError("sidecars changed while reading") }
     if cache.truthy && !prior.truthy { _ = try cacheStore(cache, "manifests", root, signature, ["rows": rows]) }
-    return try manifestOf(rows, before["fingerprint"], before["canonicalRoot"])
+    return try manifestOf(rows, before.fingerprint, before.canonicalRoot)
 }
 
 func sidecarIdentity(_ row: Value = .undefined) throws -> Value {
-    row["type"] === "symlink" ? Value("link:\(row["sha"]):\(row["resolved"])") : row["sha"]
+    let file = SidecarFile(row)
+    return file.isSymlink ? Value("link:\(file.sha):\(file.resolved)") : file.sha
 }
 
 func manifestOf(_ rows: Value = .undefined, _ fingerprint: Value = .undefined, _ canonicalRoot: Value = .undefined) throws -> Value {
     let fingerprint = fingerprint.isUndefined ? Value.null : fingerprint
     let canonicalRoot = canonicalRoot.isUndefined ? Value.null : canonicalRoot
-    let set = Value.newSet(try rows.elements.map { Value("\($0["rel"]):\(try sidecarIdentity($0))") })
-    let bytes = rows.elements.reduce(0.0) { $0 + ($1["bytes"].asNumber ?? .nan) }
+    let set = Value.newSet(try rows.elements.map { Value("\(SidecarFile($0).rel):\(try sidecarIdentity($0))") })
+    let bytes = rows.elements.reduce(0.0) { $0 + (SidecarFile($1).bytes.asNumber ?? .nan) }
     return ["set": set, "rows": rows, "count": Value(rows.length), "bytes": Value(bytes), "sha": Value(sha(stable(rows))),
             "fingerprint": fingerprint, "canonicalRoot": canonicalRoot]
 }
@@ -208,10 +210,11 @@ func openAnalysisCache(_ paths: DataLayout, _ writable: Value = .undefined) thro
 }
 
 func fingerprint(_ file: Value = .undefined, _ cache: Value = .undefined) throws -> Value {
-    if cache["fingerprints"].has(file) { return cache["fingerprints"].get(file) }
+    let fingerprints = EngineCache(cache).fingerprints
+    if fingerprints.has(file) { return fingerprints.get(file) }
     let detail = try fs.stat(file.description, bigint: true)
     let value = statIdentity(detail)
-    cache["fingerprints"].put(file, value)
+    fingerprints.put(file, value)
     return value
 }
 
@@ -222,36 +225,39 @@ let cacheNames: Value = [
 ]
 
 func cacheLookup(_ cache: Value = .undefined, _ bucket: Value = .undefined, _ key: Value = .undefined, _ signature: Value = .undefined) throws -> Value {
-    cache["used"][bucket].add(key)
-    let item = cache["data"][bucket][key]
-    if item["signature"] === signature {
+    let cache = EngineCache(cache)
+    cache.used[bucket].add(key)
+    let item = CacheEntry(cache.data[bucket][key])
+    if item.signature === signature {
         let name = cacheNames[bucket][0]
-        cache["stats"][name] = Value(toNumber(cache["stats"][name]) + 1)
-        return item["value"]
+        cache.stats[name] = Value(toNumber(cache.stats[name]) + 1)
+        return item.value
     }
     let name = cacheNames[bucket][1]
-    cache["stats"][name] = Value(toNumber(cache["stats"][name]) + 1)
+    cache.stats[name] = Value(toNumber(cache.stats[name]) + 1)
     return .null
 }
 
 func cacheStore(_ cache: Value = .undefined, _ bucket: Value = .undefined, _ key: Value = .undefined, _ signature: Value = .undefined, _ value: Value = .undefined) throws -> Value {
-    cache["used"][bucket].add(key)
-    cache["data"][bucket][key] = ["signature": signature, "value": value]
+    let cache = EngineCache(cache)
+    cache.used[bucket].add(key)
+    cache.data[bucket][key] = ["signature": signature, "value": value]
     return .undefined
 }
 
 func saveAnalysisCache(_ cache: Value = .undefined) throws -> Value {
-    if !cache["writable"].truthy { return .undefined }
+    let cache = EngineCache(cache)
+    if !cache.writable.truthy { return .undefined }
     func kept(_ bucket: String) -> Value {
-        .fromEntries(cache["used"][bucket].elements.compactMap { key in
-            let item = cache["data"][bucket][key]
+        .fromEntries(cache.used[bucket].elements.compactMap { key in
+            let item = cache.data[bucket][key]
             return item.truthy ? (key.description, item) : nil
         })
     }
-    try fs.mkdirp(path.dirname(cache["file"].description))
+    try fs.mkdirp(path.dirname(cache.file.description))
     let body: Value = ["version": Value(CACHE_VERSION), "semanticVersion": Value(SEMANTIC_VERSION),
                        "histories": kept("histories"), "manifests": kept("manifests"), "remote": kept("remote")]
-    _ = try saveJson(cache["file"], body, 0)
+    _ = try saveJson(cache.file, body, 0)
     return .undefined
 }
 
@@ -320,14 +326,14 @@ func folderRecords(_ dir: Value = .undefined, _ snapshots: Value = .undefined, _
     let snapshots = snapshots.isUndefined ? Value.null : snapshots
     let check = fnOr(check)
     let before = snapshots.truthy ? try fingerprint(dir) : Value.null
-    let previous = snapshots.get(dir)
-    let files = previous["signature"] === before ? previous["records"].asMap!.keys : try recordFiles(dir).elements
+    let previous = FolderSnapshot(snapshots.get(dir))
+    let files = previous.signature === before ? previous.records.asMap!.keys : try recordFiles(dir).elements
     let recordsMap = Value.newMap()
     for file in files {
         try check.call()
         let signature = snapshots.truthy ? try fingerprint(file) : Value.null
-        let cached = previous["records"].get(file)
-        let record = cached["signature"] === signature ? cached["record"] : ((try? readJson(file)) ?? .null)
+        let cached = SnapshotRecord(previous.records.get(file))
+        let record = cached.signature === signature ? cached.record : ((try? readJson(file)) ?? .null)
         if !record.truthy || !record.isObjectLike || record.isArray { throw EngineError("unreadable Desktop record: \(file)") }
         if try snapshots.truthy && fingerprint(file) !== signature { throw EngineError("Desktop record changed while reading: \(file)") }
         recordsMap.put(file, ["signature": signature, "record": record])
@@ -335,7 +341,7 @@ func folderRecords(_ dir: Value = .undefined, _ snapshots: Value = .undefined, _
     }
     if try snapshots.truthy && fingerprint(dir) !== before { throw EngineError("Desktop folder changed while reading: \(dir)") }
     snapshots.put(dir, ["signature": before, "records": recordsMap])
-    return recordsMap.asMap!.entries.map { file, entry -> Value in ["file": file, "record": entry["record"]] }.value
+    return recordsMap.asMap!.entries.map { file, entry -> Value in ["file": file, "record": SnapshotRecord(entry).record] }.value
 }
 
 func records(_ root: Value = .undefined) throws -> Value {
@@ -354,21 +360,23 @@ func records(_ root: Value = .undefined) throws -> Value {
 func taskSessions(_ file: Value = .undefined) throws -> Value {
     let data: Value
     do { data = try readJson(file) } catch {
-        if errorObject(error)["code"] === "ENOENT" { let s = Value.newSet(); s["registry"] = .null; return s }
+        if ThrownError(error).code === "ENOENT" { let s = Value.newSet(); s["registry"] = .null; return s }
         throw EngineError("unreadable scheduled task registry \(file)")
     }
     if !data.truthy || !data.isObjectLike || data.isArray { throw EngineError("invalid scheduled task registry \(file)") }
-    if !data["scheduledTasks"].isUndefined && !data["scheduledTasks"].isArray { throw EngineError("invalid scheduled task registry \(file)") }
+    let registry = TaskRegistryFile(data)
+    if !registry.scheduledTasks.isUndefined && !registry.scheduledTasks.isArray { throw EngineError("invalid scheduled task registry \(file)") }
     if TASK_STATE_KEYS.contains(where: { key in !data[key].isUndefined && (!data[key].truthy || !data[key].isObjectLike || data[key].isArray) }) {
         throw EngineError("invalid scheduled task state \(file)")
     }
-    let tasks = data["scheduledTasks"] ?? Value.newArray()
-    if tasks.elements.contains(where: { task in
-        !task.truthy || !task.isObjectLike || task.isArray || !task["id"].isString || !task["id"].truthy ||
-            (!task["notifySessionId"].isUndefined && !task["notifySessionId"].isNull && !LOCAL_RECORD.test(task["notifySessionId"].description))
+    let tasks = registry.scheduledTasks ?? Value.newArray()
+    if tasks.elements.contains(where: { raw in
+        let task = ScheduledTask(raw)
+        return !raw.truthy || !raw.isObjectLike || raw.isArray || !task.id.isString || !task.id.truthy ||
+            (!task.notifySessionId.isUndefined && !task.notifySessionId.isNull && !LOCAL_RECORD.test(task.notifySessionId.description))
     }) { throw EngineError("invalid scheduled task registry \(file)") }
-    if Set(tasks.elements.map { $0["id"].description }).count != tasks.length { throw EngineError("scheduled task id collision in \(file)") }
-    let s = Value.newSet(tasks.elements.map { $0["notifySessionId"] }.filter(\.truthy))
+    if Set(tasks.elements.map { ScheduledTask($0).id.description }).count != tasks.length { throw EngineError("scheduled task id collision in \(file)") }
+    let s = Value.newSet(tasks.elements.map { ScheduledTask($0).notifySessionId }.filter(\.truthy))
     s["registry"] = data
     return s
 }
@@ -388,22 +396,23 @@ func taskStateConflict(_ source: Value = .undefined, _ target: Value = .undefine
 
 func sortedTasks(_ tasks: Value = .undefined) throws -> Value {
     guard tasks.isArray else { throw EngineError.type("Cannot read properties of \(tasks.nullish ? tasks.description : "object") (reading 'toSorted')") }
-    return Value(stable(stableSorted(tasks.elements) { a, b in Double(localeCompare(a["id"].description, b["id"].description)) }.value))
+    return Value(stable(stableSorted(tasks.elements) { a, b in Double(localeCompare(ScheduledTask(a).id.description, ScheduledTask(b).id.description)) }.value))
 }
 
 func staleTaskProblem(_ source: Value = .undefined, _ twin: Value = .undefined, _ registry: Value = .undefined, _ records: Value = .undefined, _ unreadable: Value = .undefined) throws -> Value {
     let ignored = ["enabled", "lastRunAt", "lastScheduledFor", "notifySessionId"]
     let keys = defaultSorted(unique(source.ownKeys + twin.ownKeys))
     if let different = keys.first(where: { !ignored.contains($0) && stable(source[$0]) != stable(twin[$0]) }) { return Value("destination task differs: \(different)") }
-    if twin["enabled"] !== false { return "destination task enabled" }
+    let task = ScheduledTask(twin)
+    if task.enabled !== false { return "destination task enabled" }
     if unreadable.truthy { return "destination task records unreadable" }
-    if twin["notifySessionId"].truthy && records.elements.contains(where: { $0["sessionId"] === twin["notifySessionId"] }) { return "destination task notification record exists" }
-    if records.elements.contains(where: { record in
-        record["scheduledTaskId"] === twin["id"] ||
-            (record["notifySessionId"].truthy && Value([source["notifySessionId"], twin["notifySessionId"]]).includes(record["notifySessionId"]))
+    if task.notifySessionId.truthy && records.elements.contains(where: { DesktopRecord($0).sessionId === task.notifySessionId }) { return "destination task notification record exists" }
+    if records.elements.map(DesktopRecord.init).contains(where: { record in
+        record.scheduledTaskId === task.id ||
+            (record.notifySessionId.truthy && Value([ScheduledTask(source).notifySessionId, task.notifySessionId]).includes(record.notifySessionId))
     }) { return "destination task record dependency" }
     for key in TASK_STATE_KEYS {
-        let id = twin["id"].description
+        let id = task.id.description
         if (registry["target"][key] ?? Value.newObject()).hasOwn(id) &&
             (!(registry["source"][key] ?? Value.newObject()).hasOwn(id) || stable(registry["target"][key][id]) != stable(registry["source"][key][id])) {
             return Value("destination task state differs: \(key)")
@@ -414,14 +423,15 @@ func staleTaskProblem(_ source: Value = .undefined, _ twin: Value = .undefined, 
 
 func taskRegistrationKind(_ family: Value = .undefined, _ registry: Value = .undefined, _ target: Value = .undefined, _ sourcePresent: Value = .undefined) throws -> Value {
     let sourcePresent = sourcePresent.isUndefined ? Value(false) : sourcePresent
-    let tasks = registry["scheduledTasks"] ?? Value.newArray()
-    let owned = tasks.elements.filter { family["ids"].includes($0["id"]) }.value
-    let twin = try target.truthy && family["replaced"]["length"].truthy &&
-        sortedTasks(owned) === sortedTasks(family["replaced"].elements.map { $0["task"] }.value)
-    if try twin && (sourcePresent.truthy || stable(taskState(registry, family["ids"])) != stable(family["state"])) { return "twin" }
-    if try owned.length > 0 && sortedTasks(owned) === sortedTasks(family["tasks"]) { return "published" }
+    let family = TaskFamily(family)
+    let tasks = TaskRegistryFile(registry).scheduledTasks ?? Value.newArray()
+    let owned = tasks.elements.filter { family.ids.includes(ScheduledTask($0).id) }.value
+    let twin = try target.truthy && family.replaced["length"].truthy &&
+        sortedTasks(owned) === sortedTasks(family.replaced.elements.map { ReplacedTask($0).task }.value)
+    if try twin && (sourcePresent.truthy || stable(taskState(registry, family.ids)) != stable(family.state)) { return "twin" }
+    if try owned.length > 0 && sortedTasks(owned) === sortedTasks(family.tasks) { return "published" }
     if twin { return "twin" }
-    if owned.length == 0 && !(target.truthy && family["replaced"]["length"].truthy) { return "absent" }
+    if owned.length == 0 && !(target.truthy && family.replaced["length"].truthy) { return "absent" }
     throw EngineError("scheduled task registrations changed")
 }
 
@@ -435,9 +445,9 @@ func schedulerBusy(_ paths: DataLayout, _ namespaces: Value = .undefined, _ tabl
 
 func coldBlocked(_ record: Value = .undefined, _ owners: Value = .undefined) throws -> Value {
     Value(owners.elements.contains { owner in
-        let tasks = Account(owner).taskRegistry
-        return tasks.notifies(record["sessionId"]) || tasks.tasks.elements.contains { $0["id"] === record["scheduledTaskId"] } ||
-            TASK_STATE_KEYS.contains { tasks.state($0).hasOwn(record["scheduledTaskId"].description) }
+        let tasks = Account(owner).taskRegistry, record = DesktopRecord(record)
+        return tasks.notifies(record.sessionId) || tasks.tasks.elements.contains { ScheduledTask($0).id === record.scheduledTaskId } ||
+            TASK_STATE_KEYS.contains { tasks.state($0).hasOwn(record.scheduledTaskId.description) }
     })
 }
 
@@ -454,25 +464,25 @@ func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found:
             graph[a]!.add(b)
             graph[b]!.add(a)
         }
-        for task in tasks.elements {
-            seeds.add("task:\(task["id"])")
-            connect("task:\(task["id"])", task["notifySessionId"].truthy ? "record:\(task["notifySessionId"])" : "task:\(task["id"])")
+        for task in tasks.elements.map(ScheduledTask.init) {
+            seeds.add("task:\(task.id)")
+            connect("task:\(task.id)", task.notifySessionId.truthy ? "record:\(task.notifySessionId)" : "task:\(task.id)")
         }
         // Returns the `&&` chain's value, which is stored on `row.coldRun`.
         func coldRun(_ row: Value) throws -> Value {
-            let deleted = row["deletedTask"]
+            let deleted = MoveSource(row).deletedTask
             if !deleted.truthy { return deleted }
-            let record = row["record"]
-            return Value(try record["isArchived"] === true && !record["notifySessionId"].truthy && !record["forkedFromSessionId"].truthy &&
-                !recordRows.elements.contains { other in Value([other["record"]["forkedFromSessionId"], other["record"]["notifySessionId"]]).includes(record["sessionId"]) } &&
-                !coldBlocked(record, [account, to]).truthy)
+            let record = DesktopSession(row).record
+            return Value(try record.isArchived && !record.notifySessionId.truthy && !record.forkedFromSessionId.truthy &&
+                !recordRows.elements.map(DesktopSession.init).contains { other in Value([other.record.forkedFromSessionId, other.record.notifySessionId]).includes(record.sessionId) } &&
+                !coldBlocked(record.raw, [account, to]).truthy)
         }
-        for row in found.elements where try sameAccount(row["account"], account).truthy { row["coldRun"] = try coldRun(row) }
+        for row in found.elements.map(MoveSource.init) where try sameAccount(row.account.raw, account).truthy { row.coldRun = try coldRun(row.raw) }
         for row in recordRows.elements {
-            let record = row["record"], key = "record:\(record["sessionId"])"
-            if try record["scheduledTaskId"].truthy && !coldRun(row).truthy { seeds.add(key); connect(key, "task:\(record["scheduledTaskId"])") }
-            if record["notifySessionId"].truthy { seeds.add(key); connect(key, "record:\(record["notifySessionId"])") }
-            if record["forkedFromSessionId"].truthy { connect(key, "record:\(record["forkedFromSessionId"])") }
+            let record = DesktopSession(row).record, key = "record:\(record.sessionId)"
+            if try record.scheduledTaskId.truthy && !coldRun(row).truthy { seeds.add(key); connect(key, "task:\(record.scheduledTaskId)") }
+            if record.notifySessionId.truthy { seeds.add(key); connect(key, "record:\(record.notifySessionId)") }
+            if record.forkedFromSessionId.truthy { connect(key, "record:\(record.forkedFromSessionId)") }
         }
         var visited = Set<String>()
         for seed in seeds.items {
@@ -488,42 +498,43 @@ func taskFamilies(_ from: Value = .undefined, _ to: Value = .undefined, _ found:
             let ids = keys.items.filter { $0.hasPrefix("task:") }.map { sliceString($0, 5) }
             let recordIds = keys.items.filter { $0.hasPrefix("record:") }.map { sliceString($0, 7) }
             let idsValue = ids.value, recordIdsValue = recordIds.value
-            let members = try found.elements.filter { row in try sameAccount(row["account"], account).truthy && recordIdsValue.includes(row["record"]["sessionId"]) }
+            let members = try found.elements.map(MoveSource.init).filter { row in try sameAccount(row.account.raw, account).truthy && recordIdsValue.includes(DesktopRecord(row.record).sessionId) }
             if members.isEmpty { continue }
-            let routes: [Value] = tasks.elements.filter { idsValue.includes($0["id"]) }.map { [$0["id"], $0["notifySessionId"] ?? .null] }
+            let routes: [Value] = tasks.elements.map(ScheduledTask.init).filter { idsValue.includes($0.id) }.map { [$0.id, $0.notifySessionId ?? .null] }
+            let source = Account(account), target = Account(to)
             let family: Value = [
-                "key": Value("\(account["account"])/\(account["org"])/\(seed)"), "from": try accountRef(account), "to": try accountRef(to),
-                "sourceFile": account["taskFile"], "targetFile": to["taskFile"], "ids": idsValue, "recordIds": recordIdsValue,
-                "files": members.map { $0["file"] }.value, "links": try members.map { try taskLinks($0["record"]) }.value, "routes": routes.value,
+                "key": Value("\(source.accountId)/\(source.orgId)/\(seed)"), "from": try accountRef(account), "to": try accountRef(to),
+                "sourceFile": source.taskFile, "targetFile": target.taskFile, "ids": idsValue, "recordIds": recordIdsValue,
+                "files": members.map(\.file).value, "links": try members.map { try taskLinks($0.record) }.value, "routes": routes.value,
             ]
             let historical = routes.isEmpty &&
-                members.allSatisfy { $0["record"]["isArchived"] === true && $0["record"]["scheduledTaskId"].truthy && !$0["record"]["notifySessionId"].truthy } &&
+                members.allSatisfy { let record = DesktopRecord($0.record); return record.isArchived && record.scheduledTaskId.truthy && !record.notifySessionId.truthy } &&
                 TASK_STATE_KEYS.allSatisfy { key in
                     ids.allSatisfy { id in
                         !Account(account).taskRegistry.state(key).hasOwn(id) && !Account(to).taskRegistry.state(key).hasOwn(id)
                     }
                 }
             let targetTasks = Account(to).taskRegistry.tasks
-            let twins = targetTasks.elements.filter { idsValue.includes($0["id"]) }
+            let twins = targetTasks.elements.filter { idsValue.includes(ScheduledTask($0).id) }
             let twinProblems: [Value] = try twins.map { twin in
-                guard let source = tasks.elements.first(where: { $0["id"] === twin["id"] }) else { return "target scheduled task collision" }
+                guard let source = tasks.elements.first(where: { ScheduledTask($0).id === ScheduledTask(twin).id }) else { return "target scheduled task collision" }
                 let registry: Value = ["source": Account(account).taskRegistry.data, "target": Account(to).taskRegistry.data]
-                return try staleTaskProblem(source, twin, registry, Account(to).allSessions.elements.map { $0["record"] }.value, to["unreadable"]["length"])
+                return try staleTaskProblem(source, twin, registry, Account(to).allSessions.elements.map { DesktopSession($0).record.raw }.value, to["unreadable"]["length"])
             }
             let twinProblem = twinProblems.first(where: \.truthy) ?? .undefined
-            family["error"] = try account["taskError"] ?? to["taskError"] ?? (
+            TaskFamily(family).error = try source.taskError ?? target.taskError ?? (
                 account["unreadable"].length > 0 ? "unreadable scheduled task family member" :
-                    (!historical && ids.contains { id in !tasks.elements.contains { $0["id"] === Value(id) } }) || recordIds.count != members.count ? "scheduled task family member missing" :
+                    (!historical && ids.contains { id in !tasks.elements.contains { ScheduledTask($0).id === Value(id) } }) || recordIds.count != members.count ? "scheduled task family member missing" :
                     twinProblem ?? (
-                        targetTasks.elements.contains { !idsValue.includes($0["id"]) && recordIdsValue.includes($0["notifySessionId"]) } ? "target scheduled task collision" :
+                        targetTasks.elements.map(ScheduledTask.init).contains { !idsValue.includes($0.id) && recordIdsValue.includes($0.notifySessionId) } ? "target scheduled task collision" :
                             taskStateConflict(taskState(Account(account).taskRegistry.data, idsValue), taskState(Account(to).taskRegistry.data, idsValue)).truthy
                             ? "target scheduled task state collision" : .null))
-            for row in members { Value.assign(row, ["taskFamily": family, "coldRun": false]) }
+            for row in members { Value.assign(row.raw, ["taskFamily": family, "coldRun": false]) }
             families.append(family)
         }
     }
-    for family in families where families.contains(where: { other in other !== family && other["ids"].elements.contains { family["ids"].includes($0) } }) {
-        family["error"] = "source scheduled task id collision"
+    for family in families where families.contains(where: { other in other !== family && TaskFamily(other).ids.elements.contains { TaskFamily(family).ids.includes($0) } }) {
+        TaskFamily(family).error = "source scheduled task id collision"
     }
     return families.value
 }
@@ -710,9 +721,10 @@ func idbValue(_ blob: Data) throws -> Value {
 }
 
 func orgLabel(_ o: Value = .undefined) throws -> Value {
-    let caps = o["capabilities"] ?? Value.newArray()
+    let org = ClaudeOrganization(o)
+    let caps = org.capabilities ?? Value.newArray()
     guard caps.isArray || caps.isString else { throw EngineError.type("(o.capabilities ?? []).includes is not a function") }
-    return o["raven_type"].truthy || caps.includes("raven") ? Value("\(o["name"]) Team") : caps.includes("chat") ? "Personal" : o["name"]
+    return org.ravenType.truthy || caps.includes("raven") ? Value("\(org.name) Team") : caps.includes("chat") ? "Personal" : org.name
 }
 
 // The signed-in Desktop account's profile lives only in claude.ai's persisted query cache.
@@ -721,10 +733,11 @@ func desktopProfiles(_ dir: Value = .undefined) throws -> Value {
     let orgs = Value.newMap()
     func visit(_ v: Value, _ depth: Int = 0) throws {
         if !v.truthy || !v.isObjectLike || depth > 12 { return }
-        if UUID.test((v["uuid"] ?? "").description) && v["email_address"].isString && v["memberships"].isArray {
-            emails.put(v["uuid"], v["email_address"])
-            for m in v["memberships"].elements where UUID.test((m["organization"]["uuid"] ?? "").description) && m["organization"]["name"].truthy {
-                orgs.put(m["organization"]["uuid"], try orgLabel(m["organization"]))
+        let profile = ClaudeProfile(v)
+        if UUID.test((profile.uuid ?? "").description) && profile.emailAddress.isString && profile.memberships.isArray {
+            emails.put(profile.uuid, profile.emailAddress)
+            for m in profile.memberships.elements.map(ClaudeMembership.init) where UUID.test((m.organization.uuid ?? "").description) && m.organization.name.truthy {
+                orgs.put(m.organization.uuid, try orgLabel(m.organization.raw))
             }
             return
         }
@@ -749,14 +762,14 @@ func logins(_ paths: DataLayout) throws -> Value {
     let orgs = Value.newMap()
     let pairs = Value.newMap()
     func take(_ file: String) throws {
-        let a = try member((try? readJson(Value(file))) ?? Value.newObject(), "oauthAccount")
-        if a["accountUuid"].truthy && a["emailAddress"].truthy { emails.put(a["accountUuid"], a["emailAddress"]) }
-        if a["organizationUuid"].truthy && a["organizationName"].truthy {
-            let type = a["organizationType"]
-            orgs.put(a["organizationUuid"], type.truthy && !re("team|enterprise").test(type.description) ? "Personal" : a["organizationName"])
+        let a = OAuthAccount(try member((try? readJson(Value(file))) ?? Value.newObject(), "oauthAccount"))
+        if a.accountUuid.truthy && a.emailAddress.truthy { emails.put(a.accountUuid, a.emailAddress) }
+        if a.organizationUuid.truthy && a.organizationName.truthy {
+            let type = a.organizationType
+            orgs.put(a.organizationUuid, type.truthy && !re("team|enterprise").test(type.description) ? "Personal" : a.organizationName)
         }
-        if UUID.test((a["accountUuid"] ?? "").description) && UUID.test((a["organizationUuid"] ?? "").description) {
-            pairs.put(Value("\(a["accountUuid"])/\(a["organizationUuid"])"), ["account": a["accountUuid"], "org": a["organizationUuid"]])
+        if UUID.test((a.accountUuid ?? "").description) && UUID.test((a.organizationUuid ?? "").description) {
+            pairs.put(Value("\(a.accountUuid)/\(a.organizationUuid)"), ["account": a.accountUuid, "org": a.organizationUuid])
         }
     }
     let home = paths.home
@@ -769,21 +782,21 @@ func logins(_ paths: DataLayout) throws -> Value {
     try take(paths.login)
     // Desktop only caches the signed-in account, so remember every one seen for later runs.
     let remembered = (try? readJson(Value(paths.labels))) ?? Value.newObject()
-    let seen = try desktopProfiles(Value(paths.webCache))
-    let rememberedEmails = try member(remembered, "emails"), rememberedOrgs = remembered["orgs"]
+    let seen = LoginLabels(try desktopProfiles(Value(paths.webCache)))
+    let rememberedEmails = try member(remembered, "emails"), rememberedOrgs = LoginLabels(remembered).orgs
     // Live login files and Desktop's profile override what earlier runs remembered.
     let entries = { (map: Value) in Value.fromEntries(map.asMap!.entries.map { ($0.0.description, $0.1) }) }
-    let saved: Value = [
-        "emails": Value.spread(rememberedEmails, entries(emails), entries(seen["emails"])),
-        "orgs": Value.spread(rememberedOrgs, entries(orgs), entries(seen["orgs"])),
-    ]
+    let saved = LoginLabels([
+        "emails": Value.spread(rememberedEmails, entries(emails), entries(seen.emails)),
+        "orgs": Value.spread(rememberedOrgs, entries(orgs), entries(seen.orgs)),
+    ])
     let previous: Value = ["emails": rememberedEmails ?? Value.newObject(), "orgs": rememberedOrgs ?? Value.newObject()]
-    for (account, email) in saved["emails"].ownEntries where UUID.test(account) { emails.put(Value(account), email) }
-    for (org, name) in saved["orgs"].ownEntries where UUID.test(org) { orgs.put(Value(org), name) }
-    for row in try records(Value(paths.agentSessions)).elements {
-        let account = row["account"], org = row["org"]
+    for (account, email) in saved.emails.ownEntries where UUID.test(account) { emails.put(Value(account), email) }
+    for (org, name) in saved.orgs.ownEntries where UUID.test(org) { orgs.put(Value(org), name) }
+    for row in try records(Value(paths.agentSessions)).elements.map(RecordFolder.init) {
+        let account = row.accountId, org = row.orgId
         if UUID.test(account.description) && UUID.test(org.description) { pairs.put(Value("\(account)/\(org)"), ["account": account, "org": org]) }
-        for file in row["files"].elements {
+        for file in row.files.elements {
             if emails.has(account) { break }
             let r = (try? readJson(file)) ?? Value.newObject()
             if try member(r, "emailAddress").truthy { emails.put(account, r["emailAddress"]) }
@@ -816,14 +829,14 @@ func logins(_ paths: DataLayout) throws -> Value {
     }
     // Login files, agent records and receipts come and go, so keep any name they taught us.
     for (name, learned) in [("emails", emails), ("orgs", orgs)] {
-        let kept = saved[name].asObject!
+        let kept = saved.raw[name].asObject!
         for (key, label) in learned.asMap!.entries where UUID.test(key.description) && !kept.has(key.description) { kept[key.description] = label }
     }
-    if JSON.text(saved) != JSON.text(previous) {
+    if JSON.text(saved.raw) != JSON.text(previous) {
         let labels = paths.labels
         let tmp = "\(labels).\(process.pid).tmp"
         do {
-            try fs.write(tmp, JSON.text(saved, space: 2) + "\n")
+            try fs.write(tmp, JSON.text(saved.raw, space: 2) + "\n")
             try fs.rename(tmp, labels)
         } catch { try? fs.unlink(tmp) }
     }
@@ -851,9 +864,9 @@ func mode(_ values: Value = .undefined) throws -> Value {
 
 func desktopLaunch(_ paths: DataLayout, _ table: Value = .undefined) throws -> Value {
     let app = path.join(paths.claudeApp, "Contents/MacOS/Claude")
-    let apps = processRows(table).filter { $0.isDesktop || $0.executable == app }.map(\.raw)
-    let started = apps.count == 1 ? dateParse(apps[0]["started"].description) : .nan
-    return started.isFinite && started <= dateNow() ? ["pid": apps[0]["pid"], "started": Value(started)] : .null
+    let apps = processRows(table).filter { $0.isDesktop || $0.executable == app }
+    let started = apps.count == 1 ? dateParse(apps[0].started.description) : .nan
+    return started.isFinite && started <= dateNow() ? ["pid": apps[0].raw["pid"], "started": Value(started)] : .null
 }
 
 public func idleTimeouts(_ paths: Value = .undefined, _ table: Value = .undefined) throws -> Value { try idleTimeouts(DataLayout(paths), table) }
@@ -878,7 +891,7 @@ func idleTimeouts(_ paths: DataLayout, _ table: Value = .undefined) throws -> Va
             guard let record = recordPattern.match(line)?[1]?.lowercased() else { continue }
             let entry = entryPattern.match(line)
             let time = entry != nil ? dateParse(entry![1]!.replacingOccurrences(of: " ", with: "T", options: [], range: entry![1]!.range(of: " "))) : .nan
-            if time.isFinite && time < launch["started"].asNumber! { continue }
+            if time.isFinite && time < DesktopLaunch(launch).started.asNumber! { continue }
             let seconds: Value
             if let entry, index < rows.count - 1, time <= dateNow(), isSafeInteger(Value(toNumber(Value(entry[2]!)))) { seconds = Value(toNumber(Value(entry[2]!))) } else { seconds = .null }
             let key = Value(record)
@@ -906,7 +919,7 @@ func signedIn(_ paths: DataLayout, _ table: Value = .undefined) throws -> Value 
         }
         let launch = try desktopLaunch(paths, table)
         if !launch.truthy { return unknown() }
-        let started = launch["started"].asNumber!
+        let started = DesktopLaunch(launch).started.asNumber!
         let desktop = (try? readJson(Value(paths.desktop))) ?? Value.newObject()
         let logs = paths.logs
         let logNames: [Value] = try fs.names(logs).filter { re(#"^main(?:[1-9][0-9]*)?\.log$"#).test($0) }.map { Value($0) }
@@ -1046,13 +1059,14 @@ fileprivate final class RefuseRedirects: NSObject, URLSessionTaskDelegate {
 fileprivate final class FetchBox { var data: Data?; var response: URLResponse?; var error: Error? }
 
 fileprivate func nativeCloudFetch(_ request: Value) throws -> Value {
-    guard let url = URL(string: request["url"].description) else { throw EngineError.type("Failed to parse URL from \(request["url"])") }
+    let request = CloudRequest(request)
+    guard let url = URL(string: request.url.description) else { throw EngineError.type("Failed to parse URL from \(request.url)") }
     var req = URLRequest(url: url)
-    req.httpMethod = request["method"].nullish ? "GET" : request["method"].description
+    req.httpMethod = request.method.nullish ? "GET" : request.method.description
     req.httpShouldHandleCookies = false
-    for (k, v) in request["headers"].ownEntries { req.setValue(v.description, forHTTPHeaderField: k) }
-    if case .bytes(let b) = request["body"] { req.httpBody = b.data } else if !request["body"].nullish { req.httpBody = Data(request["body"].description.utf8) }
-    let timeout = request["timeout"].asNumber
+    for (k, v) in request.headers.ownEntries { req.setValue(v.description, forHTTPHeaderField: k) }
+    if case .bytes(let b) = request.body { req.httpBody = b.data } else if !request.body.nullish { req.httpBody = Data(request.body.description.utf8) }
+    let timeout = request.timeout.asNumber
     let config = URLSessionConfiguration.ephemeral
     config.httpCookieStorage = nil
     config.httpShouldSetCookies = false
@@ -1084,15 +1098,16 @@ fileprivate func nativeCloudFetch(_ request: Value) throws -> Value {
 public func cloudClient(_ paths: Value = .undefined, _ expected: Value = .undefined, _ io: Value = .undefined) throws -> Value { try cloudClient(DataLayout(paths), expected, io) }
 func cloudClient(_ paths: DataLayout, _ expected: Value = .undefined, _ io: Value = .undefined) throws -> Value {
     let expected = expected.isUndefined ? Value.null : expected
-    let io = io.isUndefined ? Value.newObject() : io
-    let memory = try io["memory"] ?? operationMemory()
-    let current = try io["active"] ?? signedIn(paths)
-    if current["state"] === "logged-out" { throw EngineError("Claude Desktop is signed out") }
-    if try expected.truthy && current["state"] === "known" && !sameLogin(expected, current).truthy { throw EngineError("sign Claude Desktop into \(try loginLabel(expected))") }
-    let selected = expected.truthy ? expected : (current["state"] === "known" ? current : .null)
-    let cookies = try io["cookies"] ?? desktopCookies(paths)
+    let io = CloudIO(io.isUndefined ? Value.newObject() : io)
+    let memory = try io.memory ?? operationMemory()
+    let current = try io.active ?? signedIn(paths)
+    let login = Identity(current)
+    if login.state === "logged-out" { throw EngineError("Claude Desktop is signed out") }
+    if try expected.truthy && login.isKnown && !sameLogin(expected, current).truthy { throw EngineError("sign Claude Desktop into \(try loginLabel(expected))") }
+    let selected = expected.truthy ? expected : (login.isKnown ? current : .null)
+    let cookies = try io.cookies ?? desktopCookies(paths)
     let cookie = cookies.elements.map { "\($0[0])=\($0[1])" }.joined(separator: "; ")
-    let userAgent = try io["userAgent"] ?? desktopUserAgent(paths)
+    let userAgent = try io.userAgent ?? desktopUserAgent(paths)
     let baseHeaders: Value = [
         "accept": "application/json",
         "cookie": Value(cookie),
@@ -1103,39 +1118,40 @@ func cloudClient(_ paths: DataLayout, _ expected: Value = .undefined, _ io: Valu
         "anthropic-beta": "oauth-2025-04-20",
     ]
     func raw(_ endpoint: String, _ options: Value = .newObject(), _ org: Value = .null) throws -> Value {
-        try memory["check"].call()
-        let headers = Value.spread(baseHeaders, org.truthy ? ["x-organization-uuid": org] : .newObject(), options["headers"] ?? .newObject())
-        let request = Value.spread(options, ["url": Value("https://claude.ai\(endpoint)"), "method": options["method"] ?? "GET", "headers": headers, "redirect": "error"])
-        if options["signal"].nullish { request["timeout"] = 15_000 }
-        let response = try cloudFetch(request)
-        if !response["ok"].truthy {
-            throw makeError("Claude \(endpoint.components(separatedBy: "?")[0]) returned \(response["status"])", code: response["status"] === 401 ? "CLOUD_AUTH_PENDING" : "CLOUD_HTTP_ERROR")
+        let budget = OperationMemory(memory), given = CloudRequest(options)
+        try budget.check.call()
+        let headers = Value.spread(baseHeaders, org.truthy ? ["x-organization-uuid": org] : .newObject(), given.headers ?? .newObject())
+        let request = CloudRequest(Value.spread(options, ["url": Value("https://claude.ai\(endpoint)"), "method": given.method ?? "GET", "headers": headers, "redirect": "error"]))
+        if given.signal.nullish { request.timeout = 15_000 }
+        let response = CloudResponse(try cloudFetch(request.raw))
+        if !response.ok.truthy {
+            throw makeError("Claude \(endpoint.components(separatedBy: "?")[0]) returned \(response.status)", code: response.status === 401 ? "CLOUD_AUTH_PENDING" : "CLOUD_HTTP_ERROR")
         }
         if org.truthy && endpoint.hasPrefix("/v1/code/") {
-            let responseOrg = response["headers"]["anthropic-organization-id"] ?? .null
+            let responseOrg = response.headers["anthropic-organization-id"] ?? .null
             if responseOrg !== org { throw EngineError("Claude Remote Control organization changed") }
         }
-        if response["status"] === 204 { return .null }
+        if response.status === 204 { return .null }
         // The memory budget reads a body as a list of chunks; this transport delivers the whole body as one.
-        let body = response["body"]
-        return try memory["read"].call(Value.spread(response, ["body": body.nullish ? body : [body]]))
+        let body = response.body
+        return try budget.read.call(Value.spread(response.raw, ["body": body.nullish ? body : [body]]))
     }
-    let account = try raw("/api/account")
-    if !UUID.test((account["uuid"] ?? "").description) { throw EngineError("Claude Desktop account could not be verified") }
-    if selected["account"].truthy && account["uuid"] !== selected["account"] {
+    let account = ClaudeProfile(try raw("/api/account")), chosen = Identity(selected)
+    if !UUID.test((account.uuid ?? "").description) { throw EngineError("Claude Desktop account could not be verified") }
+    if chosen.accountId.truthy && account.uuid !== chosen.accountId {
         let mismatch = try expected.truthy && !sameLogin(selected, current).truthy
         throw makeError(mismatch ? "sign Claude Desktop into \(try loginLabel(expected))" : "Claude Desktop login is still updating. Try again in a moment.",
                       code: try sameLogin(selected, current).truthy ? "CLOUD_AUTH_PENDING" : "CLOUD_ACCOUNT_MISMATCH")
     }
     let organizations = try raw("/api/organizations")
-    let preferredOrg = selected["org"] ?? cookies.get("lastActiveOrg")
+    let preferredOrg = chosen.orgId ?? cookies.get("lastActiveOrg")
     let organization = organizations.isArray ? try organizations.elements.first { try member($0, "uuid") === preferredOrg } ?? .undefined : .null
     if !organization.truthy { throw EngineError("Claude Desktop organization could not be verified") }
-    let org = organization["uuid"]
+    let org = ClaudeOrganization(organization).uuid
     func request(_ endpoint: String, _ options: Value = .newObject()) throws -> Value { try raw(endpoint, options, org) }
     func session(_ id: Value) throws -> Value {
         let body = try request("/v1/code/sessions/\(try wireRemoteId(id))")
-        let value = body["response_shape"] ?? body
+        let value = RemotePage(body).responseShape ?? body
         if !value.truthy || !value.isObjectLike || value.isArray { throw EngineError("Remote Control session response changed") }
         return value
     }
@@ -1147,15 +1163,15 @@ func cloudClient(_ paths: DataLayout, _ expected: Value = .undefined, _ io: Valu
         for _ in 0...2000 {
             var query: [(String, String)] = [("limit", "500"), ("sort_order", "asc")]
             if cursor.truthy { query.append(("cursor", cursor.description)) }
-            let body = try request("/v1/code/sessions/\(try wireRemoteId(id))/events?\(searchParams(query))")
-            if !body["data"].isArray || body["data"].length > 500 { throw EngineError("Remote Control history response changed") }
-            let data = body["data"].elements
+            let body = RemotePage(try request("/v1/code/sessions/\(try wireRemoteId(id))/events?\(searchParams(query))"))
+            if !body.data.isArray || body.data.length > 500 { throw EngineError("Remote Control history response changed") }
+            let data = body.data.elements
             if out.count + data.count > 1_000_000 { throw makeError("Remote Control history exceeded 1,000,000 events", code: "CLOUD_HISTORY_LIMIT") }
             if data.contains(where: { event in
-                !event.truthy || !event.isObjectLike || !event["event_type"].isString || !event["payload"].truthy || !event["payload"].isObjectLike
+                !event.truthy || !event.isObjectLike || !RemoteEventRow(event).eventType.isString || !RemoteEventRow(event).payload.truthy || !RemoteEventRow(event).payload.isObjectLike
             }) { throw EngineError("Remote Control event response changed") }
             for event in data {
-                let n = event["sequence_num"]
+                let n = RemoteEventRow(event).sequenceNum
                 let sequence: String? = n.isNumber && isSafeInteger(n) && n.asNumber! >= 0 ? String(Int64(n.asNumber!))
                     : n.isString && re(#"^[0-9]+$"#).test(n.asString!) ? n.asString! : nil
                 guard let sequence else { throw EngineError("Remote Control event sequence changed") }
@@ -1164,7 +1180,7 @@ func cloudClient(_ paths: DataLayout, _ expected: Value = .undefined, _ io: Valu
             }
             out.append(contentsOf: data)
             if data.count < 500 { return out.value }
-            cursor = body["resume_cursor"]
+            cursor = body.resumeCursor
             if !cursor.truthy || seen.has(cursor) { throw EngineError("Remote Control history cursor did not advance") }
             seen.add(cursor)
         }
@@ -1173,14 +1189,14 @@ func cloudClient(_ paths: DataLayout, _ expected: Value = .undefined, _ io: Valu
     let post: Value = ["method": "POST", "headers": ["content-type": "application/json"], "body": "{}"]
     return [
         "memory": memory,
-        "account": account["uuid"],
+        "account": account.uuid,
         "org": org,
         "list": Value { _ in
             let query = searchParams([("statuses", "active"), ("limit", "100"), ("statuses", "paused")])
-            let body = try request("/v1/code/sessions?\(query)")
-            if !body["data"].isArray { throw EngineError("Remote Control session list response changed") }
-            if body["data"].length >= 100 { throw EngineError("Remote Control session list reached its safety limit") }
-            return body["data"]
+            let body = RemotePage(try request("/v1/code/sessions?\(query)"))
+            if !body.data.isArray { throw EngineError("Remote Control session list response changed") }
+            if body.data.length >= 100 { throw EngineError("Remote Control session list reached its safety limit") }
+            return body.data
         },
         "eventRows": Value { args in try eventRows(args.first ?? .undefined) },
         "session": Value { args in try session(args.first ?? .undefined) },
@@ -1192,7 +1208,8 @@ func cloudClient(_ paths: DataLayout, _ expected: Value = .undefined, _ io: Valu
 // MARK: - Accounts
 
 func priorSessions(_ record: Value = .undefined) throws -> Value {
-    record["priorCliSessionIds"].isArray ? record["priorCliSessionIds"] : .newArray()
+    let prior = DesktopRecord(record).priorCliSessionIds
+    return prior.isArray ? prior : .newArray()
 }
 
 func desktopSession(_ file: Value = .undefined, _ record: Value = .undefined) throws -> Value { DesktopSession(file: file, record: record).raw }
@@ -1200,19 +1217,20 @@ func desktopSession(_ file: Value = .undefined, _ record: Value = .undefined) th
 public func accounts(_ paths: Value = .undefined, _ processes: Value = .undefined) throws -> Value { try accounts(DataLayout(paths), processes) }
 func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Value {
     let processes = processes.isUndefined ? Value.null : processes
-    let found = try logins(paths)
-    let emails = found["emails"], orgs = found["orgs"], pairs = found["pairs"]
-    let cur = try signedIn(paths, processes)
+    let found = LoginLabels(try logins(paths))
+    let emails = found.emails, orgs = found.orgs, pairs = found.pairs
+    let cur = try signedIn(paths, processes), login = Identity(cur)
     var out: [Account] = []
     let stored = try records(Value(paths.records))
     let known: [Value] = pairs.asMap!.values.filter { pair in !stored.elements.contains { AccountPair($0).same(AccountPair(pair)) } }.map { pair in
-        ["account": pair["account"], "org": pair["org"], "dir": Value(path.join(paths.records, pair["account"].description, pair["org"].description)), "files": .newArray()]
+        let pair = AccountPair(pair)
+        return ["account": pair.accountId, "org": pair.orgId, "dir": Value(path.join(paths.records, pair.accountId.description, pair.orgId.description)), "files": .newArray()]
     }
-    for row in stored.elements + known {
-        let account = row["account"], org = row["org"], dir = row["dir"]
+    for row in (stored.elements + known).map(RecordFolder.init) {
+        let account = row.accountId, org = row.orgId, dir = row.dir
         var sessions: [DesktopSession] = []
         var unreadable: [Value] = []
-        for file in row["files"].elements {
+        for file in row.files.elements {
             let r = (try? readJson(file)) ?? .null
             if !r.truthy { unreadable.append(file); continue }
             sessions.append(DesktopSession(file: file, record: r))
@@ -1223,7 +1241,7 @@ func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Va
         let taskFile = Value(path.join(dir.description, "scheduled-tasks.json"))
         var scheduled = Value.newSet()
         var taskError: Value = .null
-        do { scheduled = try taskSessions(taskFile) } catch { taskError = errorObject(error)["message"] }
+        do { scheduled = try taskSessions(taskFile) } catch { taskError = ThrownError(error).message }
         let label = "\(email.nullish ? Value(short(account)) : email) · \(orgName.nullish ? Value(short(org)) : orgName)"
         var base = "0 | -"
         if !sessions.isEmpty {
@@ -1239,31 +1257,31 @@ func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Va
             "account": account, "org": org, "dir": dir, "email": email, "orgName": orgName, "sessions": sessionsValue, "allSessions": sessionsValue,
             "unreadable": unreadable.value, "taskFile": taskFile, "taskSessions": scheduled, "taskError": taskError, "activeAt": Value(activeAt),
             "focusedAt": Value(nanMax([0] + sessions.map(\.focusedAt))), "label": Value(label), "stats": Value(stats), "active": false,
-            "signedIn": try sameLogin(["account": account], cur), "identityState": cur["state"],
+            "signedIn": try sameLogin(["account": account], cur), "identityState": login.state,
         ]))
     }
     let sessions = out.flatMap(\.sessions)
     var claims: [HashKey: Int] = [:]
     for session in sessions { for id in unique([session.raw["id"]] + (try priorSessions(session.record.raw)).elements) { claims[HashKey(id), default: 0] += 1 } }
-    let parents = ValueSet(sessions.map { $0.record.raw["forkedFromSessionId"] })
+    let parents = ValueSet(sessions.map { $0.record.forkedFromSessionId })
     let tasks: ValueSet? = out.contains { $0.taskError.truthy } ? nil
-        : ValueSet(out.flatMap { $0.taskRegistry.tasks.elements.map { $0["id"] } })
+        : ValueSet(out.flatMap { $0.taskRegistry.tasks.elements.map { ScheduledTask($0).id } })
     for session in sessions {
-        let record = session.record.raw
+        let record = session.record
         Value.assign(session.raw, [
-            "shared": Value((claims[HashKey(session.raw["id"])] ?? 0) > 1 || parents.has(record["sessionId"])),
-            "deletedTask": Value(tasks != nil && record["scheduledTaskId"].isString && !tasks!.has(record["scheduledTaskId"])),
+            "shared": Value((claims[HashKey(session.raw["id"])] ?? 0) > 1 || parents.has(record.sessionId)),
+            "deletedTask": Value(tasks != nil && record.scheduledTaskId.isString && !tasks!.has(record.scheduledTaskId)),
         ])
     }
     // Desktop keeps a folder for every account/org pair it has signed in with, and personal orgs share one name.
     let labels = Dictionary(grouping: out, by: \.label)
     for rows in labels.values where rows.count > 1 { for row in rows { row.label = "\(row.label) · \(short(row.orgId))" } }
-    if let chosen = out.first(where: { $0.accountId === cur["account"] && $0.orgId === cur["org"] }) {
+    if let chosen = out.first(where: { $0.accountId === login.accountId && $0.orgId === login.orgId }) {
         chosen.active = true
         chosen.stats = "\(chosen.stats) | active"
     }
     return stableSorted(out.map(\.raw)) { a, b in
-        let d = toNumber(b["activeAt"]) - toNumber(a["activeAt"])
+        let d = Account(b).activeAt - Account(a).activeAt
         return d.isNaN ? 0 : d
     }.value
 }
@@ -1279,7 +1297,7 @@ func holdsNothing(_ dir: String) -> Bool {
     for name in names {
         if desktopBookkeeping.contains(name) || name.hasPrefix("deleted_") { continue }
         guard name == "scheduled-tasks.json", let registry = try? fs.readJSON(path.join(dir, name)),
-              case .array(let tasks) = registry["scheduledTasks"], tasks.items.isEmpty else { return false }
+              case .array(let tasks) = TaskRegistryFile(registry).scheduledTasks, tasks.items.isEmpty else { return false }
     }
     return true
 }
@@ -1310,7 +1328,7 @@ func tidy(_ paths: DataLayout, _ pair: Value = .null) throws -> Value {
     let dest = path.join(paths.state, "leftovers", stamp())
     var rows = try leftovers(paths, all.map(\.raw).value).elements.map(Account.init)
     if pair.truthy {
-        guard let row = all.first(where: { $0.accountId === pair["account"] && $0.orgId === pair["org"] }) else { throw EngineError("No such account", code: "NO_ACCOUNT") }
+        guard let row = all.first(where: { $0.same(AccountPair(pair)) }) else { throw EngineError("No such account", code: "NO_ACCOUNT") }
         if row.active { throw EngineError("Claude is signed in to \(row.label)", code: "ACCOUNT_ACTIVE") }
         if !row.isEmpty { throw EngineError("\(row.label) still holds sessions", code: "ACCOUNT_NOT_EMPTY") }
         let dirs = [paths.records, paths.agentSessions].map { path.join($0, row.accountId.description, row.orgId.description) }
