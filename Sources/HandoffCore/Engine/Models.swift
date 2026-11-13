@@ -147,7 +147,10 @@ struct MoveSource: RecordHolder {
     var isComparable: Bool { raw["comparable"].truthy }
     // The only record for its history, so it can move even when the history cannot be compared.
     var isSole: Bool { raw["sole"].truthy }
-    var coldRun: Value { raw["coldRun"] }
+    var coldRun: Value {
+        get { raw["coldRun"] }
+        nonmutating set { raw["coldRun"] = newValue }
+    }
     var taskOwned: Bool { raw["taskOwned"].truthy }
     var hasWorker: Bool { raw["worker"].truthy }
     // Every copy in this row's group, or the row alone when it is not grouped.
