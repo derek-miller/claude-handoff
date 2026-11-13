@@ -113,8 +113,9 @@ public func scan(_ file: Value = .undefined) throws -> Value {
         let e: Value
         do { e = try JSON.parse(text) } catch { invalid += 1; continue }
         if !(try message(e)).truthy { continue }
-        ids.append(e["uuid"])
-        if e["forkedFrom"]["messageUuid"].isString { forked.set(e["uuid"], e["forkedFrom"]) }
+        let entry = TranscriptEntry(e)
+        ids.append(entry.uuid)
+        if entry.forkedFrom.messageUuid.isString { forked.set(entry.uuid, entry.forkedFrom.raw) }
     }
     return ["file": file, "sha": Value(sha(raw)), "ids": ids.value, "forked": .map(forked), "invalid": Value(invalid)]
 }
@@ -149,46 +150,48 @@ func semanticShape(_ entry: Value = .undefined) throws -> Value {
 
 let OUTPUT_KEYS = ["stdout", "stderr", "fileContent", "fileBase64"]
 func toolOutput(_ entry: Value = .undefined) throws -> Value {
-    let result = entry["toolUseResult"]
-    return ["stdout": result["stdout"], "stderr": result["stderr"], "fileContent": result["file"]["content"], "fileBase64": result["file"]["base64"]]
+    let result = TranscriptEntry(entry).toolUseResult
+    return ["stdout": result.stdout, "stderr": result.stderr, "fileContent": result.file["content"], "fileBase64": result.file["base64"]]
 }
 
 func stripToolOutput(_ entry: Value = .undefined) throws -> Value {
-    let result = entry["toolUseResult"]
-    if result.isPlainObject {
-        result.removeKey("stdout")
-        result.removeKey("stderr")
-        if result["file"]["content"].isString { result["file"].removeKey("content") }
-        if result["file"]["base64"].isString { result["file"].removeKey("base64") }
+    let result = TranscriptEntry(entry).toolUseResult
+    if result.raw.isPlainObject {
+        result.raw.removeKey("stdout")
+        result.raw.removeKey("stderr")
+        if result.file["content"].isString { result.file.removeKey("content") }
+        if result.file["base64"].isString { result.file.removeKey("base64") }
     }
     return entry
 }
 
 func replayShape(_ entry: Value = .undefined) throws -> Value {
-    let copy = try stripToolOutput(withoutList(entry, RUNTIME_KEYS))
-    if copy["type"] === "attachment" && copy["attachment"]["type"] === "edited_text_file" { copy["attachment"].removeKey("displayPath") }
-    return Value(stable(copy))
+    let copy = TranscriptEntry(try stripToolOutput(withoutList(entry, RUNTIME_KEYS)))
+    if copy.type === "attachment" && copy.attachment.type === "edited_text_file" { copy.attachment.raw.removeKey("displayPath") }
+    return Value(stable(copy.raw))
 }
 func richness(_ entry: Value = .undefined) throws -> Value {
     Value(try toolOutput(entry).ownEntries.reduce(0) { n, pair in n + (pair.1.asString.map { $0.utf8.count } ?? 0) })
 }
 
 func survivor(_ rows: Value = .undefined, _ ids: Value = .undefined) throws -> Value {
-    if Set(try rows.elements.map { try replayShape($0["entry"]).description }).count != 1 { return .null }
-    if rows.elements.contains(where: { $0["entry"]["parentUuid"].truthy && !ids.has($0["entry"]["parentUuid"]) }) { return .null }
+    let rows = rows.elements.map(TranscriptRow.init)
+    if Set(try rows.map { try replayShape($0.entry.raw).description }).count != 1 { return .null }
+    if rows.contains(where: { $0.entry.parentUuid.truthy && !ids.has($0.entry.parentUuid) }) { return .null }
     let keep = ValueObject()
     for k in OUTPUT_KEYS {
-        let values = ValueSet(try rows.elements.map { try toolOutput($0["entry"])[k] }.filter { ($0.asString?.utf16.count ?? 0) > 0 })
+        let values = ValueSet(try rows.map { try toolOutput($0.entry.raw)[k] }.filter { ($0.asString?.utf16.count ?? 0) > 0 })
         if values.size > 1 { return .null }
         keep[k] = values.values.first ?? ""
     }
-    let ranked = try stableSorted(rows.elements) { a, b in
-        let d = toNumber(try richness(b["entry"])) - toNumber(try richness(a["entry"]))
-        return d != 0 && !d.isNaN ? d : toNumber(a["line"]) - toNumber(b["line"])
-    }
+    let ranked = try stableSorted(rows.map(\.raw)) { a, b in
+        let (a, b) = (TranscriptRow(a), TranscriptRow(b))
+        let d = toNumber(try richness(b.entry.raw)) - toNumber(try richness(a.entry.raw))
+        return d != 0 && !d.isNaN ? d : toNumber(a.line) - toNumber(b.line)
+    }.map(TranscriptRow.init)
     for r in ranked {
-        let output = try toolOutput(r["entry"])
-        if OUTPUT_KEYS.allSatisfy({ !keep[$0].truthy || output[$0] === keep[$0] }) { return r["line"] ?? .null }
+        let output = try toolOutput(r.entry.raw)
+        if OUTPUT_KEYS.allSatisfy({ !keep[$0].truthy || output[$0] === keep[$0] }) { return r.line ?? .null }
     }
     return .null
 }
@@ -208,7 +211,7 @@ func detailIncluded(_ a: Value = .undefined, _ b: Value = .undefined) throws -> 
     Value(a.ownEntries.allSatisfy { b[$0.0] === $0.1 })
 }
 func replayDetails(_ entry: Value = .undefined) throws -> Value {
-    try toolDetails(["toolUseResult": entry["toolUseResult"], "origin": ["producer": entry["origin"]["producer"]]])
+    try toolDetails(["toolUseResult": TranscriptEntry(entry).toolUseResult.raw, "origin": ["producer": entry["origin"]["producer"]]])
 }
 func stripReplayMetadata(_ copy: Value = .undefined) throws -> Value {
     if copy["message"].isPlainObject { copy["message"].removeKey("usage") }
@@ -222,23 +225,26 @@ func omissionShape(_ entry: Value = .undefined, _ metadata: Value = .undefined) 
     let metadata = metadata.isUndefined ? Value(false) : metadata
     let copy = withoutList(entry, RUNTIME_KEYS + ["toolUseResult"])
     if metadata.truthy { _ = try stripReplayMetadata(copy) }
-    if copy["type"] === "attachment" && copy["attachment"]["type"] === "edited_text_file" { copy["attachment"].removeKey("displayPath") }
+    let entry = TranscriptEntry(copy)
+    if entry.type === "attachment" && entry.attachment.type === "edited_text_file" { entry.attachment.raw.removeKey("displayPath") }
     return Value(stable(copy))
 }
 func omissionSurvivor(_ rows: Value = .undefined, _ ids: Value = .undefined, _ metadata: Value = .undefined) throws -> Value {
     let metadata = metadata.isUndefined ? Value(false) : metadata
-    if rows.elements.contains(where: { $0["entry"]["parentUuid"].truthy && !ids.has($0["entry"]["parentUuid"]) }) { return .null }
-    if Set(try rows.elements.map { try omissionShape($0["entry"], metadata).description }).count != 1 { return .null }
-    let candidates: [Value] = try rows.elements.map { row in
-        Value.spread(row, ["detail": metadata.truthy ? try replayDetails(row["entry"]) : try toolDetails(row["entry"]["toolUseResult"]),
-                           "size": Value(JSON.text(row["entry"]).utf8.count)])
+    let rows = rows.elements.map(TranscriptRow.init)
+    if rows.contains(where: { $0.entry.parentUuid.truthy && !ids.has($0.entry.parentUuid) }) { return .null }
+    if Set(try rows.map { try omissionShape($0.entry.raw, metadata).description }).count != 1 { return .null }
+    let candidates: [TranscriptRow] = try rows.map { row in
+        TranscriptRow(Value.spread(row.raw, ["detail": metadata.truthy ? try replayDetails(row.entry.raw) : try toolDetails(row.entry.toolUseResult.raw),
+                                             "size": Value(JSON.text(row.entry.raw).utf8.count)]))
     }
-    let sorted = stableSorted(candidates) { a, b in
-        let d = toNumber(b["size"]) - toNumber(a["size"])
-        return d != 0 ? d : toNumber(a["line"]) - toNumber(b["line"])
-    }
+    let sorted = stableSorted(candidates.map(\.raw)) { a, b in
+        let (a, b) = (TranscriptRow(a), TranscriptRow(b))
+        let d = toNumber(b.size) - toNumber(a.size)
+        return d != 0 ? d : toNumber(a.line) - toNumber(b.line)
+    }.map(TranscriptRow.init)
     for row in sorted {
-        if try candidates.allSatisfy({ try detailIncluded($0["detail"], row["detail"]).truthy }) { return row["line"] ?? .null }
+        if try candidates.allSatisfy({ try detailIncluded($0.detail, row.detail).truthy }) { return row.line ?? .null }
     }
     return .null
 }
@@ -246,8 +252,8 @@ func omissionSurvivor(_ rows: Value = .undefined, _ ids: Value = .undefined, _ m
 public func normalize(_ entries: Value = .undefined, _ omissions: Value = .undefined) throws -> Value {
     let omissions = omissions.isUndefined ? Value(true) : omissions
     let rows: [Value] = try entries.elements.enumerated().map { (line, entry) -> Value in ["entry": entry, "line": Value(line)] }
-        .filter { try typed($0["entry"]).truthy }
-    let groups = groupBy(rows) { $0["entry"]["uuid"] }
+        .filter { try typed(TranscriptRow($0).entry.raw).truthy }
+    let groups = groupBy(rows) { TranscriptRow($0).entry.uuid }
     let ids = Value.set(ValueSet(groups.keys))
     var drop = Set<Int>()
     var replays = 0
@@ -263,7 +269,7 @@ public func normalize(_ entries: Value = .undefined, _ omissions: Value = .undef
         }
         if line.isNull { conflicts += 1; continue }
         replays += 1
-        for r in group.elements where r["line"] !== line { drop.insert(r["line"].asInt!) }
+        for r in group.elements.map(TranscriptRow.init) where r.line !== line { drop.insert(r.line.asInt!) }
     }
     let kept = entries.elements.enumerated().filter { !drop.contains($0.offset) }.map(\.element)
     return ["entries": kept.value, "replays": Value(replays), "conflicts": Value(conflicts)]
@@ -273,40 +279,41 @@ func sessionState(_ entries: Value = .undefined, _ sessionId: Value = .undefined
     let origin = origin.isUndefined ? Value.newMap() : origin
     var replacements: [Value] = []
     var relocated = Value.null
-    for e in entries.elements {
-        if e["type"] === "content-replacement" && e["sessionId"] === sessionId && e["replacements"].isArray {
-            for replacement in e["replacements"].elements {
+    for e in entries.elements.map(TranscriptEntry.init) {
+        if e.type === "content-replacement" && e.sessionId === sessionId && e.replacements.isArray {
+            for replacement in e.replacements.elements {
                 let copy = replacement.deepClone()
                 if copy["uuid"].isString { copy["uuid"] = origin.get(copy["uuid"]) ?? copy["uuid"] }
                 replacements.append(copy)
             }
-        } else if e["type"] === "relocated" && e["sessionId"] === sessionId && e["relocatedCwd"].isString && e["relocatedCwd"].truthy {
-            relocated = e["relocatedCwd"]
+        } else if e.type === "relocated" && e.sessionId === sessionId && e.relocatedCwd.isString && e.relocatedCwd.truthy {
+            relocated = e.relocatedCwd
         }
     }
-    return ["replacements": replacements.value, "suppressed": Value(entries.elements.contains { $0["type"] === "history-suppression" }), "relocated": relocated]
+    return ["replacements": replacements.value, "suppressed": Value(entries.elements.contains { TranscriptEntry($0).type === "history-suppression" }), "relocated": relocated]
 }
 
 public func semantic(_ entries: Value = .undefined, _ sessionId: Value = .undefined, _ invalid: Value = .undefined) throws -> Value {
     let invalid = invalid.isUndefined ? Value(0) : invalid
-    let normalized = try normalize(entries, false)
-    let rows: [Value] = try normalized["entries"].elements.filter { try message($0).truthy }.map { Value(sha(try semanticShape($0).description)) }
-    return Value(sha(stable(["rows": rows.value, "state": try sessionState(entries, sessionId), "invalid": invalid, "conflicts": normalized["conflicts"]])))
+    let normalized = NormalizedTranscript(try normalize(entries, false))
+    let rows: [Value] = try normalized.entries.elements.filter { try message($0).truthy }.map { Value(sha(try semanticShape($0).description)) }
+    return Value(sha(stable(["rows": rows.value, "state": try sessionState(entries, sessionId), "invalid": invalid, "conflicts": normalized.conflicts])))
 }
 
 func scanLineage(_ ctx: Value = .undefined, _ transcript: Value = .undefined) throws -> Value {
-    let forked = ctx["scans"].get(transcript)["forked"] ?? Value.newMap()
-    let lineage = unique(forked.asMap?.values.map { $0["sessionId"] } ?? [])
+    let forked = TranscriptScan(HistoryContext(ctx).scans.get(transcript)).forked ?? Value.newMap()
+    let lineage = unique(forked.asMap?.values.map { ForkPoint($0).sessionId } ?? [])
     return ["forks": Value(forked.length), "lineage": lineage.value]
 }
 
 func scanned(_ id: Value = .undefined, _ ctx: Value = .undefined, _ cwd: Value = .undefined, _ dependencies: Value = .undefined) throws -> Value {
     let cwd = cwd.isUndefined ? Value("") : cwd
-    let file = try locate(ctx["index"], id, cwd)
+    let ctx = HistoryContext(ctx)
+    let file = try locate(ctx.index, id, cwd)
     if !file.truthy { return .null }
     dependencies.add(file)
-    if !ctx["scans"].has(file) { ctx["scans"].put(file, try scan(file)) }
-    return ctx["scans"].get(file)
+    if !ctx.scans.has(file) { ctx.scans.put(file, try scan(file)) }
+    return ctx.scans.get(file)
 }
 
 func sidecars(_ transcript: Value = .undefined, _ id: Value = .undefined, _ cache: Value = .undefined) throws -> Value {
@@ -316,25 +323,25 @@ func sidecars(_ transcript: Value = .undefined, _ id: Value = .undefined, _ cach
 }
 
 func sidecarsAgree(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
-    let files = ValueMap(try a["rows"].elements.map { ($0["rel"], try sidecarIdentity($0)) })
-    return Value(try b["rows"].elements.allSatisfy { row in try !files.has(row["rel"]) || files.get(row["rel"]) === (try sidecarIdentity(row)) })
+    let files = ValueMap(try SidecarTree(a).rows.elements.map { ($0["rel"], try sidecarIdentity($0)) })
+    return Value(try SidecarTree(b).rows.elements.allSatisfy { row in try !files.has(row["rel"]) || files.get(row["rel"]) === (try sidecarIdentity(row)) })
 }
 
 func origins(_ id: Value = .undefined, _ ctx: Value = .undefined, _ cwd: Value = .undefined) throws -> Value {
     let cwd = cwd.isUndefined ? Value("") : cwd
     let out = ValueMap()
     let dependencies = Value.newSet()
-    let own = try scanned(id, ctx, cwd, dependencies)
-    for uuid in ValueSet((own["ids"] ?? Value.newArray()).elements).values {
+    let own = TranscriptScan(try scanned(id, ctx, cwd, dependencies))
+    for uuid in ValueSet((own.ids ?? Value.newArray()).elements).values {
         var cursor = uuid
         var session = own
         let seen = ValueSet()
-        while session.truthy && !seen.has(cursor) {
+        while session.isPresent && !seen.has(cursor) {
             seen.add(cursor)
-            let from = session["forked"].get(cursor)
-            if !from.truthy { break }
-            cursor = from["messageUuid"]
-            session = try scanned(from["sessionId"], ctx, "", dependencies)
+            let from = ForkPoint(session.forked.get(cursor))
+            if !from.isPresent { break }
+            cursor = from.messageUuid
+            session = TranscriptScan(try scanned(from.sessionId, ctx, "", dependencies))
         }
         out.set(uuid, cursor)
     }
@@ -354,7 +361,8 @@ func lineageEvent(_ entry: Value = .undefined) throws -> Value {
 }
 
 func eventIncluded(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
-    Value(try b.truthy && a["base"] === b["base"] && (try detailIncluded(a["detail"], b["detail"])).truthy)
+    let (a, b) = (LineageEvent(a), LineageEvent(b))
+    return Value(try b.raw.truthy && a.base === b.base && (try detailIncluded(a.detail, b.detail)).truthy)
 }
 
 func messageHash(_ type: Value = .undefined, _ value: Value = .undefined) throws -> Value {
@@ -373,10 +381,11 @@ func queuedContent(_ content: Value = .undefined, _ hash: Value = .undefined) th
     return ["hash": hash]
 }
 func queuedContentAgrees(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
+    let (a, b) = (QueuedContent(a), QueuedContent(b))
     // (!a.hash || !b.hash || a.hash === b.hash || a.textHash && a.textHash === b.textHash) && (!a.richHash || !b.richHash || a.richHash === b.richHash)
-    let first: Value = !a["hash"].truthy || !b["hash"].truthy || a["hash"] === b["hash"] ? .bool(true)
-        : and(a["textHash"], Value(a["textHash"] === b["textHash"]))
-    return and(first, Value(!a["richHash"].truthy || !b["richHash"].truthy || a["richHash"] === b["richHash"]))
+    let first: Value = !a.hash.truthy || !b.hash.truthy || a.hash === b.hash ? .bool(true)
+        : and(a.textHash, Value(a.textHash === b.textHash))
+    return and(first, Value(!a.richHash.truthy || !b.richHash.truthy || a.richHash === b.richHash))
 }
 func uniqueBridgeOwners(_ owners: Value = .undefined) throws -> Value {
     ValueMap(owners.elements.map { (Value(stable($0)), $0) }).values.value
@@ -389,68 +398,68 @@ public func conversation(_ entries: Value = .undefined, _ sessionId: Value = .un
     var unidentified = Set<Int>()
     let consumedHashes = ValueSet()
     func identity(_ value: Value) -> Value { (value.asString?.isEmpty == false) ? value : .null }
-    func root(_ start: Value) -> Value {
+    func root(_ start: ConversationNode) -> ConversationNode {
         var found = start
-        while found["parent"].truthy { found = found["parent"] }
+        while found.parent.truthy { found = ConversationNode(found.parent) }
         var node = start
-        while node["parent"].truthy { let next = node["parent"]; node["parent"] = found; node = next }
+        while node.parent.truthy { let next = ConversationNode(node.parent); node.parent = found.raw; node = next }
         return found
     }
-    func merge(_ a: Value, _ b: Value) throws -> Value {
-        if a === b { return a }
-        b["parent"] = a
-        if !a["bad"].truthy {
-            a["bad"] = Value(try b["bad"].truthy || !(try queuedContentAgrees(a, b)).truthy
-                || (a["userHash"].truthy && b["userHash"].truthy && a["userHash"] !== b["userHash"])
-                || (a["consumedHash"].truthy && b["consumedHash"].truthy && a["consumedHash"] !== b["consumedHash"])
-                || (a["command"].truthy && b["command"].truthy && a["command"] !== b["command"])
-                || (a["delivery"].truthy && b["delivery"].truthy && a["delivery"] !== b["delivery"]))
+    func merge(_ a: ConversationNode, _ b: ConversationNode) throws -> ConversationNode {
+        if a.raw === b.raw { return a }
+        b.parent = a.raw
+        if !a.bad.truthy {
+            a.bad = Value(try b.bad.truthy || !(try queuedContentAgrees(a.raw, b.raw)).truthy
+                || (a.userHash.truthy && b.userHash.truthy && a.userHash !== b.userHash)
+                || (a.consumedHash.truthy && b.consumedHash.truthy && a.consumedHash !== b.consumedHash)
+                || (a.command.truthy && b.command.truthy && a.command !== b.command)
+                || (a.delivery.truthy && b.delivery.truthy && a.delivery !== b.delivery))
         }
-        if !a["mixed"].truthy { a["mixed"] = Value(b["mixed"].truthy || (a["hash"].truthy && b["hash"].truthy && a["hash"] !== b["hash"])) }
-        if a["textHash"].nullish { a["textHash"] = b["textHash"] }
-        if a["richHash"].nullish { a["richHash"] = b["richHash"] }
-        if a["userHash"].nullish { a["userHash"] = b["userHash"] }
-        a["userFirst"] = Value(min(toNumber(a["userFirst"]), toNumber(b["userFirst"])))
-        if a["consumedHash"].nullish { a["consumedHash"] = b["consumedHash"] }
-        if a["hash"].nullish { a["hash"] = b["hash"] }
-        if a["command"].nullish { a["command"] = b["command"] }
-        if a["delivery"].nullish { a["delivery"] = b["delivery"] }
-        a["first"] = Value(min(toNumber(a["first"]), toNumber(b["first"])))
+        if !a.mixed.truthy { a.mixed = Value(b.mixed.truthy || (a.hash.truthy && b.hash.truthy && a.hash !== b.hash)) }
+        if a.textHash.nullish { a.textHash = b.textHash }
+        if a.richHash.nullish { a.richHash = b.richHash }
+        if a.userHash.nullish { a.userHash = b.userHash }
+        a.userFirst = Value(min(toNumber(a.userFirst), toNumber(b.userFirst)))
+        if a.consumedHash.nullish { a.consumedHash = b.consumedHash }
+        if a.hash.nullish { a.hash = b.hash }
+        if a.command.nullish { a.command = b.command }
+        if a.delivery.nullish { a.delivery = b.delivery }
+        a.first = Value(min(toNumber(a.first), toNumber(b.first)))
         return a
     }
-    for entry in entries.elements {
+    for entry in entries.elements.map(TranscriptEntry.init) {
         var hash = Value.null, command = Value.null, delivery = Value.null
         var eligible = false, bad = false, consumed = false
         var shape: Value = Value.newObject()
-        let type = entry["type"]
-        if entry.truthy && (type === "user" || type === "assistant") && entry["message"].truthy {
-            hash = try messageHash(type, entry["message"])
+        let type = entry.type
+        if entry.raw.truthy && (type === "user" || type === "assistant") && entry.message.isPresent {
+            hash = try messageHash(type, entry.message.raw)
             eligible = true
             if type === "user" {
-                command = identity(entry["commandUuid"]) ?? identity(entry["uuid"])
-                delivery = identity(entry["deliveryId"])
-                if entry["message"]["role"] === "user" && entry["message"].ownKeys.allSatisfy({ (["role", "content"] + MESSAGE_RUNTIME_KEYS).contains($0) }) {
-                    shape = try queuedContent(entry["message"]["content"], hash)
+                command = identity(entry.commandUuid) ?? identity(entry.uuid)
+                delivery = identity(entry.deliveryId)
+                if entry.message.role === "user" && entry.message.raw.ownKeys.allSatisfy({ (["role", "content"] + MESSAGE_RUNTIME_KEYS).contains($0) }) {
+                    shape = try queuedContent(entry.message.content, hash)
                 }
             }
-        } else if type === "attachment" && (entry["attachment"]["prompt"].isString || (sessionId.truthy && entry["attachment"]["type"] === "queued_command")) {
-            let prompt = entry["attachment"]["prompt"]
-            if prompt.isString || prompt.isArray { shape = try queuedContent(prompt); hash = shape["hash"] }
-            command = identity(entry["attachment"]["commandUuid"]) ?? identity(entry["attachment"]["source_uuid"])
-            delivery = identity(entry["attachment"]["delivery_id"])
+        } else if type === "attachment" && (entry.attachment.prompt.isString || (sessionId.truthy && entry.attachment.type === "queued_command")) {
+            let prompt = entry.attachment.prompt
+            if prompt.isString || prompt.isArray { shape = try queuedContent(prompt); hash = QueuedContent(shape).hash }
+            command = identity(entry.attachment.commandUuid) ?? identity(entry.attachment.sourceUuid)
+            delivery = identity(entry.attachment.deliveryId)
             eligible = prompt.isString
             bad = !hash.truthy
-        } else if sessionId.truthy && type === "queue-operation" && entry["sessionId"] === sessionId {
-            command = identity(entry["commandUuid"])
-            delivery = identity(entry["deliveryId"])
-            let operation = entry["operation"]
-            consumed = operation === "remove" && entry["reason"] === "absorbed_mid_turn"
-            if entry["content"].isString || entry["content"].isArray { shape = try queuedContent(entry["content"]); hash = shape["hash"] }
+        } else if sessionId.truthy && type === "queue-operation" && entry.sessionId === sessionId {
+            command = identity(entry.commandUuid)
+            delivery = identity(entry.deliveryId)
+            let operation = entry.operation
+            consumed = operation === "remove" && entry.reason === "absorbed_mid_turn"
+            if entry.content.isString || entry.content.isArray { shape = try queuedContent(entry.content); hash = QueuedContent(shape).hash }
             eligible = consumed && hash.truthy && (command.truthy || delivery.truthy)
             if eligible { consumedHashes.add(hash) }
-            bad = (consumed && entry.hasOwn("content") && !hash.truthy) || (operation === "remove" && !consumed) || operation === "cancel" || operation === "dequeue"
+            bad = (consumed && entry.raw.hasOwn("content") && !hash.truthy) || (operation === "remove" && !consumed) || operation === "cancel" || operation === "dequeue"
         } else { continue }
-        let own = entry["sessionId"] ?? sessionId
+        let own = entry.sessionId ?? sessionId
         if !sessionId.truthy || (!command.truthy && !delivery.truthy) {
             if eligible {
                 if sessionId.truthy && own === sessionId && type !== "assistant" { unidentified.insert(output.count) }
@@ -461,14 +470,14 @@ public func conversation(_ entries: Value = .undefined, _ sessionId: Value = .un
         var keys: [Value] = []
         if command.truthy { keys.append(Value(stable([own, "command", command]))) }
         if delivery.truthy { keys.append(Value(stable([own, "delivery", delivery]))) }
-        var node = Value.spread(shape, [
+        var node = ConversationNode(Value.spread(shape, [
             "hash": hash, "command": command, "delivery": delivery, "bad": Value(bad),
             "userHash": type === "user" ? hash : .null, "userFirst": Value(type === "user" ? Double(output.count) : .infinity),
             "consumedHash": consumed && eligible ? hash : .null, "first": Value(eligible ? Double(output.count) : .infinity),
-        ])
-        for key in keys where aliases.has(key) { node = try merge(root(aliases.get(key)), node) }
-        for key in keys { aliases.set(key, node) }
-        output.append(node)
+        ]))
+        for key in keys where aliases.has(key) { node = try merge(root(ConversationNode(aliases.get(key))), node) }
+        for key in keys { aliases.set(key, node.raw) }
+        output.append(node.raw)
     }
     var result: [Value] = []
     for (at, item) in output.enumerated() {
@@ -476,22 +485,22 @@ public func conversation(_ entries: Value = .undefined, _ sessionId: Value = .un
             if !(unidentified.contains(at) && consumedHashes.has(item)) { result.append(item) }
             continue
         }
-        let group = root(item)
-        let position = group["userHash"].truthy ? group["userFirst"] : group["first"]
-        if !group["bad"].truthy && (!group["mixed"].truthy || group["userHash"].truthy || group["consumedHash"].truthy) && position === Value(Double(at)) {
-            result.append(group["userHash"] ?? group["consumedHash"] ?? group["hash"])
+        let group = root(ConversationNode(item))
+        let position = group.userHash.truthy ? group.userFirst : group.first
+        if !group.bad.truthy && (!group.mixed.truthy || group.userHash.truthy || group.consumedHash.truthy) && position === Value(Double(at)) {
+            result.append(group.userHash ?? group.consumedHash ?? group.hash)
         }
     }
     return result.value
 }
 
 func conversationFromRows(_ rows: Value = .undefined) throws -> Value {
-    let messages = rows.elements.filter { $0["event_type"] === "user" || $0["event_type"] === "assistant" }
+    let messages = rows.elements.map(RemoteEventRow.init).filter { $0.eventType === "user" || $0.eventType === "assistant" }
     if messages.contains(where: { row in
-        let payload = row["payload"]
-        return payload["type"] !== row["event_type"] || !payload["message"].truthy || payload["message"].typeOf != "object" || payload["message"].isArray
+        let payload = TranscriptEntry(row.payload)
+        return payload.type !== row.eventType || !payload.message.isPresent || payload.message.raw.typeOf != "object" || payload.message.raw.isArray
     }) { throw makeError("Remote Control message payload is unreadable", code: "CLOUD_HISTORY_UNREADABLE") }
-    return try conversation(messages.map { $0["payload"] }.value)
+    return try conversation(messages.map(\.payload).value)
 }
 
 func orderedConversation(_ source: Value = .undefined, _ target: Value = .undefined) throws -> Value {
@@ -577,23 +586,25 @@ func artifactBudget(_ limit: Value = .undefined) throws -> Value {
     return ["limit": Value(value), "used": 0, "indexes": Value.newMap()]
 }
 func eventDescriptor(_ entry: Value = .undefined) throws -> Value {
-    let out: Value = ["uuid": entry["uuid"], "type": entry["type"], "role": entry["message"]["role"],
-                      "hash": try messageHash(entry["type"], entry["message"]), "timestamp": entry["timestamp"]]
-    if !entry["agentId"].isUndefined { out["agentId"] = entry["agentId"] }
-    if !entry["isSidechain"].isUndefined { out["isSidechain"] = entry["isSidechain"] }
+    let entry = TranscriptEntry(entry)
+    let out: Value = ["uuid": entry.uuid, "type": entry.type, "role": entry.message.role,
+                      "hash": try messageHash(entry.type, entry.message.raw), "timestamp": entry.timestamp]
+    if !entry.agentId.isUndefined { out["agentId"] = entry.agentId }
+    if !entry.isSidechain.isUndefined { out["isSidechain"] = entry.isSidechain }
     return out
 }
 func remoteEvents(_ rows: Value = .undefined) throws -> Value {
-    try rows.elements.filter { $0["event_type"] === "user" || $0["event_type"] === "assistant" }.map { row -> Value in
-        let event = try eventDescriptor(Value.spread(row["payload"], ["timestamp": row["payload"]["timestamp"] ?? row["created_at"]]))
-        for key in ["agentId", "isSidechain"] where !row[key].isUndefined {
-            event[key] = !event[key].isUndefined && event[key] !== row[key] ? .null : row[key]
+    try rows.elements.map(RemoteEventRow.init).filter { $0.eventType === "user" || $0.eventType === "assistant" }.map { row -> Value in
+        let event = try eventDescriptor(Value.spread(row.payload, ["timestamp": TranscriptEntry(row.payload).timestamp ?? row.createdAt]))
+        for key in ["agentId", "isSidechain"] where !row.raw[key].isUndefined {
+            event[key] = !event[key].isUndefined && event[key] !== row.raw[key] ? .null : row.raw[key]
         }
         return event
     }.value
 }
 func eventAgrees(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
-    Value(a["uuid"] === b["uuid"] && a["type"] === b["type"] && a["role"] === b["role"] && a["hash"] === b["hash"])
+    let (a, b) = (ArtifactEvent(a), ArtifactEvent(b))
+    return Value(a.uuid === b.uuid && a.type === b.type && a.role === b.role && a.hash === b.hash)
 }
 func agentName(_ value: Value = .undefined) throws -> Value {
     Value(value.asString.map { re(#"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\z"#).test($0) } ?? false)
@@ -631,14 +642,15 @@ func artifactStat(_ file: Value = .undefined) throws -> ArtifactStat {
 }
 
 func artifactInputs(_ row: Value = .undefined) throws -> Value {
-    if try !UUID.test(row["id"].description) || path.basename(row["transcript"].description) != "\(row["id"]).jsonl" || (try desktopRecordOf(row))["cliSessionId"] !== row["id"] {
+    let row = CoveredSession(row)
+    if try !UUID.test(row.id.description) || path.basename(row.transcript.description) != "\(row.id).jsonl" || row.desktopRecord.cliSessionId !== row.id {
         throw artifactFail("the linked parent identity is not established")
     }
-    let project = try fs.realpath(path.dirname(row["transcript"].description)), transcript = path.join(project, "\(row["id"]).jsonl")
-    if row["sidecar"]["canonicalRoot"].truthy && Value(path.join(project, row["id"].description)) !== row["sidecar"]["canonicalRoot"] {
+    let project = try fs.realpath(path.dirname(row.transcript.description)), transcript = path.join(project, "\(row.id).jsonl")
+    if row.sidecar.canonicalRoot.truthy && Value(path.join(project, row.id.description)) !== row.sidecar.canonicalRoot {
         throw artifactFail("session root mapping changed")
     }
-    let signature = try artifactStat(Value(transcript)).signature, root = path.join(project, row["id"].description), directory = path.join(root, "subagents")
+    let signature = try artifactStat(Value(transcript)).signature, root = path.join(project, row.id.description), directory = path.join(root, "subagents")
     var fingerprints: [Value] = [[Value(transcript), signature]]
     var files: [Value] = []
     for dir in [root, directory] {
@@ -667,8 +679,9 @@ func artifactInputs(_ row: Value = .undefined) throws -> Value {
 func artifactIndex(_ file: Value = .undefined, _ kind: Value = .undefined, _ budget: Value = .undefined) throws -> Value {
     let stat = try artifactStat(file)
     let signature = stat.signature
+    let budget = ArtifactBudget(budget)
     let key = Value("\(file)/\(signature)/\(kind)")
-    if budget["indexes"].has(key) { return budget["indexes"].get(key) }
+    if budget.indexes.has(key) { return budget.indexes.get(key) }
     // Only a finished index is cached; a failure leaves no entry, so the next call retries.
     let name = file.description
     let size = Int(stat.detail.size)
@@ -676,10 +689,10 @@ func artifactIndex(_ file: Value = .undefined, _ kind: Value = .undefined, _ bud
     let result: Value = try closing(handle) {
         if try statIdentity(handle.stat(bigint: true)) !== signature { throw artifactFail("artifact changed before reading") }
         func read(_ length: Int, _ position: Int) throws -> Data {
-            if toNumber(budget["used"]) + Double(length) > toNumber(budget["limit"]) {
+            if toNumber(budget.used) + Double(length) > toNumber(budget.limit) {
                 throw artifactFail("the shared read budget was exhausted", "CLOUD_ARTIFACT_BUDGET")
             }
-            budget["used"] = Value(toNumber(budget["used"]) + Double(length))
+            budget.used = Value(toNumber(budget.used) + Double(length))
             let data = try handle.read(length: length, position: Int64(position))
             if data.count != length { throw artifactFail("artifact changed while reading") }
             return data
@@ -699,26 +712,26 @@ func artifactIndex(_ file: Value = .undefined, _ kind: Value = .undefined, _ bud
                 if skip || length == 0 { return }
                 let text = trimmed(Substring(String(decoding: parts, as: UTF8.self)))
                 if text.isEmpty { return }
-                let row: Value
-                do { row = try JSON.parse(text) } catch { throw artifactFail("artifact contains an unreadable relevant line") }
-                let type = row["type"]
-                if !row.truthy || !(type.asString.map { relevant.contains($0) } ?? false) { return }
+                let row: TranscriptEntry
+                do { row = TranscriptEntry(try JSON.parse(text)) } catch { throw artifactFail("artifact contains an unreadable relevant line") }
+                let type = row.type
+                if !row.raw.truthy || !(type.asString.map { relevant.contains($0) } ?? false) { return }
                 let isMessage = type === "user" || type === "assistant"
-                if isMessage && row["message"].isPlainObject {
-                    let event = Value.spread(try eventDescriptor(row), ["sessionId": row["sessionId"]])
-                    if kind === "agent" { events.append(event) } else if !row["isSidechain"].truthy { main.append(event) }
-                } else if type === "attachment" && row["attachment"]["type"] === "queued_command" {
-                    let item = row["attachment"], prompt = item["prompt"]
-                    queued.append(Value.spread(["uuid": item["source_uuid"], "delivery": item["delivery_id"], "type": "user", "role": "user",
-                                                "sessionId": row["sessionId"], "isSidechain": row["isSidechain"]],
+                if isMessage && row.message.raw.isPlainObject {
+                    let event = Value.spread(try eventDescriptor(row.raw), ["sessionId": row.sessionId])
+                    if kind === "agent" { events.append(event) } else if !row.isSidechain.truthy { main.append(event) }
+                } else if type === "attachment" && row.attachment.type === "queued_command" {
+                    let item = row.attachment, prompt = item.prompt
+                    queued.append(Value.spread(["uuid": item.sourceUuid, "delivery": item.deliveryId, "type": "user", "role": "user",
+                                                "sessionId": row.sessionId, "isSidechain": row.isSidechain],
                                                prompt.isString || prompt.isArray ? try queuedContent(prompt) : ["hash": .null]))
                 } else if type === "queue-operation" {
-                    let operation = row["operation"]
-                    let consumed = operation === "remove" && row["reason"] === "absorbed_mid_turn"
+                    let operation = row.operation
+                    let consumed = operation === "remove" && row.reason === "absorbed_mid_turn"
                     let cancelled = (operation === "remove" && !consumed) || operation === "cancel" || operation === "dequeue"
-                    operations.append(Value.spread(["uuid": row["commandUuid"], "delivery": row["deliveryId"], "sessionId": row["sessionId"], "consumed": Value(consumed),
-                                                    "cancelled": Value(cancelled), "hasContent": Value(row.hasOwn("content"))],
-                                                   row["content"].isString || row["content"].isArray ? try queuedContent(row["content"]) : ["hash": .null]))
+                    operations.append(Value.spread(["uuid": row.commandUuid, "delivery": row.deliveryId, "sessionId": row.sessionId, "consumed": Value(consumed),
+                                                    "cancelled": Value(cancelled), "hasContent": Value(row.raw.hasOwn("content"))],
+                                                   row.content.isString || row.content.isArray ? try queuedContent(row.content) : ["hash": .null]))
                 } else if isMessage { throw artifactFail("artifact message is unreadable") }
             }
             var position = 0
@@ -753,119 +766,122 @@ func artifactIndex(_ file: Value = .undefined, _ kind: Value = .undefined, _ bud
         if let timestamp { out["timestamp"] = timestamp }
         return out
     }
-    budget["indexes"].put(key, result)
+    budget.indexes.put(key, result)
     return result
 }
 
 func supplementalCoverage(_ events: Value = .undefined, _ row: Value = .undefined, _ budget: Value = .undefined, _ inputs: Value = .undefined) throws -> Value {
     if events.length == 0 { return .null }
-    if try events.elements.contains(where: { event in
-        try !UUID.test((event["uuid"] ?? "").description) || event["role"] !== event["type"] ||
-            (!event["agentId"].isUndefined && !(try agentName(event["agentId"])).truthy) ||
-            (!event["isSidechain"].isUndefined && event["isSidechain"].typeOf != "boolean")
+    if try events.elements.map(ArtifactEvent.init).contains(where: { event in
+        try !UUID.test((event.uuid ?? "").description) || event.role !== event.type ||
+            (!event.agentId.isUndefined && !(try agentName(event.agentId)).truthy) ||
+            (!event.isSidechain.isUndefined && event.isSidechain.typeOf != "boolean")
     }) { throw artifactFail("remote event identity is incomplete") }
-    let inputs = inputs.nullish ? try artifactInputs(row) : inputs
-    let local = try artifactIndex(inputs["transcript"], "main", budget)
-    let main = groupBy(local["main"].elements) { $0["uuid"] }
-    let commands = groupBy(local["operations"].elements) { $0["uuid"] }, deliveries = groupBy(local["operations"].elements) { $0["delivery"] }
+    let session = CoveredSession(row)
+    let inputs = ArtifactInputs(inputs.nullish ? try artifactInputs(row) : inputs)
+    let local = ArtifactIndex(try artifactIndex(inputs.transcript, "main", budget))
+    let main = groupBy(local.main.elements) { ArtifactEvent($0).uuid }
+    let commands = groupBy(local.operations.elements) { QueueOperation($0).uuid }, deliveries = groupBy(local.operations.elements) { QueueOperation($0).delivery }
     let queues = ValueMap()
-    for item in local["queued"].elements {
-        let prior = queues.get(item["uuid"])
-        if try !UUID.test((item["uuid"] ?? "").description) || !item["delivery"].isString || !item["delivery"].truthy || !item["hash"].truthy || item["sessionId"] !== row["id"] || item["isSidechain"].truthy ||
-            (prior.truthy && (!(try eventAgrees(prior, item)).truthy || prior["delivery"] !== item["delivery"])) {
+    for item in local.queued.elements.map(QueuedPrompt.init) {
+        let prior = QueuedPrompt(queues.get(item.uuid))
+        if try !UUID.test((item.uuid ?? "").description) || !item.delivery.isString || !item.delivery.truthy || !item.hash.truthy || item.sessionId !== session.id || item.isSidechain.truthy ||
+            (prior.raw.truthy && (!(try eventAgrees(prior.raw, item.raw)).truthy || prior.delivery !== item.delivery)) {
             throw artifactFail("queued prompt identity or replay copies disagree")
         }
-        queues.set(item["uuid"], item)
+        queues.set(item.uuid, item.raw)
     }
-    var remainder: [Value] = [], pending: [Value] = [], queuedIds: [Value] = []
+    var remainder: [Value] = [], pending: [ArtifactEvent] = [], queuedIds: [Value] = []
     var countMain = 0, countSubagent = 0, countQueued = 0
     let consumed = ValueSet()
-    for event in events.elements {
-        if main.has(event["uuid"]) {
-            let copies = main.get(event["uuid"]).elements
-            if try event["isSidechain"] === true || !event["agentId"].isUndefined || (try copies.contains { !(try eventAgrees($0, event)).truthy }) || consumed.has(event["uuid"]) {
+    for event in events.elements.map(ArtifactEvent.init) {
+        if main.has(event.uuid) {
+            let copies = main.get(event.uuid).elements
+            if try event.isSidechain === true || !event.agentId.isUndefined || (try copies.contains { !(try eventAgrees($0, event.raw)).truthy }) || consumed.has(event.uuid) {
                 throw artifactFail("main event identity or multiplicity disagrees")
             }
-            consumed.add(event["uuid"])
-            remainder.append(event["hash"])
+            consumed.add(event.uuid)
+            remainder.append(event.hash)
             countMain += 1
-        } else if queues.has(event["uuid"]) {
-            let item = queues.get(event["uuid"])
-            let copies = ValueSet(commands.get(item["uuid"]).elements + deliveries.get(item["delivery"]).elements).values
-            let delivered = copies.filter { $0["consumed"].truthy && $0["hasContent"].truthy }
+        } else if queues.has(event.uuid) {
+            let item = QueuedPrompt(queues.get(event.uuid))
+            let copies = ValueSet(commands.get(item.uuid).elements + deliveries.get(item.delivery).elements).values.map(QueueOperation.init)
+            let delivered = copies.filter { $0.consumed.truthy && $0.hasContent.truthy }
             let disagree = try copies.contains { copy in
-                if copy["cancelled"].truthy || copy["sessionId"] !== row["id"] { return true }
-                if !copy["uuid"].isUndefined && copy["uuid"] !== item["uuid"] { return true }
-                if !copy["delivery"].isUndefined && copy["delivery"] !== item["delivery"] { return true }
-                return try copy["hasContent"].truthy && (!copy["hash"].truthy || !(try queuedContentAgrees(copy, item)).truthy)
+                if copy.cancelled.truthy || copy.sessionId !== session.id { return true }
+                if !copy.uuid.isUndefined && copy.uuid !== item.uuid { return true }
+                if !copy.delivery.isUndefined && copy.delivery !== item.delivery { return true }
+                return try copy.hasContent.truthy && (!copy.hash.truthy || !(try queuedContentAgrees(copy.raw, item.raw)).truthy)
             }
-            if disagree || ValueSet(delivered.map { $0["hash"] }).size > 1 || ValueSet(([item] + copies).map { $0["richHash"] }.filter { $0.truthy }).size > 1 {
+            if disagree || ValueSet(delivered.map(\.hash)).size > 1 || ValueSet(([item.raw] + copies.map(\.raw)).map { QueuedContent($0).richHash }.filter { $0.truthy }).size > 1 {
                 throw artifactFail("queued prompt operation copies disagree")
             }
-            let witness = Value.spread(item, ["hash": (delivered.first ?? .undefined)["hash"] ?? item["hash"]])
-            if !(try eventAgrees(witness, event)).truthy || event["isSidechain"] === true || !event["agentId"].isUndefined || consumed.has(event["uuid"]) ||
-                !copies.contains(where: { $0["consumed"].truthy && $0["uuid"] === item["uuid"] && $0["delivery"] === item["delivery"] && $0["sessionId"] === row["id"] }) {
+            let deliveredHash = delivered.first.map(\.hash) ?? .undefined
+            let witness = Value.spread(item.raw, ["hash": deliveredHash ?? item.hash])
+            if !(try eventAgrees(witness, event.raw)).truthy || event.isSidechain === true || !event.agentId.isUndefined || consumed.has(event.uuid) ||
+                !copies.contains(where: { $0.consumed.truthy && $0.uuid === item.uuid && $0.delivery === item.delivery && $0.sessionId === session.id }) {
                 throw artifactFail("queued prompt delivery is not proven")
             }
-            consumed.add(event["uuid"])
-            queuedIds.append(event["uuid"])
+            consumed.add(event.uuid)
+            queuedIds.append(event.uuid)
             countQueued += 1
         } else { pending.append(event) }
     }
     if try !queuedIds.isEmpty && !(try orderedConversation(queuedIds.value, queues.keys.value)).truthy { throw artifactFail("queued prompt order disagrees") }
-    if try !remainder.isEmpty && !(try conversationMatch(remainder.value, row["conversation"])).truthy { throw artifactFail("remaining main history does not match") }
-    var files = inputs["files"].elements
+    if try !remainder.isEmpty && !(try conversationMatch(remainder.value, session.conversation)).truthy { throw artifactFail("remaining main history does not match") }
+    var files = inputs.files.elements.map(ArtifactFile.init)
     if !pending.isEmpty {
-        let hinted = ValueSet(pending.flatMap { $0["agentId"].isUndefined ? [] : [$0["agentId"]] })
-        if pending.allSatisfy({ !$0["agentId"].isUndefined }) { files = files.filter { hinted.has($0["agent"]) } }
-        let times = try pending.map { toNumber(try milliseconds($0["timestamp"])) }.filter { $0 >= 0 }
+        let hinted = ValueSet(pending.flatMap { $0.agentId.isUndefined ? [] : [$0.agentId] })
+        if pending.allSatisfy({ !$0.agentId.isUndefined }) { files = files.filter { hinted.has($0.agent) } }
+        let times = try pending.map { toNumber(try milliseconds($0.timestamp)) }.filter { $0 >= 0 }
         let earliest = times.reduce(Double.infinity) { Swift.min($0, $1) }, latest = times.reduce(-Double.infinity) { Swift.max($0, $1) }
         for file in files {
-            let timestamp = toNumber(try artifactIndex(file["file"], "header", budget)["timestamp"])
-            let modified = toNumber(file["modified"])
-            file["priority"] = hinted.has(file["agent"]) ? 0 : times.isEmpty || timestamp < 0 || modified < timestamp ? 1 : timestamp <= latest && modified >= earliest ? 0 : 2
+            let timestamp = toNumber(ArtifactIndex(try artifactIndex(file.file, "header", budget)).timestamp)
+            let modified = toNumber(file.modified)
+            file.priority = hinted.has(file.agent) ? 0 : times.isEmpty || timestamp < 0 || modified < timestamp ? 1 : timestamp <= latest && modified >= earliest ? 0 : 2
         }
         let found = ValueMap(), owners = ValueMap()
-        let ordered = stableSorted(files) { a, b in
-            let d = toNumber(a["priority"]) - toNumber(b["priority"])
-            return d != 0 ? d : Double(localeCompare(a["file"].description, b["file"].description))
-        }
+        let ordered = stableSorted(files.map(\.raw)) { a, b in
+            let (a, b) = (ArtifactFile(a), ArtifactFile(b))
+            let d = toNumber(a.priority) - toNumber(b.priority)
+            return d != 0 ? d : Double(localeCompare(a.file.description, b.file.description))
+        }.map(ArtifactFile.init)
         for file in ordered {
-            let localEvents = try artifactIndex(file["file"], "agent", budget)["events"].elements
-            let needed = pending.filter { $0["agentId"].isUndefined || $0["agentId"] === file["agent"] }
-            let ids = ValueSet(needed.map { $0["uuid"] })
-            let selected = localEvents.filter { ids.has($0["uuid"]) }
-            let byId = groupBy(selected) { $0["uuid"] }
+            let localEvents = ArtifactIndex(try artifactIndex(file.file, "agent", budget)).events.elements.map(ArtifactEvent.init)
+            let needed = pending.filter { $0.agentId.isUndefined || $0.agentId === file.agent }
+            let ids = ValueSet(needed.map { $0.uuid })
+            let selected = localEvents.filter { ids.has($0.uuid) }
+            let byId = groupBy(selected.map { $0.raw }) { ArtifactEvent($0).uuid }
             for event in selected {
-                if event["sessionId"] !== row["id"] || event["agentId"] !== file["agent"] || event["isSidechain"] !== true || main.has(event["uuid"]) || queues.has(event["uuid"]) ||
-                    (owners.has(event["uuid"]) && owners.get(event["uuid"]) !== file["agent"]) {
+                if event.sessionId !== session.id || event.agentId !== file.agent || event.isSidechain !== true || main.has(event.uuid) || queues.has(event.uuid) ||
+                    (owners.has(event.uuid) && owners.get(event.uuid) !== file.agent) {
                     throw artifactFail("subagent ownership or stream assignment disagrees")
                 }
-                owners.set(event["uuid"], file["agent"])
+                owners.set(event.uuid, file.agent)
             }
             for copies in byId.values {
                 if try copies.elements.contains(where: { !(try eventAgrees(copies[0], $0)).truthy }) { throw artifactFail("subagent payload, order or multiplicity disagrees") }
             }
-            let stream = needed.filter { byId.has($0["uuid"]) }
+            let stream = needed.filter { byId.has($0.uuid) }
             var at = 0
             for event in stream {
-                if event["isSidechain"] === false { throw artifactFail("remote sidechain identity disagrees") }
-                while at < selected.count, !(try eventAgrees(selected[at], event)).truthy { at += 1 }
+                if event.isSidechain === false { throw artifactFail("remote sidechain identity disagrees") }
+                while at < selected.count, !(try eventAgrees(selected[at].raw, event.raw)).truthy { at += 1 }
                 if at == selected.count { throw artifactFail("subagent payload, order or multiplicity disagrees") }
                 at += 1
             }
-            for event in stream { found.set(event, file["agent"]) }
+            for event in stream { found.set(event.raw, file.agent) }
             if found.size == pending.count { countSubagent = pending.count; break }
         }
     }
-    for pair in inputs["fingerprints"].elements {
+    for pair in inputs.fingerprints.elements {
         let file = pair[0].description, signature = pair[1]
         let current = try lstatOrNull(file)
         if try (current.map { statIdentity($0) } ?? .null) !== signature || (current != nil && (try fs.realpath(file)) != file) {
             throw artifactFail("session artifacts changed during coverage analysis")
         }
     }
-    if try mappedPath(row["transcript"]) !== inputs["transcript"] { throw artifactFail("session root mapping changed during coverage analysis") }
+    if try mappedPath(session.transcript) !== inputs.transcript { throw artifactFail("session root mapping changed during coverage analysis") }
     if countSubagent != pending.count { return .null }
     let counts: Value = ["main": Value(countMain), "subagent": Value(countSubagent), "queued": Value(countQueued)]
     return ["matchMode": "artifacts", "artifactCounts": counts, "artifactSignature": Value(sha(stable(events)))]
@@ -874,100 +890,105 @@ func supplementalCoverage(_ events: Value = .undefined, _ row: Value = .undefine
 // MARK: - History
 
 func priorHistory(_ cache: Value = .undefined, _ key: Value = .undefined) throws -> Value {
-    cache["used"]["histories"].add(key)
-    let item = cache["data"]["histories"][key]
-    let dependencies = item["value"]["dependencies"]
-    let encoded = item["value"]["result"]
-    if dependencies.isArray && encoded.truthy && encoded["events"].isArray && encoded["bridgeOwners"].isArray && encoded["contentSha"].isString {
+    let cache = EngineCache(cache)
+    cache.used["histories"].add(key)
+    let item = CachedHistory(cache.data["histories"][key])
+    let dependencies = item.dependencies
+    let encoded = item.result
+    if dependencies.isArray && encoded.isPresent && encoded.events.isArray && encoded.bridgeOwners.isArray && encoded.contentSha.isString {
         do {
             var current: [Value] = []
             for dependency in dependencies.elements {
                 let file = dependency[0]
-                current.append([file, try fingerprint(file, cache)])
+                current.append([file, try fingerprint(file, cache.raw)])
             }
-            if Value(sha(stable(current.value))) === item["signature"] {
-                cache["stats"]["historyHits"] = Value(toNumber(cache["stats"]["historyHits"]) + 1)
-                let events = Value.newMap(encoded["events"].elements.map { ($0[0], $0[1]) })
-                return Value.spread(encoded, ["bridgeOwners": try uniqueBridgeOwners(encoded["bridgeOwners"]), "events": events,
-                                              "roots": .set(ValueSet(events.asMap!.keys))])
+            if Value(sha(stable(current.value))) === item.signature {
+                cache.stats["historyHits"] = Value(toNumber(cache.stats["historyHits"]) + 1)
+                let events = Value.newMap(encoded.events.elements.map { ($0[0], $0[1]) })
+                return Value.spread(encoded.raw, ["bridgeOwners": try uniqueBridgeOwners(encoded.bridgeOwners), "events": events,
+                                                  "roots": .set(ValueSet(events.asMap!.keys))])
             }
         } catch {}
     }
-    cache["stats"]["historyMisses"] = Value(toNumber(cache["stats"]["historyMisses"]) + 1)
+    cache.stats["historyMisses"] = Value(toNumber(cache.stats["historyMisses"]) + 1)
     return .null
 }
 
 func history(_ id: Value = .undefined, _ transcript: Value = .undefined, _ ctx: Value = .undefined, _ cwd: Value = .undefined) throws -> Value {
     let cwd = cwd.isUndefined ? Value("") : cwd
-    let cacheKey: Value = ctx["cache"].truthy
+    let cache = HistoryContext(ctx).cache
+    let cacheKey: Value = cache.isPresent
         ? Value(sha(stable(["version": Value(CACHE_VERSION), "semanticVersion": Value(SEMANTIC_VERSION), "id": id, "transcript": transcript, "cwd": cwd])))
         : .null
-    if ctx["cache"].truthy {
-        let prior = try priorHistory(ctx["cache"], cacheKey)
+    if cache.isPresent {
+        let prior = try priorHistory(cache.raw, cacheKey)
         if prior.truthy { return prior }
     }
-    let lineage = try origins(id, ctx, cwd)
+    let lineage = TranscriptLineage(try origins(id, ctx, cwd))
     var dependencyRows: [Value] = []
-    if ctx["cache"].truthy {
-        for file in defaultSorted(lineage["dependencies"].elements) { dependencyRows.append([file, try fingerprint(file, ctx["cache"])]) }
+    if cache.isPresent {
+        for file in defaultSorted(lineage.dependencies.elements) { dependencyRows.append([file, try fingerprint(file, cache.raw)]) }
     }
-    let data = try load(transcript)
-    let normalized = try normalize(data["entries"])
-    let origin = lineage["origin"]
+    let data = TranscriptLoad(try load(transcript))
+    let normalized = NormalizedTranscript(try normalize(data.entries))
+    let origin = lineage.origin
     let events = ValueMap(), seen = ValueSet()
-    var conflicts = toNumber(normalized["conflicts"])
-    for e in try normalized["entries"].elements.filter({ try message($0).truthy }) {
-        let root = origin.get(e["uuid"]) ?? e["uuid"]
-        let shape = try lineageEvent(e)
+    var conflicts = toNumber(normalized.conflicts)
+    for e in try normalized.entries.elements.filter({ try message($0).truthy }).map(TranscriptEntry.init) {
+        let root = origin.get(e.uuid) ?? e.uuid
+        let shape = try lineageEvent(e.raw)
         let prior = events.get(root)
         if try !prior.truthy || (try eventIncluded(prior, shape)).truthy { events.set(root, shape) }
-        else if !(try eventIncluded(shape, prior)).truthy && !seen.has(e["uuid"]) { conflicts += 1 }
-        seen.add(e["uuid"])
+        else if !(try eventIncluded(shape, prior)).truthy && !seen.has(e.uuid) { conflicts += 1 }
+        seen.add(e.uuid)
     }
     let roots = ValueSet(events.keys)
-    let state = Value(sha(stable(try sessionState(data["entries"], id, origin))))
-    let comparable = data["invalid"] === 0 && conflicts == 0 && roots.size > 0
-    let bridges = data["entries"].elements.filter { $0["type"] === "bridge-session" }
-    let bridgeIds = unique(bridges.map { $0["bridgeSessionId"] ?? $0["bridge_session_id"] }.filter { $0.isString })
+    let state = Value(sha(stable(try sessionState(data.entries, id, origin))))
+    let comparable = data.invalid === 0 && conflicts == 0 && roots.size > 0
+    let bridges = data.entries.elements.map(TranscriptEntry.init).filter { $0.type === "bridge-session" }
+    let bridgeIds = unique(bridges.map(\.bridgeSessionId).filter { $0.isString })
     let bridgeOwners = try uniqueBridgeOwners(try bridges.map { entry -> Value in
-        ["id": try remoteId(entry["bridgeSessionId"] ?? entry["bridge_session_id"]), "sessionId": entry["sessionId"] ?? .null,
-         "account": entry["ownerAccountUuid"] ?? .null, "org": entry["ownerOrganizationUuid"] ?? .null]
+        ["id": try remoteId(entry.bridgeSessionId), "sessionId": entry.sessionId ?? .null,
+         "account": entry.ownerAccountUuid ?? .null, "org": entry.ownerOrganizationUuid ?? .null]
     }.value)
-    let head: Value = ["roots": .set(roots), "events": .map(events), "conversation": try conversation(normalized["entries"], id)]
+    let head: Value = ["roots": .set(roots), "events": .map(events), "conversation": try conversation(normalized.entries, id)]
     let tail: Value = ["state": state, "bridge": Value(!bridges.isEmpty), "bridgeIds": bridgeIds.value, "bridgeOwners": bridgeOwners,
-                       "invalid": data["invalid"], "conflicts": Value(conflicts), "comparable": Value(comparable),
-                       "snapshot": try semantic(data["entries"], id, data["invalid"]), "contentSha": data["sha"]]
+                       "invalid": data.invalid, "conflicts": Value(conflicts), "comparable": Value(comparable),
+                       "snapshot": try semantic(data.entries, id, data.invalid), "contentSha": data.sha]
     let result = Value.spread(head, try scanLineage(ctx, transcript), tail)
-    if ctx["cache"].truthy {
+    if cache.isPresent {
         let encoded = Value.spread(result, ["roots": .undefined, "events": events.entries.map { Value([$0.0, $0.1]) }.value])
-        _ = try cacheStore(ctx["cache"], "histories", cacheKey, Value(sha(stable(dependencyRows.value))), ["dependencies": dependencyRows.value, "result": encoded])
+        _ = try cacheStore(cache.raw, "histories", cacheKey, Value(sha(stable(dependencyRows.value))), ["dependencies": dependencyRows.value, "result": encoded])
     }
     return result
 }
 
 func sameEvents(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
-    for (id, event) in a["events"].asMap?.entries ?? [] where !(try eventIncluded(event, b["events"].get(id))).truthy { return false }
+    for (id, event) in MoveSource(a).events.asMap?.entries ?? [] where !(try eventIncluded(event, MoveSource(b).events.get(id))).truthy { return false }
     return true
 }
 func historyIncluded(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
-    if a["sole"].truthy || b["sole"].truthy || !a["comparable"].truthy || !b["comparable"].truthy { return false }
-    guard let x = a["roots"].asSet, let y = b["roots"].asSet else { throw EngineError.type("a.roots.isSubsetOf is not a function") }
-    return Value(try x.isSubset(of: y) && a["state"] === b["state"] && (try sameEvents(a, b)).truthy)
+    let (first, second) = (MoveSource(a), MoveSource(b))
+    if first.isSole || second.isSole || !first.isComparable || !second.isComparable { return false }
+    guard let x = first.roots.asSet, let y = second.roots.asSet else { throw EngineError.type("a.roots.isSubsetOf is not a function") }
+    return Value(try x.isSubset(of: y) && first.state === second.state && (try sameEvents(a, b)).truthy)
 }
 func carries(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
-    if !(a["sidecar"].truthy && b["sidecar"].truthy) { return false }
-    guard let x = a["sidecar"]["set"].asSet, let y = b["sidecar"]["set"].asSet else { throw EngineError.type("a.sidecar.set.isSubsetOf is not a function") }
+    let (first, second) = (SidecarTree(MoveSource(a).sidecar), SidecarTree(MoveSource(b).sidecar))
+    if !(first.isPresent && second.isPresent) { return false }
+    guard let x = first.set.asSet, let y = second.set.asSet else { throw EngineError.type("a.sidecar.set.isSubsetOf is not a function") }
     return Value(x.isSubset(of: y))
 }
 func desktopRecordOf(_ row: Value = .undefined) throws -> Value { MoveSource(row).desktopRecord.raw }
 func canShareRecord(_ a: Value = .undefined, _ b: Value = .undefined, _ requiredParents: Value = .undefined) throws -> Value {
-    let first = try desktopRecordOf(a), second = try desktopRecordOf(b)
-    if a["taskFamily"].truthy || b["taskFamily"].truthy {
-        if !(a["taskFamily"] === b["taskFamily"] && first["sessionId"] === second["sessionId"]) { return false }
-        return try sameAccount(a["account"], b["account"])
+    let (a, b) = (MoveSource(a), MoveSource(b))
+    let first = a.desktopRecord, second = b.desktopRecord
+    if a.taskFamily.truthy || b.taskFamily.truthy {
+        if !(a.taskFamily === b.taskFamily && first.sessionId === second.sessionId) { return false }
+        return try sameAccount(a.account.raw, b.account.raw)
     }
-    if first["sessionId"] !== second["sessionId"] && (requiredParents.has(first["sessionId"]) || requiredParents.has(second["sessionId"])) { return false }
-    return Value(a["transcript"] === b["transcript"] || !(first["forkedFromSessionId"].truthy || second["forkedFromSessionId"].truthy))
+    if first.sessionId !== second.sessionId && (requiredParents.has(first.sessionId) || requiredParents.has(second.sessionId)) { return false }
+    return Value(a.transcript === b.transcript || !(first.forkedFromSessionId.truthy || second.forkedFromSessionId.truthy))
 }
 func included(_ a: Value = .undefined, _ b: Value = .undefined) throws -> Value {
     let shared = try canShareRecord(a, b)
@@ -982,38 +1003,38 @@ func progress(_ report: Value = .undefined, _ stage: Value = .undefined, _ compl
 }
 func desktopFileOf(_ row: Value = .undefined) throws -> Value { row.isString ? row : MoveSource(row).desktopFile }
 func taskLinks(_ record: Value = .undefined) throws -> Value {
-    [record["sessionId"], record["cliSessionId"], record["scheduledTaskId"] ?? .null, record["notifySessionId"] ?? .null,
-     record["forkedFromSessionId"] ?? .null, record["cwd"] ?? .null, record["originCwd"] ?? .null]
+    let record = DesktopRecord(record)
+    return [record.sessionId, record.cliSessionId, record.scheduledTaskId ?? .null, record.notifySessionId ?? .null,
+            record.forkedFromSessionId ?? .null, record.cwd ?? .null, record.originCwd ?? .null]
 }
 func bridgeIdsOf(_ row: Value = .undefined) throws -> Value {
-    try ([row] + (row["members"] ?? Value.newArray()).elements).flatMap { member -> [Value] in
-        let record = try desktopRecordOf(member)
-        return (member["bridgeIds"] ?? Value.newArray()).elements + (record["bridgeSessionIds"] ?? Value.newArray()).elements
+    ([row] + (row["members"] ?? Value.newArray()).elements).map(MoveSource.init).flatMap { member -> [Value] in
+        (member.bridgeIds ?? Value.newArray()).elements + (member.desktopRecord.bridgeSessionIds ?? Value.newArray()).elements
     }.value
 }
 func remoteIdsOf(_ row: Value = .undefined) throws -> Value {
     unique(try bridgeIdsOf(row).elements.map { try remoteId($0) }.filter { $0.truthy }).value
 }
 func sourceCloudLinks(_ sources: Value = .undefined) throws -> Value {
-    try sources.elements.flatMap { source -> [Value] in
-        try (source["members"] ?? Value([source])).elements.flatMap { member -> [Value] in
-            let bridgeIds = try remoteIdsOf(member).elements.filter { id in
-                try (member["bridgeOwners"] ?? Value.newArray()).elements.allSatisfy { owner in
-                    try owner["id"] !== id ||
-                        (try sameAccount(["account": owner["account"] ?? member["account"]["account"], "org": owner["org"] ?? member["account"]["org"]], member["account"])).truthy
+    try sources.elements.map(MoveSource.init).flatMap { source -> [Value] in
+        try source.members.flatMap { member -> [Value] in
+            let bridgeIds = try remoteIdsOf(member.raw).elements.filter { id in
+                try (member.bridgeOwners ?? Value.newArray()).elements.map(BridgeOwner.init).allSatisfy { owner in
+                    try owner.id !== id ||
+                        (try sameAccount(["account": owner.accountId ?? member.account.accountId, "org": owner.orgId ?? member.account.orgId], member.account.raw)).truthy
                 }
             }
-            return bridgeIds.isEmpty ? [] : [Value.spread(try accountRef(member["account"]), ["targetId": source["cloudTargetId"] ?? source["id"], "bridgeIds": bridgeIds.value])]
+            return bridgeIds.isEmpty ? [] : [Value.spread(try accountRef(member.account.raw), ["targetId": source.cloudTargetId ?? source.id, "bridgeIds": bridgeIds.value])]
         }
     }.value
 }
 func linkedCloudIds(_ links: Value = .undefined, _ account: Value = .undefined) throws -> Value {
     let rows = try links.elements.filter { try sameAccount($0, account).truthy }
-    return unique(try rows.flatMap { flatArray($0["bridgeIds"]) }.map { try remoteId($0) }.filter { $0.truthy }).value
+    return unique(try rows.flatMap { flatArray(CloudLink($0).bridgeIds) }.map { try remoteId($0) }.filter { $0.truthy }).value
 }
 func retainedCloudChecks(_ receipt: Receipt, _ inv: MovePlan, _ current: Value = .undefined) throws -> Value {
     return try receipt.cloudChecks.elements.flatMap { check -> [Value] in
-        if try (inv.cloud["checked"].truthy && (try sameAccount(check, inv.cloud)).truthy) ||
+        if try (inv.cloudPlan.checked.truthy && (try sameAccount(check, inv.cloud)).truthy) ||
             (try inv.deferredCloudSources.elements.contains { try sameAccount(check, $0).truthy }) ||
             (try localCloudPending(try current.elements.first { try sameAccount($0, check).truthy } ?? .undefined)).truthy {
             return [check]
@@ -1023,7 +1044,7 @@ func retainedCloudChecks(_ receipt: Receipt, _ inv: MovePlan, _ current: Value =
     }.value
 }
 func validDesktopRecord(_ row: Value = .undefined) throws -> Value {
-    let record = try desktopRecordOf(row)
+    let record = MoveSource(row).desktopRecord
     let file = try desktopFileOf(row)
-    return Value(LOCAL_RECORD.test((record["sessionId"] ?? "").description) && file.isString && path.basename(file.description) == "\(record["sessionId"]).json")
+    return Value(LOCAL_RECORD.test((record.sessionId ?? "").description) && file.isString && path.basename(file.description) == "\(record.sessionId).json")
 }
