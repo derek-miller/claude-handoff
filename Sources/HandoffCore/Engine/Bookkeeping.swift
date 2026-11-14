@@ -1,8 +1,6 @@
 import Foundation
 
 // Desktop keeps a session's queued input, archive flag and filed suggestions beside its record.
-// A move copies them to the destination and records what it added; Undo takes back only that,
-// so the source copies stay as they were.
 
 fileprivate let WAITING = "waiting-input", ARCHIVE_INDEX = "archived-sessions.idx", BACKLOG = "backlog/tasks.json"
 

@@ -507,7 +507,17 @@ func transferRecords(_ inv: MovePlan, _ to: Value = .undefined, _ paths: DataLay
     }
     if !placed.isEmpty {
         try save.call()
-        for row in placed { try carryBookkeeping(row.bookkeeping, row.targetRecordId.description) }
+        var failures: [String] = []
+        for row in placed {
+            do { try carryBookkeeping(row.bookkeeping, row.targetRecordId.description) } catch {
+                row.bookkeeping["error"] = ThrownError(error).message
+                failures.append("\(row.title) | \(ThrownError(error).message)")
+            }
+        }
+        if !failures.isEmpty {
+            try save.call()
+            try report.call("bookkeeping", .string("Desktop bookkeeping not carried:\n" + failures.joined(separator: "\n")))
+        }
     }
     try optCall(context.sessionProgress, receipt.raw)
     if inv.move.length > 0 || context.wholeOperation.truthy {

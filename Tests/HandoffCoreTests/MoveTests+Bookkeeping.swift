@@ -81,4 +81,24 @@ extension Engine.Moves {
         ok(try undo(h.paths)["dest"])
         eq(try ["waiting-input/\(record).json", "archived-sessions.idx", "backlog/tasks.json"].map { try readText(path.join(t, $0)) }, destBefore)
     }
+
+    @Test("bookkeeping that cannot be carried is recorded without failing the move")
+    func bookkeepingFailure() throws {
+        let h = try home(), record = "local_\(SOURCE)"
+        try h.write(SOURCE, [entry("user", 1, nil, SOURCE)])
+        try h.record("P", SOURCE)
+        let p = h.dir("P"), t = h.dir("T")
+        try mkdirp(path.join(p, "backlog"))
+        try mkdirp(t)
+        try writeJSON(path.join(p, "backlog", "tasks.json"), ["version": 1, "items": [["id": "todo_mine", "originSessionId": Value(record)]]])
+        try writeText(path.join(t, "backlog"), "not a folder")
+
+        let result = try Self.moved(h)
+        ok(result["ok"])
+        ok(result["receipt"]["sessions"][0]["bookkeeping"]["error"].isString)
+        ok(!exists(h.recordFile("P", SOURCE)))
+        ok(try undo(h.paths)["dest"])
+        ok(exists(h.recordFile("P", SOURCE)))
+        eq(readOrNil(path.join(t, "backlog")), "not a folder")
+    }
 }
