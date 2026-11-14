@@ -500,6 +500,9 @@ func finishUndo(_ receipt: Receipt, _ file: Value = .undefined, _ paths: DataLay
         for row in receipt.sessions.elements {
             _ = try restoreBridge(row, Value { _ in try saveJson(file, receipt.raw, 2, true) }, inspect, true)
         }
+        for row in receipt.sessions.elements.map(PlacedSession.init) where row.bookkeeping.truthy {
+            try uncarryBookkeeping(row.bookkeeping, row.targetRecordId.description, dest.description)
+        }
         try writeTaskRegistrations(receipt.taskTransfers, "source", true, paths, inspect, check)
         try fs.mkdirp(dest.description)
     } catch { failure = error }

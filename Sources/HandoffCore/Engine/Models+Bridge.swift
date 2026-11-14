@@ -236,6 +236,10 @@ struct PlacedSession {
         get { raw["targetRecordId"] }
         nonmutating set { raw["targetRecordId"] = newValue }
     }
+    var bookkeeping: Value {
+        get { raw["bookkeeping"] }
+        nonmutating set { raw["bookkeeping"] = newValue }
+    }
     var recordId: Value {
         get { raw["recordId"] }
         nonmutating set { raw["recordId"] = newValue }

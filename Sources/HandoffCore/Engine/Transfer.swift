@@ -497,6 +497,18 @@ func transferRecords(_ inv: MovePlan, _ to: Value = .undefined, _ paths: DataLay
     receipt.clear(.cloudAttempts)
     receipt.failed = Value(receipt.failed.elements.flatMap(unheldFailures))
     try save.call()
+    let sourceDirs = Dictionary(inv.move.elements.map(MoveSource.init).map { ($0.id.description, path.dirname($0.file.description)) }, uniquingKeysWith: { first, _ in first })
+    let placed = sliceArray(receipt.sessions.elements, previousCount).map(PlacedSession.init).compactMap { row -> PlacedSession? in
+        guard row.targetRecordId.isString, row.record.isString, let from = sourceDirs[row.id.description] else { return nil }
+        let plan = bookkeepingPlan(row.targetRecordId.description, from, path.dirname(row.record.description))
+        if !plan.truthy { return nil }
+        row.bookkeeping = plan
+        return row
+    }
+    if !placed.isEmpty {
+        try save.call()
+        for row in placed { try carryBookkeeping(row.bookkeeping, row.targetRecordId.description) }
+    }
     try optCall(context.sessionProgress, receipt.raw)
     if inv.move.length > 0 || context.wholeOperation.truthy {
         let rehomed = receipt.sessions.elements.filter { PlacedSession($0).strategy === "rehome" }.count
