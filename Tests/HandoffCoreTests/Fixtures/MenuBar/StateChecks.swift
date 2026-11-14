@@ -539,6 +539,17 @@ enum StateChecks {
         freshActions.links[0].action()
         precondition(!freshActions.skipRestartWarning && freshActions.links.isEmpty)
         requests = []
+        let cloudMove = Model(demo: Demo.accounts)
+        precondition(!cloudMove.cloudMoves && cloudMove.showsCloudToggle)
+        cloudMove.skipRestartWarning = true
+        cloudMove.cloudMoves = true
+        precondition(fixtureDefaults.bool(forKey: "cloudMoves"))
+        cloudMove.primary()
+        precondition(requests.count == 1 && requests[0].0.suffix(2) == ["--cloud", "--json"] && cloudMove.running)
+        precondition(!cloudMove.moveProgress.skipped.contains("cloud") && !cloudMove.moveProgress.skipped.contains("cloudScan") && !cloudMove.showsCloudToggle)
+        cloudMove.cloudMoves = false
+        precondition(!fixtureDefaults.bool(forKey: "cloudMoves"))
+        requests = []
         let login = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("12-undo-pending").utf8)))
         precondition(login.undoPending && !login.pendingReady && login.primaryTitle == nil)
         precondition(login.pendingPrompt.contains("Sign Claude in as home@example.test.") && login.screen == .signIn)

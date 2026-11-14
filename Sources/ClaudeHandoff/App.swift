@@ -224,7 +224,7 @@ struct MoveProgress {
     static let phases = ["prepare", "cloudScan", "close", "rescan", "move", "verify", "retire", "finalize", "reopen", "cloud"]
     static let costs: [String: Double] = ["prepare": 0.012, "cloudScan": 1, "close": 2, "rescan": 0.001, "move": 0.0015, "verify": 0.0003, "retire": 0.0002, "finalize": 0.0015, "reopen": 1, "cloud": 1]
     static let scaled: Set<String> = ["prepare", "rescan", "move", "verify", "retire", "finalize"]
-    // Moves are local-only; the cloud phases count only when an older receipt's cloud work reports progress.
+    // The cloud phases count only for a --cloud move or when an older receipt's cloud work reports progress.
     var skipped: Set<String> = ["cloudScan", "cloud"]
     var phase = "prepare"
     var started: TimeInterval
@@ -335,6 +335,9 @@ final class Model: ObservableObject {
     static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
     @Published private(set) var updating = false
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
+    @Published var cloudMoves = UserDefaults.standard.bool(forKey: "cloudMoves") {
+        didSet { UserDefaults.standard.set(cloudMoves, forKey: "cloudMoves") }
+    }
     @Published var restartAvailable = false
     @Published var moveProgress = MoveProgress()
     var snapshotFailed = false
@@ -395,6 +398,7 @@ final class Model: ObservableObject {
         demo = true
         config = nil
         skipRestartWarning = false
+        cloudMoves = false
         self.accounts = accounts
         settle()
     }
@@ -413,6 +417,7 @@ final class Model: ObservableObject {
         return checks.count == pendingAccounts.count && !partialResult && receiptSummaries.allSatisfy({ $0.notMoved.isEmpty }) ? checks : []
     }
     var movable: Bool { pendingAccounts.isEmpty || !leaveChecks.isEmpty }
+    var showsCloudToggle: Bool { !running && movable && !directActions }
     var receiptSummaries: [ReceiptSummary] {
         var seen = Set<String>()
         return accounts.compactMap { account in
@@ -730,7 +735,7 @@ final class Model: ObservableObject {
 
     func move() {
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
-        let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--json"]
+        let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector] + (cloudMoves ? ["--cloud"] : []) + ["--json"]
         let checks = leaveChecks, kept = pendingAccounts.map { ("kept", "\(oldCopies($0)) left unarchived in \($0.label)") }
         dismiss()
         left = []
@@ -1019,6 +1024,7 @@ final class Model: ObservableObject {
 
     private func start(_ args: [String]) {
         begin()
+        if args.contains("--cloud") { moveProgress.skipped.subtract(["cloudScan", "cloud"]) }
         if sweeping {
             queued = { [weak self] in self?.moveProgress.resume(); self?.runOperation(args) }
             moveProgress.paused = ProcessInfo.processInfo.systemUptime
@@ -1595,6 +1601,18 @@ struct Panel: View {
                     if model.detailLines.count <= 3 && model.detailLines.allSatisfy({ !$0.1.contains("\n") && $0.1.count < 240 }) { detailRows }
                     else { ScrollView { detailRows }.frame(height: 200) }
                 }.font(.caption)
+            }
+            if model.showsCloudToggle {
+                Button(action: { model.cloudMoves.toggle() }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: model.cloudMoves ? "checkmark.square.fill" : "square")
+                            .foregroundStyle(model.cloudMoves ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
+                        Text("Also archive old copies on claude.ai").foregroundStyle(.secondary)
+                    }.font(.caption).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).focusable(false).disabled(!model.canMutate)
+                .accessibilityAddTraits(model.cloudMoves ? .isSelected : [])
+                .help("After the move checks out, archives the old accounts' Remote Control copies on claude.ai. Claude must be signed in to each old account for that, so the move can wait for a sign-in.")
             }
             if model.restartAvailable && model.pendingAccounts.isEmpty {
                 Button(action: { model.restartDesktop() }) { Text("Restart Claude").font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
