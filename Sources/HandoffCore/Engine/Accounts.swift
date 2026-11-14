@@ -761,6 +761,8 @@ func logins(_ paths: DataLayout) throws -> Value {
     let emails = Value.newMap()
     let orgs = Value.newMap()
     let pairs = Value.newMap()
+    // Pairs a login file or a move named, as opposed to the empty folders Desktop leaves while switching logins.
+    let real = Value.newMap()
     func take(_ file: String) throws {
         let a = OAuthAccount(try member((try? readJson(Value(file))) ?? Value.newObject(), "oauthAccount"))
         if a.accountUuid.truthy && a.emailAddress.truthy { emails.put(a.accountUuid, a.emailAddress) }
@@ -770,6 +772,7 @@ func logins(_ paths: DataLayout) throws -> Value {
         }
         if UUID.test((a.accountUuid ?? "").description) && UUID.test((a.organizationUuid ?? "").description) {
             pairs.put(Value("\(a.accountUuid)/\(a.organizationUuid)"), ["account": a.accountUuid, "org": a.organizationUuid])
+            real.put(Value("\(a.accountUuid)/\(a.organizationUuid)"), true)
         }
     }
     let home = paths.home
@@ -784,13 +787,22 @@ func logins(_ paths: DataLayout) throws -> Value {
     let remembered = (try? readJson(Value(paths.labels))) ?? Value.newObject()
     let seen = LoginLabels(try desktopProfiles(Value(paths.webCache)))
     let rememberedEmails = try member(remembered, "emails"), rememberedOrgs = LoginLabels(remembered).orgs
+    let rememberedAccounts = LoginLabels(remembered).accounts, removed = LoginLabels(remembered).removed
     // Live login files and Desktop's profile override what earlier runs remembered.
     let entries = { (map: Value) in Value.fromEntries(map.asMap!.entries.map { ($0.0.description, $0.1) }) }
     let saved = LoginLabels([
         "emails": Value.spread(rememberedEmails, entries(emails), entries(seen.emails)),
         "orgs": Value.spread(rememberedOrgs, entries(orgs), entries(seen.orgs)),
+        "accounts": Value.spread(rememberedAccounts),
+        "removed": Value.spread(removed),
     ])
-    let previous: Value = ["emails": rememberedEmails ?? Value.newObject(), "orgs": rememberedOrgs ?? Value.newObject()]
+    let previous: Value = ["emails": rememberedEmails ?? Value.newObject(), "orgs": rememberedOrgs ?? Value.newObject(),
+                           "accounts": rememberedAccounts ?? Value.newObject(), "removed": removed ?? Value.newObject()]
+    // An account stays listed after cleanups take its folders, receipts and login files.
+    for key in saved.accounts.ownKeys {
+        let parts = key.components(separatedBy: "/")
+        if parts.count == 2 && UUID.test(parts[0]) && UUID.test(parts[1]) { pairs.put(Value(key), ["account": Value(parts[0]), "org": Value(parts[1])]) }
+    }
     for (account, email) in saved.emails.ownEntries where UUID.test(account) { emails.put(Value(account), email) }
     for (org, name) in saved.orgs.ownEntries where UUID.test(org) { orgs.put(Value(org), name) }
     for row in try records(Value(paths.agentSessions)).elements.map(RecordFolder.init) {
@@ -821,6 +833,7 @@ func logins(_ paths: DataLayout) throws -> Value {
             do { isDir = try fs.stat(path.join(paths.records, account, org)).isDirectory } catch { isDir = false }
             if !isDir { continue }
             pairs.put(Value("\(account)/\(org)"), ["account": Value(account), "org": Value(org)])
+            real.put(Value("\(account)/\(org)"), true)
             let parts = try JSON.parse("\"\(raw)\"").description.components(separatedBy: " · ")
             let who = parts[0], team = parts.count > 1 ? parts[1] : nil
             if who.contains("@") && !emails.has(account) { emails.put(Value(account), Value(who)) }
@@ -832,15 +845,30 @@ func logins(_ paths: DataLayout) throws -> Value {
         let kept = saved.raw[name].asObject!
         for (key, label) in learned.asMap!.entries where UUID.test(key.description) && !kept.has(key.description) { kept[key.description] = label }
     }
-    if JSON.text(saved.raw) != JSON.text(previous) {
-        let labels = paths.labels
-        let tmp = "\(labels).\(process.pid).tmp"
-        do {
-            try fs.write(tmp, JSON.text(saved.raw, space: 2) + "\n")
-            try fs.rename(tmp, labels)
-        } catch { try? fs.unlink(tmp) }
-    }
-    return ["emails": emails, "orgs": orgs, "pairs": pairs]
+    let keptAccounts = saved.accounts.asObject!
+    for key in real.asMap!.keys where !keptAccounts.has(key.description) { keptAccounts[key.description] = true }
+    if JSON.text(saved.raw) != JSON.text(previous) { saveLabels(paths, saved.raw) }
+    return ["emails": emails, "orgs": orgs, "pairs": pairs, "removed": saved.removed]
+}
+
+func saveLabels(_ paths: DataLayout, _ labels: Value) {
+    let file = paths.labels
+    let tmp = "\(file).\(process.pid).tmp"
+    do {
+        try fs.write(tmp, JSON.text(labels, space: 2) + "\n")
+        try fs.rename(tmp, file)
+    } catch { try? fs.unlink(tmp) }
+}
+
+// Records whether the user removed an account/org from the list; a removed one stays hidden while it holds nothing.
+func setRemoved(_ paths: DataLayout, _ key: String, _ isRemoved: Bool) {
+    let labels = (try? readJson(Value(paths.labels))) ?? Value.newObject()
+    guard labels.isObjectLike, !labels.isArray else { return }
+    let removed = Value.spread(LoginLabels(labels).removed)
+    if isRemoved == removed.asObject!.has(key) { return }
+    if isRemoved { removed[key] = true } else { removed.removeKey(key) }
+    labels["removed"] = removed
+    saveLabels(paths, labels)
 }
 
 // MARK: - Presentation
@@ -1260,6 +1288,16 @@ func accounts(_ paths: DataLayout, _ processes: Value = .undefined) throws -> Va
             "signedIn": try sameLogin(["account": account], cur), "identityState": login.state,
         ]))
     }
+    // A removed account stays hidden while it holds nothing, though a login file still names it, until Desktop signs in to it.
+    let removed = found.removed
+    if removed.isObjectLike && !removed.isArray {
+        let signedInKey = "\(login.accountId)/\(login.orgId)"
+        if login.isKnown && removed.asObject!.has(signedInKey) { setRemoved(paths, signedInKey, false) }
+        out.removeAll { row in
+            let key = "\(row.accountId)/\(row.orgId)"
+            return key != signedInKey && row.isEmpty && removed.asObject!.has(key)
+        }
+    }
     let sessions = out.flatMap(\.sessions)
     var claims: [HashKey: Int] = [:]
     for session in sessions { for id in unique([session.raw["id"]] + (try priorSessions(session.record.raw)).elements) { claims[HashKey(id), default: 0] += 1 } }
@@ -1316,7 +1354,7 @@ func leftovers(_ paths: DataLayout, _ all: Value = .undefined) throws -> Value {
     return Value(found.filter { row in holders[row.orgId.description]!.contains { other in !found.contains { $0.raw === other.raw } } }.map(\.raw))
 }
 
-// Without a pair, sets aside the leftovers above; with one, sets aside that account/org if it holds nothing.
+// Without a pair, sets aside the leftovers above; with one, sets aside that account/org if it holds nothing and keeps it off the list.
 public func tidy(_ paths: Value = .undefined, _ pair: Value = .null) throws -> Value { try tidy(DataLayout(paths), pair) }
 func tidy(_ paths: DataLayout, _ pair: Value = .null) throws -> Value {
     let latest = LatestReceipt(try latestReceipt(paths))
@@ -1354,6 +1392,7 @@ func tidy(_ paths: DataLayout, _ pair: Value = .null) throws -> Value {
         var entry: Value = ["account": row.accountId, "org": row.orgId, "label": row.raw["label"]]
         if scratchKept { entry = Value.spread(entry, ["scratchKept": .string(scratch)]) }
         moved.append(entry)
+        if pair.truthy { setRemoved(paths, "\(account)/\(org)", true) }
     }
     return ["ok": true, "moved": Value(moved), "dest": moved.isEmpty ? .null : .string(dest)]
 }

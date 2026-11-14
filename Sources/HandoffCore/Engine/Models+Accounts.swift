@@ -90,6 +90,9 @@ struct LoginLabels {
     var emails: Value { raw["emails"] }
     var orgs: Value { raw["orgs"] }
     var pairs: Value { raw["pairs"] }
+    // labels.json's "account/org" keys: every real login seen, and the ones removed from the list.
+    var accounts: Value { raw["accounts"] }
+    var removed: Value { raw["removed"] }
 }
 
 // The oauthAccount block of a Claude Code .claude.json.
