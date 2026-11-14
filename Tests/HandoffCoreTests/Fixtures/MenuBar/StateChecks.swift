@@ -877,6 +877,21 @@ enum StateChecks {
         precondition(waiting.statusDetail?.hasPrefix("Waiting for Claude to finish signing in.") == true)
         refreshReply(waiting, wordingAccounts("05-other-login"))
         precondition(waiting.statusDetail?.contains("Sign Claude in as home@example.test") == true && waiting.primaryTitle == "Leave old copies and move")
+        requests = []
+        let leaveOnly = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
+        leaveOnly.to = nil
+        precondition(leaveOnly.primaryTitle == "Leave old copies" && !leaveOnly.links.contains { $0.title == "Keep moved sessions" })
+        leaveOnly.primary()
+        precondition(requests.count == 1 && requests[0].0 == ["keep-local", "--json", "--leave-check", String(repeating: "3", count: 64)])
+        requests[0].1(#"{"done":true,"ok":true,"complete":true,"keptLocal":1,"heldCancelled":0}"#)
+        requests[0].2(0, "")
+        precondition(!requests.contains { $0.0.contains("--to") })
+        requests = []
+        let drifted = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
+        sweepReply(drifted, #"{"swept":true,"ok":true,"complete":false,"receipt":"receipt-one","changed":[{"id":"fixture","title":"Fixture","fields":["isArchived"]}]}"#)
+        precondition(drifted.statusDetail?.contains("New moves wait for this cleanup.") == true && !drifted.displaySummary.contains("archive state"))
+        precondition(drifted.detailLines.contains { $0.1.contains("archive state") })
+        requests = []
         let ghost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: false, signedIn: false, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
         let crowded = Model(demo: Demo.accounts + [ghost])
         precondition(crowded.visibleAccounts.map(\.id) == Demo.accounts.map(\.id))

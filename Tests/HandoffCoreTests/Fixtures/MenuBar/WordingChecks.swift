@@ -78,7 +78,8 @@ enum WordingChecks {
                 if fixture.name == "11-repair" { precondition(model.detailLines.map(\.0) == ["receipt"]) }
                 if fixture.name == "05-other-login" {
                     precondition(model.statusHeadline == "361 sessions moved" && model.statusDetail?.contains("Sign Claude in as home@example.test") == true)
-                    precondition(!model.directActions && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"] && !model.undoPending)
+                    precondition(!model.directActions && model.links.map(\.title) == ["Undo last move"] && !model.undoPending)
+                    precondition(model.statusDetail?.hasSuffix("New moves wait for this cleanup. Leave the old copies unarchived to move on now.") == true)
                 }
                 if fixture.name == "08-unproven" { precondition(model.detailLines.filter { $0.1.contains("Research conversation") }.count == 1 && !model.directActions && model.canMutate) }
                 if fixture.name == "50-limit-and-sign-in" { precondition(model.primaryTitle == nil && !model.directActions && model.links.map(\.title) == ["Undo last move", "Keep moved sessions"] && !model.undoPending) }
