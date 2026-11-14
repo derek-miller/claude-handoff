@@ -144,6 +144,39 @@ extension Engine {
             eq(saved["orgs"][org], "Gone Team")
         }
 
+        @Test("accounts keeps listing a login after its login file and folders go away")
+        func learnedAccountSurvives() throws {
+            let h = try home()
+            let account = id(928), org = id(929), profile = path.join(h.root, ".claude-kept")
+            try mkdirp(profile)
+            try mkdirp(h.paths["state"])
+            try Accounts.login(path.join(profile, ".claude.json"), account, org, "kept@example.com", "Kept Team", "team")
+            _ = try accounts(h.paths)
+            try rmrf(profile)
+            let row = try accounts(h.paths).find { $0["account"].str == account && $0["org"].str == org }
+            eq(row["label"], "kept@example.com · Kept Team")
+            eq(row["sessions"].length, 0)
+            eq(try readJSON(h.paths["labels"].str)["accounts"]["\(account)/\(org)"], true)
+        }
+
+        @Test("a removed account stays off the list while a login file names it, until Desktop signs in to it")
+        func removedAccountStaysHidden() throws {
+            let h = try home(), f = try identityFixture(h)
+            let account = id(934), org = id(935), profile = path.join(h.root, ".claude-removed")
+            try mkdirp(profile)
+            try mkdirp(h.paths["state"])
+            try Accounts.login(path.join(profile, ".claude.json"), account, org, "removed@example.com", "Personal", "personal")
+            func listed() throws -> Value { try accounts(h.paths, f.processes).find { $0["account"].str == account && $0["org"].str == org } }
+            #expect(try listed().truthy)
+            eq(try tidy(h.paths, ["account": Value(account), "org": Value(org)])["moved"].length, 1)
+            #expect(!(try listed().truthy))
+            eq(try readJSON(h.paths["labels"].str)["removed"]["\(account)/\(org)"], true)
+            try writeJSON(h.paths["desktop"].str, ["lastKnownAccountUuid": Value(account)])
+            try f.write(f.`init`() + f.`init`(2, account, org))
+            #expect(try listed()["active"].truthy)
+            eq(try readJSON(h.paths["labels"].str)["removed"]["\(account)/\(org)"], .undefined)
+        }
+
         @Test("accounts follows a login file that changes its email or organization name")
         func loginRename() throws {
             let h = try home()
