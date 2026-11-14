@@ -434,7 +434,7 @@ final class Model: ObservableObject {
     var canKeepLocal: Bool { canMutate && (partialResult || pendingAccounts.contains { ["cloud", "local", "partial"].contains($0.pending ?? "") }) }
     var links: [(title: String, action: @MainActor () -> Void)] {
         let all: [(Bool, String, @MainActor () -> Void)] = [(canMutate && !undoPending && !directActions && max(latestReceipt ?? "", retryReceipt ?? "") > undone, "Undo last move", undo),
-            (canKeepLocal && !directActions, "Keep moved sessions", stopHere), (skipRestartWarning, "Show restart warnings", restoreRestartWarning),
+            (canKeepLocal && !directActions && leaveChecks.isEmpty, "Keep moved sessions", stopHere), (skipRestartWarning, "Show restart warnings", restoreRestartWarning),
             (canMutate && pendingAccounts.isEmpty && !directActions && leftoverCount > 0, "Clean up \(leftoverCount) empty \(leftoverCount == 1 ? "folder" : "folders")", tidy),
             (canUpdate, "Check for updates", update)]
         return all.filter { $0.0 }.map { ($0.1, $0.2) }
@@ -501,7 +501,9 @@ final class Model: ObservableObject {
         case "held", "open": return account.pendingAction == "finish" ? "\(amount) remaining \(count == 1 ? "session is" : "sessions are") ready to move." : count.map { "\($0) more \($0 == 1 ? "needs" : "need") Claude to restart." } ?? "The remaining sessions need Claude to restart."
         default:
             let status = count == nil ? "Source history in \(account.label) still needs checking." : "\(copies) \(count == 1 ? "needs" : "need") checking in \(account.label)".punctuated
+            let leavable = account.pendingCancel.map(leaveChecks.contains) == true
             return status + (account.signedIn == true ? account.pendingRetryAt == nil ? " Cleanup will retry automatically." : retry : " " + signIn(" and cleanup will retry automatically."))
+                + (leavable ? " New moves wait for this cleanup. Leave the old copies unarchived to move on now." : "")
         }
     }
     private func oldCopies(_ account: Account) -> String { account.pendingCount.map { quantity($0, "old copy", "old copies") } ?? "Old copies" }
@@ -512,12 +514,15 @@ final class Model: ObservableObject {
         if retryable && !operationArgs.isEmpty { return "Try again" }
         if !movable { return pendingReady ? pendingButtonTitle : nil }
         if partialResult { return nil }
-        return !pendingResult && !stopped && ready ? leaveChecks.isEmpty ? "Move" : "Leave old copies and move" : nil
+        guard !pendingResult && !stopped else { return nil }
+        if !leaveChecks.isEmpty { return ready ? "Leave old copies and move" : "Leave old copies" }
+        return ready ? "Move" : nil
     }
     func primary() {
         if stopped && !operationArgs.isEmpty && continuationArgs.isEmpty { return }
         if reviewRestart || retryable { guard canMutate, !continuationArgs.isEmpty else { return }; start(continuationArgs) }
         else if !movable { finishPending() }
+        else if !ready && !leaveChecks.isEmpty { start(leave(leaveChecks)) }
         else { move() }
     }
     var scopedChecks: [String] {
@@ -1129,10 +1134,13 @@ final class Model: ObservableObject {
                 if !unavailable.isEmpty { sweepFailureReceipt = nil }
                 let names = ["title": "title", "isArchived": "archive state", "isStarred": "starred state"]
                 let fields = Set(changed.flatMap(\.fields)).sorted().map { names[$0] ?? $0 }.joined(separator: ", ")
-                note = unavailable.isEmpty
-                    ? quantity(changed.count, "moved session changed", "moved sessions changed") + " " + fields + ". Snapshots are in the receipt."
-                    : quantity(unavailable.count, "moved session record cannot be read", "moved session records cannot be read") + ". Check Details."
-                symbol = unavailable.isEmpty ? "info.circle" : "exclamationmark.triangle"
+                // While work is pending, its explanation stays in the panel and the changes go to Details only.
+                if !unavailable.isEmpty || pendingAccounts.isEmpty {
+                    note = unavailable.isEmpty
+                        ? quantity(changed.count, "moved session changed", "moved sessions changed") + " " + fields + ". Snapshots are in the receipt."
+                        : quantity(unavailable.count, "moved session record cannot be read", "moved session records cannot be read") + ". Check Details."
+                    symbol = unavailable.isEmpty ? "info.circle" : "exclamationmark.triangle"
+                }
                 lines.append(("metadata", changed.map { self.identity($0.title, $0.id) + " | " + $0.fields.map { names[$0] ?? $0 }.joined(separator: ", ") }.joined(separator: "\n")))
             }
             if resolvedRestartError {
