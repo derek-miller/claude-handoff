@@ -224,7 +224,8 @@ struct MoveProgress {
     static let phases = ["prepare", "cloudScan", "close", "rescan", "move", "verify", "retire", "finalize", "reopen", "cloud"]
     static let costs: [String: Double] = ["prepare": 0.012, "cloudScan": 1, "close": 2, "rescan": 0.001, "move": 0.0015, "verify": 0.0003, "retire": 0.0002, "finalize": 0.0015, "reopen": 1, "cloud": 1]
     static let scaled: Set<String> = ["prepare", "rescan", "move", "verify", "retire", "finalize"]
-    var skipped: Set<String> = []
+    // Moves are local-only; the cloud phases count only when an older receipt's cloud work reports progress.
+    var skipped: Set<String> = ["cloudScan", "cloud"]
     var phase = "prepare"
     var started: TimeInterval
     var paused: TimeInterval?
@@ -729,7 +730,7 @@ final class Model: ObservableObject {
 
     func move() {
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
-        let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--cloud", "--json"]
+        let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--json"]
         let checks = leaveChecks, kept = pendingAccounts.map { ("kept", "\(oldCopies($0)) left unarchived in \($0.label)") }
         dismiss()
         left = []

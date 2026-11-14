@@ -83,6 +83,7 @@ enum StateChecks {
         local.update("move", completed: 100, total: 100, now: 2)
         precondition(!local.skipped.contains("move"))
         local.update("finalize", completed: nil, total: nil, now: 3)
+        precondition(local.percent >= 85)
         local.update("cloud", completed: 0, total: 0, now: 4)
         precondition(local.skipped.contains("cloud") && local.percent > 90)
         var mixed = MoveProgress(now: 0)
@@ -610,7 +611,7 @@ enum StateChecks {
             precondition(relaunched.primaryTitle == primary)
         }
         restartDialogResponse = (.alertThirdButtonReturn, false)
-        let moveArgs = ["--from", "work personal", "--to", "work company", "--cloud", "--json"]
+        let moveArgs = ["--from", "work personal", "--to", "work company", "--json"]
         let emptyAccounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8))
         let heldAccounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("02-held").utf8))
         func completedAccountResponse(_ receipt: String) -> String {
@@ -842,7 +843,7 @@ enum StateChecks {
         precondition(requests.count == 1 && requests[0].0 == ["keep-local", "--json", "--leave-check", String(repeating: "3", count: 64)])
         requests[0].1(#"{"done":true,"ok":true,"complete":true,"keptLocal":1,"heldCancelled":0}"#)
         requests[0].2(0, "")
-        let leaveMove = ["--from", "work company", "--from", "work personal", "--to", "home personal", "--cloud", "--json"]
+        let leaveMove = ["--from", "work company", "--from", "work personal", "--to", "home personal", "--json"]
         precondition(requests.count == 2 && requests[1].0 == leaveMove && leaving.running)
         requests[1].1(#"{"plan":true,"kind":"move","token":"leave-token","affected":[]}"#)
         requests[1].2(0, "")

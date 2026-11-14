@@ -75,7 +75,7 @@ A single receipt tracks each move. Records are written to a temp file and publis
 - **A move, undo or finish:** Desktop's session records and scheduled-task registries.
 - **When you approve it:** quitting and reopening Claude Desktop.
 - **Removing an empty account or cleaning up:** that account's folders under Desktop's session, agent, plugin-list, skills and scratch areas, moved into `leftovers/` in its own folder. A scratch folder that a session still works in stays put.
-- **With `--cloud` (the menu bar's Move always uses it):** Desktop's claude.ai session, read from Keychain into memory and sent only to `claude.ai`, to archive the old account's Remote Control copies. It is never stored.
+- **With `--cloud` (CLI only; the menu bar never uses it):** Desktop's claude.ai session, read from Keychain into memory and sent only to `claude.ai`, to archive the old account's Remote Control copies. It is never stored.
 - **Updates:** the app reads `appcast.xml` from this repository's latest release, downloads the DMG it names, checks its EdDSA signature and swaps itself in.
 
 Nothing else leaves your Mac, and a move uses no model tokens.
